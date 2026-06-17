@@ -1,0 +1,26 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent TLS/kTLS encryption proxy gateway (POC)"
+
+[features]
+default = []
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+ale_pipe = { path = "../../ale-frame", package = "ale-frame" }
+openssl = "0.10"
+openssl-sys = "0.9"
+libc = "0.2"
+foreign-types-shared = "0.1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ktls_pipe = { path = "../crates/ktls_pipe" }
+tls_pipe = { path = "../crates/tls_pipe" }
+bench_log = { path = "../crates/bench_log" }
+log = "0.4"
+env_logger = "0.11"

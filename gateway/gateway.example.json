@@ -1,0 +1,158 @@
+{
+  "log_dir": "/results",
+  "run_id": "proxy_test_001",
+  "latency": false,
+  "sock_buf_size": 16777216,
+  "log_level": "info",
+  "rules": [
+    {
+      "name": "web-encrypt-tls",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:8080",
+      "listen_proto": "tcp",
+      "upstream_addr": "backend:443",
+      "security_provider": "tls",
+      "priority": 0,
+      "transparent": false,
+      "simulated_delay_ms": 0,
+      "protocol_version": "tls1.2"
+    },
+    {
+      "name": "web-decrypt-tls",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:8443",
+      "listen_proto": "tcp",
+      "upstream_addr": "localhost:8080",
+      "upstream_proto": "tcp",
+      "security_provider": "tls"
+    },
+    {
+      "name": "web-encrypt-ktls",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:9080",
+      "listen_proto": "tcp",
+      "upstream_addr": "backend:9443",
+      "security_provider": "ktls"
+    },
+    {
+      "name": "udp-encrypt-tls-ale",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:5000",
+      "listen_proto": "udp",
+      "upstream_addr": "collector:5443",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "app_protocol": "ale"
+    },
+    {
+      "name": "udp-decrypt-tls-ale",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:5443",
+      "listen_proto": "tcp",
+      "upstream_addr": "localhost:5000",
+      "upstream_proto": "udp",
+      "security_provider": "tls",
+      "app_protocol": "ale"
+    },
+    {
+      "name": "sensor-encrypt-dtls",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:6000",
+      "listen_proto": "udp",
+      "upstream_addr": "collector:6000",
+      "security_provider": "dtls"
+    },
+    {
+      "name": "sensor-decrypt-dtls",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:6001",
+      "listen_proto": "udp",
+      "upstream_addr": "localhost:6000",
+      "security_provider": "dtls"
+    },
+    {
+      "name": "tproxy-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:3128",
+      "listen_proto": "tcp",
+      "upstream_addr": "auto",
+      "security_provider": "tls",
+      "transparent": true
+    },
+    {
+      "name": "tproxy-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:3129",
+      "listen_proto": "tcp",
+      "upstream_addr": "auto",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "transparent": true
+    },
+    {
+      "name": "udp-encrypt-tls-raw",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:5100",
+      "listen_proto": "udp",
+      "upstream_addr": "collector:5143",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "app_protocol": "raw"
+    },
+    {
+      "name": "safety-udp-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.2:5000",
+      "listen_proto": "udp",
+      "upstream_addr": "remote-gw:5443",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "app_id": "etcs_safety",
+      "app_protocol": "ale"
+    },
+    {
+      "name": "normal-udp-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.3:5000",
+      "listen_proto": "udp",
+      "upstream_addr": "remote-gw:5444",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "app_id": "diagnostics",
+      "app_protocol": "ale"
+    }
+  ],
+  "traffic_rules": [
+    {
+      "source": "127.0.0.2:5000",
+      "destination": "any",
+      "app_id": "etcs_safety",
+      "traffic_class": "safety"
+    },
+    {
+      "source": "127.0.0.3:5000",
+      "destination": "any",
+      "app_id": "diagnostics",
+      "traffic_class": "normal"
+    },
+    {
+      "source": "127.0.0.0/8",
+      "destination": "any",
+      "app_id": "local_apps",
+      "traffic_class": "normal"
+    }
+  ],
+  "policy": {
+    "default_action": "allow",
+    "whitelist": [
+      { "source": "127.0.0.0/8", "destination": "any" },
+      { "source": "10.0.0.0/8", "destination": "any" }
+    ]
+  },
+  "cache": {
+    "max_entries": 10000,
+    "ttl_secs": 300
+  }
+}

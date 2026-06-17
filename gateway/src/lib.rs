@@ -1,0 +1,447 @@
+//! Secure Communication Gateway — library core.
+//!
+//! A configurable proxy that transparently encrypts or decrypts traffic:
+//!
+//! - **Encrypt direction**: Accept plain TCP/UDP -> forward as TLS/kTLS/DTLS or
+//!   any registered custom provider.
+//! - **Decrypt direction**: Accept TLS/kTLS/DTLS (or custom) -> forward as plain
+//!   TCP/UDP.
+//!
+//! The gateway is exposed as a library so that downstream binaries can register
+//! additional providers (for example proprietary crypto) on top of the built-in
+//! set before starting the runtime via [`run`].
+//!
+//! Supports:
+//! - Pluggable security providers (TLS, kTLS, DTLS, or custom)
+//! - Pluggable app-level protocol providers (ALE, Raw, or custom)
+//! - TPROXY transparent proxying with `IP_TRANSPARENT` and `SO_ORIGINAL_DST`
+//! - Hot-reload: SIGHUP or file change reloads config without interrupting transfers
+
+pub mod api;
+pub mod app_protocols;
+pub mod interfaces;
+pub mod management;
+pub mod networking;
+pub mod processing;
+pub mod security;
+
+use app_protocols::ale_provider::AleProtocolProvider;
+use app_protocols::provider::AppProtocolProvider;
+use app_protocols::raw_provider::RawProtocolProvider;
+use log::{error, info, warn};
+use management::config::GatewayConfig;
+use management::config_manager::{spawn_config_watcher, SharedConfig};
+use processing::cache::TrafficCache;
+use processing::lifecycle::{LifecycleEvent, LifecycleOrchestrator};
+use processing::policy::PolicyManager;
+use processing::registry::ProviderRegistry;
+use processing::traffic_analyzer::TrafficAnalyzer;
+use security::provider::CryptoProvider;
+use security::providers::dtls_provider::DtlsProvider;
+use security::providers::ktls_provider::KtlsProvider;
+use security::providers::tls_provider::TlsProvider;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+/// Run the gateway runtime.
+///
+/// The built-in TLS/kTLS/DTLS crypto providers and ALE/Raw app-protocol
+/// providers are always registered. `extra_crypto` and `extra_app` let a
+/// downstream binary register additional providers (e.g. proprietary crypto)
+/// before startup. Pass empty vectors for the default open configuration.
+///
+/// This function parses the process arguments, loads configuration, and blocks
+/// until shutdown.
+pub fn run(
+    extra_crypto: Vec<Box<dyn CryptoProvider>>,
+    extra_app: Vec<Box<dyn AppProtocolProvider>>,
+) {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Build the provider registry: built-in providers plus any extras supplied
+    // by the caller. Constructing the registry has no side effects, so it is
+    // safe to do before argument handling (needed to print provider names).
+    let mut registry = ProviderRegistry::new();
+    registry.register_crypto(Box::new(TlsProvider));
+    registry.register_crypto(Box::new(KtlsProvider));
+    registry.register_crypto(Box::new(DtlsProvider));
+    for provider in extra_crypto {
+        registry.register_crypto(provider);
+    }
+    registry.register_app_protocol(Box::new(AleProtocolProvider));
+    registry.register_app_protocol(Box::new(RawProtocolProvider));
+    for provider in extra_app {
+        registry.register_app_protocol(provider);
+    }
+
+    if args.len() < 2 || args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
+        print_usage(&args[0], &registry);
+        std::process::exit(0);
+    }
+
+    // Parse --config flag
+    let config_path = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!("Error: --config PATH is required");
+            print_usage(&args[0], &registry);
+            std::process::exit(1);
+        });
+
+    let validate_only = args.contains(&"--validate".to_string());
+    let log_stdout = args.contains(&"--log-stdout".to_string());
+
+    // Load config
+    let mut config = match GatewayConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // CLI overrides
+    if let Some(pos) = args.iter().position(|a| a == "--log-dir") {
+        if let Some(dir) = args.get(pos + 1) {
+            config.log_dir = dir.clone();
+        }
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--run-id") {
+        if let Some(id) = args.get(pos + 1) {
+            config.run_id = id.clone();
+        }
+    }
+    if args.contains(&"--latency".to_string()) {
+        config.latency = true;
+    }
+
+    // Parse --log-level CLI flag (overrides config log_level)
+    let cli_log_level = args
+        .iter()
+        .position(|a| a == "--log-level")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    // Resolve log level: CLI > config > default ("info")
+    let log_level_str = cli_log_level
+        .or_else(|| config.log_level.clone())
+        .unwrap_or_else(|| "info".to_string());
+
+    let log_level = match log_level_str.to_lowercase().as_str() {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        other => {
+            eprintln!(
+                "Warning: unknown log level '{}', defaulting to 'info'",
+                other
+            );
+            log::LevelFilter::Info
+        }
+    };
+
+    // Initialize the logger
+    env_logger::Builder::new()
+        .filter_level(log_level)
+        .format_timestamp_millis()
+        .init();
+
+    let enable_watch = args.contains(&"--watch".to_string());
+
+    // --validate: check config + preflight, then exit
+    if validate_only {
+        info!("=== Configuration Validation ===");
+        config.print_summary();
+
+        let (warnings, errors) = config.preflight_check();
+
+        if !warnings.is_empty() {
+            info!("Warnings:");
+            for w in &warnings {
+                warn!("  {}", w);
+            }
+        }
+
+        if !errors.is_empty() {
+            info!("Errors:");
+            for e in &errors {
+                error!("  {}", e);
+            }
+            error!(
+                "Validation FAILED ({} error(s), {} warning(s))",
+                errors.len(),
+                warnings.len()
+            );
+            std::process::exit(1);
+        }
+
+        if warnings.is_empty() {
+            info!("Validation PASSED (no warnings)");
+        } else {
+            info!("Validation PASSED ({} warning(s))", warnings.len());
+        }
+        std::process::exit(0);
+    }
+
+    // Finalize the registry for sharing across rule threads.
+    let registry = registry.into_arc();
+
+    // Print config summary
+    config.print_summary();
+
+    // Run preflight checks (warnings only -- don't block startup for non-fatal issues)
+    let (warnings, errors) = config.preflight_check();
+    for w in &warnings {
+        warn!("{}", w);
+    }
+    for e in &errors {
+        error!("{}", e);
+    }
+    if !errors.is_empty() {
+        error!(
+            "{} preflight error(s) detected -- startup may fail",
+            errors.len()
+        );
+        error!("Run with --validate for details, or fix the issues above");
+    }
+
+    // Create log directory
+    if let Err(e) = std::fs::create_dir_all(&config.log_dir) {
+        warn!("Could not create log dir '{}': {}", config.log_dir, e);
+    }
+
+    // Shutdown signal handling
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = shutdown.clone();
+
+    ctrlc_handler(shutdown_signal);
+
+    // ── Instantiate traffic pipeline components ──────────────────────────────
+    let pipeline_enabled = !config.traffic_rules.is_empty()
+        || config.policy.is_some()
+        || config
+            .rules
+            .iter()
+            .any(|r| r.traffic_class != management::config::TrafficClass::Normal);
+
+    // Traffic cache (shared across all rules for classification lookup)
+    let cache_cfg = config.cache.as_ref();
+    let traffic_cache = Arc::new(TrafficCache::new(
+        cache_cfg.map_or(10_000, |c| c.max_entries),
+        cache_cfg.map_or(300, |c| c.ttl_secs),
+    ));
+
+    // Traffic analyzer (classifies flows by source/dest)
+    let traffic_analyzer = if !config.traffic_rules.is_empty() {
+        Some(Arc::new(TrafficAnalyzer::new(
+            &config.traffic_rules,
+            traffic_cache.clone(),
+        )))
+    } else {
+        None
+    };
+
+    // Policy manager (whitelist-based allow/deny)
+    let policy_manager = Arc::new(RwLock::new(PolicyManager::new(config.policy.as_ref())));
+
+    // Lifecycle orchestrator (event-driven cache/policy management)
+    let (orchestrator, lifecycle_tx) = LifecycleOrchestrator::new(
+        traffic_cache.clone(),
+        policy_manager.clone(),
+        shutdown.clone(),
+    );
+
+    // Spawn orchestrator thread
+    let _orchestrator_handle = std::thread::Builder::new()
+        .name("lifecycle-orchestrator".to_string())
+        .spawn(move || orchestrator.run())
+        .expect("Failed to spawn lifecycle orchestrator");
+
+    if pipeline_enabled {
+        info!(
+            "Traffic pipeline enabled (analyzer={}, policy={}, cache={})",
+            traffic_analyzer.is_some(),
+            config.policy.is_some(),
+            cache_cfg.is_some(),
+        );
+    }
+
+    // Start all proxy rules
+    let pipeline = Arc::new(processing::PipelineComponents {
+        traffic_analyzer: traffic_analyzer.clone(),
+        policy_manager: policy_manager.clone(),
+    });
+    let (handles, rule_shutdowns) = processing::start_rules(
+        &config,
+        shutdown.clone(),
+        registry.clone(),
+        pipeline.clone(),
+    );
+
+    // Start config watcher for hot-reload (if --watch or always via SIGHUP)
+    let shared_config = SharedConfig::new(config.clone(), &config_path);
+    let watcher_shutdown = shutdown.clone();
+    let watcher_rule_shutdowns = rule_shutdowns.clone();
+    let watcher_config = shared_config.clone();
+    let watcher_global_shutdown = shutdown.clone();
+    let watcher_registry = registry.clone();
+    let watcher_pipeline = pipeline.clone();
+    let watcher_lifecycle_tx = lifecycle_tx.clone();
+
+    let _watcher_handle = spawn_config_watcher(shared_config, watcher_shutdown, move |diff| {
+        // Stop removed rules
+        for name in &diff.removed {
+            if let Some(flag) = watcher_rule_shutdowns.lock().unwrap().get(name) {
+                flag.store(true, Ordering::SeqCst);
+                info!("Stopped rule: \"{}\"", name);
+            }
+        }
+
+        // Notify lifecycle orchestrator of config change
+        let current_config = watcher_config.read();
+        let _ = watcher_lifecycle_tx.send(LifecycleEvent::ConfigChanged {
+            diff: current_config.diff(&current_config), // Pass a fresh diff for the orchestrator
+            new_policy: current_config.policy.clone(),
+        });
+
+        // Start added rules
+        for rule in &diff.added {
+            info!("Starting new rule: \"{}\"", rule.name);
+            let _handle = processing::start_single_rule(
+                rule,
+                &current_config,
+                watcher_global_shutdown.clone(),
+                watcher_rule_shutdowns.clone(),
+                watcher_registry.clone(),
+                watcher_pipeline.clone(),
+            );
+            // Note: handle is detached (thread runs independently)
+        }
+    });
+
+    // Log to stdout if requested (for journald/container use)
+    if log_stdout {
+        info!("--log-stdout: log output will also go to stdout");
+    }
+
+    if enable_watch {
+        info!("Hot-reload enabled -- edit config or send SIGHUP to reload");
+    } else {
+        info!("Send SIGHUP to reload configuration without restart");
+    }
+    info!("Running -- press Ctrl+C to stop");
+
+    // Wait for all listener threads to finish with a timeout.
+    // Spawn a watchdog that force-exits after 5 seconds to prevent hanging.
+    let shutdown_watchdog = shutdown.clone();
+    std::thread::Builder::new()
+        .name("shutdown-watchdog".to_string())
+        .spawn(move || {
+            // Wait until shutdown is signaled
+            while !shutdown_watchdog.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Give threads 5 seconds to finish gracefully
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            eprintln!("[gateway] Shutdown timeout reached, forcing exit");
+            unsafe {
+                libc::_exit(1);
+            }
+        })
+        .ok();
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    info!("Shutdown complete");
+}
+
+fn ctrlc_handler(shutdown: Arc<AtomicBool>) {
+    // Install signal handlers for graceful shutdown.
+    // Uses sigaction (not signal) for reliable behavior across invocations.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = signal_handler as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
+    // Store the shutdown flag globally for the signal handler
+    SHUTDOWN_FLAG
+        .set(shutdown)
+        .expect("SHUTDOWN_FLAG already set");
+}
+
+static SHUTDOWN_FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+
+extern "C" fn signal_handler(_sig: libc::c_int) {
+    if let Some(flag) = SHUTDOWN_FLAG.get() {
+        if flag.load(Ordering::SeqCst) {
+            // Second signal -- force exit immediately
+            eprintln!("\n[gateway] Forced shutdown (second signal)");
+            unsafe {
+                libc::_exit(1);
+            }
+        }
+        flag.store(true, Ordering::SeqCst);
+    }
+    eprintln!("\n[gateway] Shutdown signal received, stopping... (send again to force quit)");
+}
+
+fn print_usage(prog: &str, registry: &ProviderRegistry) {
+    eprintln!("Usage: {} --config PATH [OPTIONS]", prog);
+    eprintln!();
+    eprintln!("  Transparent encryption proxy gateway with extensible provider architecture");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --config PATH    Path to JSON configuration file (required)");
+    eprintln!("  --validate       Validate config and environment, then exit");
+    eprintln!("  --log-dir DIR    Override log directory from config");
+    eprintln!("  --run-id ID      Override run ID from config");
+    eprintln!("  --latency        Enable latency measurement");
+    eprintln!("  --log-level LVL  Set log level: error, warn, info, debug, trace (default: info)");
+    eprintln!("  --watch          Enable config hot-reload via file watching");
+    eprintln!("  --log-stdout     Copy log output to stdout (for journald/containers)");
+    eprintln!("  --help           Show this help");
+    eprintln!();
+    eprintln!("Validation (--validate):");
+    eprintln!("  Checks: JSON syntax, rule consistency, port conflicts, CAP_NET_ADMIN,");
+    eprintln!("  iptables chains, TPROXY routing policy, log dir writability, kTLS support.");
+    eprintln!("  Exits 0 on success, 1 on failure. Safe to run -- makes no changes.");
+    eprintln!();
+    eprintln!("Hot-reload:");
+    eprintln!("  SIGHUP signal always triggers a config reload (even without --watch).");
+    eprintln!("  With --watch, the config file is polled every 2s for changes.");
+    eprintln!("  Existing connections are NOT interrupted -- only new connections use new rules.");
+    eprintln!();
+    eprintln!("Configuration file format (JSON):");
+    eprintln!();
+    eprintln!("  {{");
+    eprintln!("    \"log_dir\": \"/results\",");
+    eprintln!("    \"run_id\": \"test_001\",");
+    eprintln!("    \"latency\": true,");
+    eprintln!("    \"rules\": [");
+    eprintln!("      {{");
+    eprintln!("        \"name\": \"web-encrypt\",");
+    eprintln!("        \"direction\": \"encrypt\",");
+    eprintln!("        \"listen_addr\": \"0.0.0.0:8080\",");
+    eprintln!("        \"listen_proto\": \"tcp\",");
+    eprintln!("        \"upstream_addr\": \"backend:443\",");
+    eprintln!("        \"security_provider\": \"ktls\"");
+    eprintln!("      }}");
+    eprintln!("    ]");
+    eprintln!("  }}");
+    eprintln!();
+    eprintln!("Security providers: {}", registry.crypto_names().join(", "));
+    eprintln!(
+        "App protocols (for UDP-over-TLS): {}",
+        registry.app_protocol_names().join(", ")
+    );
+}

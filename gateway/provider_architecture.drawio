@@ -1,0 +1,335 @@
+<mxfile host="app.diagrams.net" agent="Claude" version="26.0.0">
+  <diagram id="provider-architecture" name="Provider Architecture">
+    <mxGraphModel dx="1200" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="title" value="&lt;b&gt;Gateway Provider Architecture&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=20;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="500" y="10" width="400" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- JSON CONFIG -->
+        <!-- ================================================================ -->
+        <mxCell id="config" value="&lt;b&gt;gateway.json&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;rules[].security_provider&lt;br&gt;rules[].app_protocol&lt;br&gt;rules[].direction&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="620" y="70" width="180" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow: config -> main.rs -->
+        <mxCell id="e_config_main" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#666666;fontSize=10;" edge="1" parent="1" source="config" target="main_box">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_config_main_label" value="load &amp; validate" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#666666;" vertex="1" connectable="0" parent="e_config_main">
+          <mxGeometry x="-0.2" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MAIN.RS - STARTUP -->
+        <!-- ================================================================ -->
+        <mxCell id="main_box" value="&lt;b&gt;main.rs&lt;/b&gt;&lt;br&gt;Startup &amp; Registration" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="620" y="200" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PROVIDER REGISTRY -->
+        <!-- ================================================================ -->
+        <mxCell id="registry_group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="180" y="300" width="1060" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="registry_title" value="&lt;b&gt;ProviderRegistry&lt;/b&gt;&amp;nbsp;&lt;font style=&quot;font-size:10px&quot;&gt;(Arc&amp;lt;ProviderRegistry&amp;gt; — shared read-only across all rule threads)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=13;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="190" y="305" width="600" height="25" as="geometry" />
+        </mxCell>
+
+        <!-- Crypto providers row -->
+        <mxCell id="crypto_label" value="&lt;b&gt;crypto: Vec&amp;lt;Box&amp;lt;dyn CryptoProvider&amp;gt;&amp;gt;&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="200" y="335" width="320" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p_tls" value="&lt;b&gt;TlsProvider&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;name: &quot;tls&quot;&lt;br&gt;OpenSSL userspace&lt;br&gt;TCP + UDP-over-TLS&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="360" width="140" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p_ktls" value="&lt;b&gt;KtlsProvider&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;name: &quot;ktls&quot;&lt;br&gt;Kernel TLS offload&lt;br&gt;TCP + UDP-over-TLS&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="360" width="140" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p_dtls" value="&lt;b&gt;DtlsProvider&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;name: &quot;dtls&quot;&lt;br&gt;Datagram TLS&lt;br&gt;UDP only&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="520" y="360" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- App protocol providers -->
+        <mxCell id="app_label" value="&lt;b&gt;app_protocols: Vec&amp;lt;Box&amp;lt;dyn AppProtocolProvider&amp;gt;&amp;gt;&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="870" y="335" width="360" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p_ale" value="&lt;b&gt;AleProtocolProvider&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;name: &quot;ale&quot;&lt;br&gt;EuroRadio AU1/AU2&lt;br&gt;+ DT/DI framing&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="360" width="155" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p_raw" value="&lt;b&gt;RawProtocolProvider&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;name: &quot;raw&quot;&lt;br&gt;4-byte LE length&lt;br&gt;prefix, no handshake&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1055" y="360" width="155" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow: main -> registry (register) -->
+        <mxCell id="e_main_reg" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#6c8ebf;fontSize=10;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="main_box" target="registry_group">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_main_reg_label" value="register_crypto()&lt;br&gt;register_app_protocol()&lt;br&gt;then into_arc()" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#6c8ebf;" vertex="1" connectable="0" parent="e_main_reg">
+          <mxGeometry x="-0.1" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- TRAITS (sidebar) -->
+        <!-- ================================================================ -->
+        <mxCell id="trait_crypto" value="&lt;b&gt;trait CryptoProvider&lt;/b&gt;&lt;hr size=&quot;1&quot;&gt;&lt;font style=&quot;font-size:10px&quot;&gt;+ name() → &amp;str&lt;br&gt;+ description() → &amp;str&lt;br&gt;+ supported_modes() → Vec&lt;br&gt;+ &lt;b&gt;run_encrypt(&amp;self, ctx)&lt;/b&gt;&lt;br&gt;+ &lt;b&gt;run_decrypt(&amp;self, ctx)&lt;/b&gt;&lt;/font&gt;" style="shape=document;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=0.1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;align=left;spacingLeft=8;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+          <mxGeometry x="20" y="110" width="200" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="trait_app" value="&lt;b&gt;trait AppProtocolProvider&lt;/b&gt;&lt;hr size=&quot;1&quot;&gt;&lt;font style=&quot;font-size:10px&quot;&gt;+ name() → &amp;str&lt;br&gt;+ description() → &amp;str&lt;br&gt;+ &lt;b&gt;create_session()&lt;/b&gt; → FramingSession&lt;/font&gt;" style="shape=document;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=0.1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;align=left;spacingLeft=8;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+          <mxGeometry x="20" y="260" width="220" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="trait_framing" value="&lt;b&gt;trait FramingSession&lt;/b&gt;&lt;hr size=&quot;1&quot;&gt;&lt;font style=&quot;font-size:10px&quot;&gt;+ handshake_initiator(stream)&lt;br&gt;+ handshake_responder(stream)&lt;br&gt;+ frame_datagram(payload, out)&lt;br&gt;+ deframe(data) → DeframeResult&lt;br&gt;+ write_disconnect(stream)&lt;/font&gt;" style="shape=document;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=0.1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;align=left;spacingLeft=8;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+          <mxGeometry x="20" y="380" width="220" height="130" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow: trait_app -> trait_framing -->
+        <mxCell id="e_app_framing" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#b85450;fontSize=10;dashed=1;" edge="1" parent="1" source="trait_app" target="trait_framing">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_app_framing_label" value="creates" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#b85450;" vertex="1" connectable="0" parent="e_app_framing">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- DISPATCH: processing/mod.rs -->
+        <!-- ================================================================ -->
+        <mxCell id="dispatch_group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="310" y="520" width="800" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="dispatch_title" value="&lt;b&gt;processing/mod.rs — start_single_rule()&lt;/b&gt;&amp;nbsp;&lt;font style=&quot;font-size:10px&quot;&gt;(one dedicated thread per rule)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=13;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="320" y="525" width="500" height="25" as="geometry" />
+        </mxCell>
+
+        <mxCell id="build_ctx" value="&lt;b&gt;1. Build RuleContext&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;from RuleConfig + globals&lt;br&gt;+ pipeline components&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="330" y="560" width="160" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="find_provider" value="&lt;b&gt;2. find_crypto()&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;registry.find_crypto(&lt;br&gt;&amp;nbsp;&amp;nbsp;ctx.security_provider)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="530" y="560" width="170" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="dispatch_call" value="&lt;b&gt;3. Dispatch&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Encrypt → run_encrypt(ctx)&lt;br&gt;Decrypt → run_decrypt(ctx)&lt;br&gt;&lt;i&gt;(blocks until shutdown)&lt;/i&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="555" width="180" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_step1_2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#d6b656;" edge="1" parent="1" source="build_ctx" target="find_provider">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_step2_3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#d6b656;" edge="1" parent="1" source="find_provider" target="dispatch_call">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow: registry -> dispatch (lookup) -->
+        <mxCell id="e_reg_dispatch" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#82b366;fontSize=10;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="registry_group" target="dispatch_group">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_reg_dispatch_label" value="find_crypto(name) → &amp;dyn CryptoProvider" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#82b366;" vertex="1" connectable="0" parent="e_reg_dispatch">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- SECURITY ENGINES (bottom) -->
+        <!-- ================================================================ -->
+        <mxCell id="engine_group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;dashed=1;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="150" y="700" width="1120" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="engine_title" value="&lt;b&gt;Security Engines&lt;/b&gt;&amp;nbsp;&lt;font style=&quot;font-size:10px&quot;&gt;(blocking listener/relay loops — one per rule thread)&lt;/font&gt;" style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontSize=13;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="160" y="705" width="500" height="25" as="geometry" />
+        </mxCell>
+
+        <mxCell id="eng_tls_tcp_enc" value="&lt;b&gt;tls_engine/encrypt&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;run_tcp_encrypt_listener&lt;br&gt;run_udp_encrypt_relay&lt;br&gt;&lt;i&gt;(used by TLS + kTLS)&lt;/i&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="170" y="740" width="175" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="eng_tls_tcp_dec" value="&lt;b&gt;tls_engine/decrypt&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;run_tcp_decrypt_listener&lt;br&gt;run_udp_decrypt_relay&lt;br&gt;&lt;i&gt;(used by TLS + kTLS)&lt;/i&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="370" y="740" width="175" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="eng_dtls" value="&lt;b&gt;dtls_engine&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;run_dtls_encrypt_relay&lt;br&gt;run_dtls_decrypt_relay&lt;br&gt;&lt;i&gt;(native UDP datagrams)&lt;/i&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="570" y="740" width="175" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="eng_framing" value="&lt;b&gt;FramingSession&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Used by UDP-over-TLS&lt;br&gt;handshake → frame → deframe&lt;br&gt;&lt;i&gt;(ALE or Raw sessions)&lt;/i&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="970" y="740" width="175" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- Arrows: dispatch -> engines -->
+        <mxCell id="e_dispatch_engines" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#999999;fontSize=10;" edge="1" parent="1" source="dispatch_call" target="engine_group">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_dispatch_engines_label" value="provider.run_encrypt(ctx) / run_decrypt(ctx)" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#999999;" vertex="1" connectable="0" parent="e_dispatch_engines">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Arrows: provider boxes -> engines (dotted) -->
+        <mxCell id="e_tls_eng" style="rounded=1;strokeColor=#82b366;fontSize=10;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="p_tls" target="eng_tls_tcp_enc">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="270" y="450" />
+              <mxPoint x="270" y="500" />
+              <mxPoint x="160" y="500" />
+              <mxPoint x="160" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_ktls_eng" style="rounded=1;strokeColor=#82b366;fontSize=10;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="p_ktls" target="eng_tls_tcp_dec">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="430" y="450" />
+              <mxPoint x="430" y="500" />
+              <mxPoint x="458" y="500" />
+              <mxPoint x="458" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_dtls_eng" style="rounded=1;strokeColor=#82b366;fontSize=10;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="p_dtls" target="eng_dtls">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="590" y="450" />
+              <mxPoint x="590" y="500" />
+              <mxPoint x="658" y="500" />
+              <mxPoint x="658" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Arrow: ALE/Raw -> FramingSession engine box -->
+        <mxCell id="e_ale_framing" style="rounded=1;strokeColor=#9673a6;fontSize=10;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="p_ale" target="eng_framing">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="958" y="450" />
+              <mxPoint x="958" y="500" />
+              <mxPoint x="1058" y="500" />
+              <mxPoint x="1058" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_raw_framing" style="rounded=1;strokeColor=#9673a6;fontSize=10;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="p_raw" target="eng_framing">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1133" y="450" />
+              <mxPoint x="1133" y="500" />
+              <mxPoint x="1100" y="500" />
+              <mxPoint x="1100" y="740" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Arrow: tls_engine uses FramingSession -->
+        <mxCell id="e_eng_framing" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#9673a6;fontSize=10;dashed=1;" edge="1" parent="1" source="eng_tls_tcp_enc" target="eng_framing">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="258" y="830" />
+              <mxPoint x="1058" y="830" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_eng_framing_label" value="UDP-over-TLS tunnel uses FramingSession for datagram framing" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#9673a6;" vertex="1" connectable="0" parent="e_eng_framing">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- RULE CONTEXT (bottom-left annotation) -->
+        <!-- ================================================================ -->
+        <mxCell id="ctx_box" value="&lt;b&gt;RuleContext&lt;/b&gt;&lt;hr size=&quot;1&quot;&gt;&lt;font style=&quot;font-size:9px&quot;&gt;rule_name, listen_addr, listen_proto&lt;br&gt;upstream_addr, upstream_proto&lt;br&gt;tls_mode, security_provider&lt;br&gt;app_protocol, transparent&lt;br&gt;metrics, shutdown flag&lt;br&gt;traffic_class, app_id&lt;br&gt;traffic_analyzer, policy_manager&lt;br&gt;…&lt;/font&gt;" style="shape=note;whiteSpace=wrap;html=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=5;" vertex="1" parent="1">
+          <mxGeometry x="20" y="560" width="225" height="170" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow: ctx -> dispatch -->
+        <mxCell id="e_ctx_dispatch" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#d6b656;fontSize=10;dashed=1;" edge="1" parent="1" source="ctx_box" target="build_ctx">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_ctx_dispatch_label" value="passed to providers" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=9;fontColor=#d6b656;" vertex="1" connectable="0" parent="e_ctx_dispatch">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- NETWORK (very bottom) -->
+        <!-- ================================================================ -->
+        <mxCell id="net_in" value="&lt;b&gt;Inbound Traffic&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;TCP / UDP listeners&lt;/font&gt;" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="280" y="900" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="net_out" value="&lt;b&gt;Outbound Traffic&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;TLS / kTLS / DTLS&lt;/font&gt;" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="900" width="200" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_net_in" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#666666;" edge="1" parent="1" source="net_in" target="engine_group">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_net_out" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#666666;" edge="1" parent="1" source="engine_group" target="net_out">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- LEGEND -->
+        <!-- ================================================================ -->
+        <mxCell id="legend_group" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#999999;strokeWidth=1;" vertex="1" parent="1">
+          <mxGeometry x="1300" y="70" width="170" height="195" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_title" value="&lt;b&gt;Legend&lt;/b&gt;" style="text;html=1;align=left;fontSize=12;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="1310" y="75" width="60" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1315" y="100" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1t" value="CryptoProvider" style="text;html=1;align=left;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1345" y="97" width="110" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1315" y="125" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2t" value="AppProtocolProvider" style="text;html=1;align=left;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1345" y="122" width="120" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1315" y="150" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3t" value="Security Engine" style="text;html=1;align=left;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1345" y="147" width="110" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1315" y="175" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg4t" value="Dispatch / Config" style="text;html=1;align=left;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1345" y="172" width="110" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg5" value="" style="shape=document;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;size=0.15;" vertex="1" parent="1">
+          <mxGeometry x="1315" y="200" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg5t" value="Trait Definition" style="text;html=1;align=left;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1345" y="197" width="110" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg6" value="" style="endArrow=classic;html=1;strokeColor=#666666;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1315" y="237" as="sourcePoint" />
+            <mxPoint x="1335" y="237" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="leg6t" value="Delegates to" style="text;html=1;align=left;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="1345" y="227" width="110" height="20" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

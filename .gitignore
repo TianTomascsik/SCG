@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target/
+
+# rustfmt backups
+**/*.rs.bk
+
+# Debug info
+*.pdb
+
+# Logs
+*.log

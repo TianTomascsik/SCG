@@ -1,0 +1,10 @@
+[package]
+name = "tls_pipe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openssl = "0.10"
+openssl-sys = "0.9"
+libc = "0.2"
+foreign-types-shared = "0.1"
