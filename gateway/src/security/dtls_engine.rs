@@ -607,6 +607,13 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                 set_nonblocking_fd(dtls_fd);
 
                 match upstream_proto {
+                    Proto::Uds | Proto::Shm => {
+                        error!(
+                            "[{}] DTLS upstream protocol {} is not supported",
+                            rule_name, upstream_proto
+                        );
+                        return;
+                    }
                     Proto::Udp => {
                         let upstream = match UdpSocket::bind("0.0.0.0:0") {
                             Ok(s) => s,

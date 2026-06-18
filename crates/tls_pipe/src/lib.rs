@@ -19,7 +19,10 @@ use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
-use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion};
+use openssl::ssl::{
+    SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslStream, SslVerifyMode,
+    SslVersion,
+};
 use openssl::x509::X509;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -95,6 +98,73 @@ pub fn build_self_signed_cert(
     Ok((pkey, builder.build()))
 }
 
+/// Resolve the TLS protocol version for benchmarks from the
+/// `SCG_BENCH_TLS_VERSION` environment variable (default: TLS 1.2).
+fn bench_tls_version() -> SslVersion {
+    let raw = std::env::var("SCG_BENCH_TLS_VERSION").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    let v = v.trim_start_matches("tls").trim_start_matches('v');
+    match v {
+        "" | "1.2" | "1-2" | "1_2" | "12" => SslVersion::TLS1_2,
+        "1.3" | "1-3" | "1_3" | "13" => SslVersion::TLS1_3,
+        other => {
+            eprintln!("[tls] WARNING: unknown TLS version '{}', using TLS 1.2", other);
+            SslVersion::TLS1_2
+        }
+    }
+}
+
+/// Configure the benchmark TLS version + AEAD cipher on `builder` from the
+/// `SCG_BENCH_TLS_VERSION` / `SCG_BENCH_CIPHER` environment variables, so the
+/// historical AES-128-GCM / TLS 1.2 baseline can be compared against modern,
+/// forward-secret suites recommended by BSI TR-02102-2 and NIST SP 800-52r2 —
+/// without recompiling.
+///
+/// Cipher values (case-insensitive, `-`/`_` interchangeable):
+///   * `aes128-gcm` (default), `aes256-gcm` (BSI + NIST), `chacha20-poly1305` (BSI)
+fn configure_bench_crypto(builder: &mut SslContextBuilder) -> Result<(), openssl::error::ErrorStack> {
+    let ver = bench_tls_version();
+    builder.set_min_proto_version(Some(ver))?;
+    builder.set_max_proto_version(Some(ver))?;
+
+    let raw = std::env::var("SCG_BENCH_CIPHER").unwrap_or_default();
+    let cipher = raw.trim().to_ascii_lowercase().replace('_', "-");
+
+    if ver == SslVersion::TLS1_3 {
+        // `mozilla_intermediate()` disables TLS 1.3 via SSL_OP_NO_TLSv1_3; undo that
+        // so the requested TLS 1.3 version is actually negotiable.
+        builder.clear_options(SslOptions::NO_TLSV1_3);
+        let suite = match cipher.as_str() {
+            "" | "aes128-gcm" | "aes-128-gcm" => "TLS_AES_128_GCM_SHA256",
+            "aes256-gcm" | "aes-256-gcm" => "TLS_AES_256_GCM_SHA384",
+            "chacha20-poly1305" | "chacha20" | "chacha" => "TLS_CHACHA20_POLY1305_SHA256",
+            other => {
+                eprintln!(
+                    "[tls] WARNING: unknown SCG_BENCH_CIPHER='{}', using TLS_AES_128_GCM_SHA256",
+                    other
+                );
+                "TLS_AES_128_GCM_SHA256"
+            }
+        };
+        builder.set_ciphersuites(suite)?;
+    } else {
+        let list = match cipher.as_str() {
+            "" | "aes128-gcm" | "aes-128-gcm" => "AES128-GCM-SHA256",
+            "aes256-gcm" | "aes-256-gcm" => "ECDHE-RSA-AES256-GCM-SHA384",
+            "chacha20-poly1305" | "chacha20" | "chacha" => "ECDHE-RSA-CHACHA20-POLY1305",
+            other => {
+                eprintln!(
+                    "[tls] WARNING: unknown SCG_BENCH_CIPHER='{}', using AES128-GCM-SHA256",
+                    other
+                );
+                "AES128-GCM-SHA256"
+            }
+        };
+        builder.set_cipher_list(list)?;
+    }
+    Ok(())
+}
+
 fn build_server_acceptor() -> Result<SslAcceptor, openssl::error::ErrorStack> {
     let (pkey, cert) = get_or_init_cert()?;
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
@@ -102,9 +172,7 @@ fn build_server_acceptor() -> Result<SslAcceptor, openssl::error::ErrorStack> {
     builder.set_certificate(cert)?;
     builder.check_private_key()?;
     // No kTLS: we intentionally do NOT set SSL_OP_ENABLE_KTLS
-    builder.set_cipher_list("AES128-GCM-SHA256:AES256-GCM-SHA384")?;
-    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+    configure_bench_crypto(&mut builder)?;
     Ok(builder.build())
 }
 
@@ -112,9 +180,7 @@ fn build_client_connector() -> Result<SslConnector, openssl::error::ErrorStack> 
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_verify(SslVerifyMode::NONE);
     // No kTLS: we intentionally do NOT set SSL_OP_ENABLE_KTLS
-    builder.set_cipher_list("AES128-GCM-SHA256:AES256-GCM-SHA384")?;
-    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
+    configure_bench_crypto(&mut builder)?;
     Ok(builder.build())
 }
 

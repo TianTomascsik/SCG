@@ -24,3 +24,20 @@ tls_pipe = { path = "../crates/tls_pipe" }
 bench_log = { path = "../crates/bench_log" }
 log = "0.4"
 env_logger = "0.11"
+
+# Local-interface IPC primitives and management gRPC.
+scg-ipc = { path = "../crates/scg-ipc" }
+scg-proto = { path = "../crates/scg-proto" }
+tonic = "0.12"
+prost = "0.13"
+# tokio/tokio-stream are used ONLY by the management thread (gRPC). The data
+# plane stays synchronous (thread-per-rule, blocking I/O).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+# Integration tests drive the gateway through the real client library.
+scg-client = { path = "../crates/scg-client" }
+scg-ipc = { path = "../crates/scg-ipc" }
+serde_json = "1"
+libc = "0.2"

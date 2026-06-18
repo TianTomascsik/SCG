@@ -267,3 +267,111 @@ Then use `"app_protocol": "my_name"` in config.
 | Yellow | Config & dispatch logic |
 | Red (doc shape) | Trait definitions |
 | Dashed arrow | "Delegates to" relationship |
+
+---
+
+## Local Interfaces (UDS & SHM) and the Management API
+
+In addition to the network listeners (TCP/UDP/TPROXY), the gateway exposes
+**local interfaces** so co-located application processes can hand traffic to the
+gateway over a Unix domain socket (UDS) or shared memory (SHM) instead of the
+loopback network. Local endpoints are **provisioned on demand, per application
+and per traffic class** (safety vs. normal) through the gRPC **management API**.
+
+### Components
+
+| Module | Role |
+|---|---|
+| [crates/scg-ipc](../crates/scg-ipc) | Dependency-light IPC primitives: framing (`[len][traffic_id][data]`), 256-bit capability tokens (constant-time `ct_eq`), HELLO handshake, two-ring SHM layout + seals, eventfd/futex notify, `SO_PEERCRED`/memfd/`SCM_RIGHTS` OS helpers. |
+| [crates/scg-proto](../crates/scg-proto) | tonic/prost `scg.management.v1.ManagementApi` service stubs. |
+| [src/api/grpc.rs](src/api/grpc.rs) | gRPC server on a **dedicated thread**, off the data path. Default transport is **gRPC-over-UDS** (`SO_PEERCRED`-authenticated caller identity, no network port); optional TCP for remote admin. |
+| [src/interfaces/manager.rs](src/interfaces/manager.rs) | `InterfaceManager`: owns rule **templates**, the live-endpoint registry, token issuance, authorization, per-uid quota + rate limiting, and create-or-replace lifecycle. |
+| [src/interfaces/uds.rs](src/interfaces/uds.rs) | UDS data endpoint: a transparent byte pipe between the client socket and the TLS upstream leg. |
+| [src/interfaces/shm.rs](src/interfaces/shm.rs) | SHM data endpoint: a control socket that authenticates the client and passes memfd + eventfd descriptors via `SCM_RIGHTS`. |
+| [crates/scg-client](../crates/scg-client) | One Rust client engine exposed to **Rust, C (cbindgen ABI), and C++ (header-only)**. |
+
+### Provisioning flow
+
+```
+app ──gRPC/UDS──▶ ManagementApi.CreateUdsEndpoint(app_id, class, direction)
+                        │  (SO_PEERCRED → CallerCred{uid,gid,pid})
+                        ▼
+                InterfaceManager: look up the matching uds/shm rule template,
+                  authorize (uid ∈ allowed_uids ∧ optional pid ∈ allowed_pids),
+                  enforce per-uid quota + create rate-limit,
+                  mint a single-use 256-bit token, spawn the endpoint thread
+                        │
+                        ▼
+        reply { socket_path | control_socket_path, token, endpoint_id }
+                        │
+   app connects to the endpoint and sends HELLO[token] as the first data-plane frame
+                        │  authenticate_peer: SO_PEERCRED re-check (uid == owner_uid),
+                        ▼  constant-time token compare, consume under lock (single-use)
+                  gateway relays:  client ⇄ (UDS pipe | SHM rings) ⇄ TLS upstream
+```
+
+- **UDS** carries the gateway's TLS byte stream transparently (frames pass
+  through untouched).
+- **SHM** uses **two unidirectional rings** (client→gateway and gateway→client).
+  The gateway-to-client ring is **sealed** (`F_SEAL_WRITE`) so the client maps it
+  read-only and cannot tamper with it. Wakeups default to **eventfd** because the
+  single-threaded relay must multiplex the upstream fd and the ring notification
+  through one `poll`/`epoll`; see the [SHM wakeup benchmark](../../SCG-Interface-benchmarks/bench_shm)
+  (`wakeup_bench`) for the data behind that choice (busy-poll / hybrid-futex remain
+  available as a dedicated-core low-latency knob).
+
+### Security layers
+
+1. **Transport identity** — gRPC-over-UDS yields a kernel-verified
+   `SO_PEERCRED`; the data-plane connection is re-checked the same way at the
+   instant of connect.
+2. **Authorization** — `allowed_uids` (and optional `allowed_pids`) come from the
+   rule; the connecting uid must match **and** equal the endpoint owner.
+3. **Capability token** — single-use, 256-bit, presented in the first HELLO
+   frame, compared in constant time, and consumed under a lock so a race cannot
+   reuse it. Tokens are masked (`***`) in all log/Debug output.
+4. **Filesystem** — per-uid runtime directory `0700` (privileged:
+   `/run/scg/<uid>` chowned to the caller; unprivileged fallback
+   `/run/user/<uid>/scg`); endpoint sockets `0600`.
+5. **Memory** — memfds created `MFD_CLOEXEC | MFD_ALLOW_SEALING` and sealed; the
+   client-readable ring additionally `F_SEAL_WRITE`.
+6. **Resource safety** — per-uid **live-endpoint quota**
+   (`api.max_endpoints_per_uid`) and per-uid **create-request rate limit**
+   (`api.create_rate_per_min`); atomic create-or-replace tears down the previous
+   endpoint with no fd/mapping leak.
+7. **Audit** — every denial logs one greppable line
+   (`AUDIT deny op=… uid=… pid=… app_id=…: reason`).
+
+### Configuration
+
+A local interface is declared as a normal rule with `listen_proto` `"uds"` or
+`"shm"`, an `app_id`, a `traffic_class`, and an `allowed_uids` list; the `api`
+block tunes the management transport and the resource guards. See
+[09 — Configuration](docs/interfaces/09-configuration.md) and
+[10 — Management API](docs/interfaces/10-management-api.md), and
+[gateway.example.json](gateway.example.json) for a complete example.
+
+---
+
+## Deployment Hardening (optional)
+
+The defaults above are self-contained and need no external tooling. For
+defense-in-depth in production, the following **optional** OS-level measures
+compose well with the gateway and are recommended but not required:
+
+- **Mount/PID/user namespaces** — run the gateway and each app group in their own
+  namespaces so the per-uid `/run/scg/<uid>` runtime directory and the endpoint
+  sockets are only visible to intended processes.
+- **SELinux / AppArmor** — confine the gateway and client processes with a policy
+  that restricts which uids may `connect()` the management/endpoint sockets and
+  which paths are reachable, backstopping the in-process `SO_PEERCRED` checks.
+- **seccomp-bpf** — restrict the gateway's syscall surface (e.g. deny `ptrace`,
+  unexpected `socket` families) once the steady-state syscall set is profiled.
+- **pidfd pinning (future)** — `scg_ipc::os::pidfd_open` is available to pin the
+  caller's process identity across the gRPC→data-plane hop. v1 relies on a fresh
+  `SO_PEERCRED` check at each connect plus the single-use token, which already
+  closes the PID-reuse window; pidfd pinning is documented here as an available
+  enhancement rather than a requirement.
+- **systemd sandboxing** — `DynamicUser=`, `ProtectSystem=strict`,
+  `RuntimeDirectory=scg`, `RestrictAddressFamilies=AF_UNIX AF_INET`, and
+  `NoNewPrivileges=yes` give most of the above with minimal configuration.

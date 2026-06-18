@@ -2,6 +2,8 @@
 //!
 //! gRPC APIs for runtime control and administration.
 
+pub mod grpc;
+
 // TODO: gRPC API
 // - Runtime status queries (active rules, connection counts, throughput)
 // - Rule management (add/remove/modify rules without config file)

@@ -283,6 +283,28 @@ pub fn run(
         pipeline.clone(),
     );
 
+    // Build the interface manager (owns dynamically-created UDS/SHM endpoints)
+    // and start the management API (gRPC) on a dedicated thread, off the data path.
+    let interface_manager = interfaces::manager::InterfaceManager::new(
+        &config,
+        env!("CARGO_PKG_VERSION"),
+        shutdown.clone(),
+    );
+    let api_cfg = config.api.clone().unwrap_or_default();
+    let mgmt_handle = if api_cfg.enabled {
+        match api::grpc::start_management_server(interface_manager.clone(), api_cfg, shutdown.clone())
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                error!("Failed to start management API: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("Management API disabled (api.enabled = false)");
+        None
+    };
+
     // Start config watcher for hot-reload (if --watch or always via SIGHUP)
     let shared_config = SharedConfig::new(config.clone(), &config_path);
     let watcher_shutdown = shutdown.clone();
@@ -358,6 +380,15 @@ pub fn run(
     for handle in handles {
         let _ = handle.join();
     }
+
+    // If only on-demand interfaces are configured (no static listeners above),
+    // block on the management server so the gateway stays alive until shutdown.
+    if let Some(h) = mgmt_handle {
+        let _ = h.join();
+    }
+
+    // Shutdown has fired: tear down any live UDS/SHM endpoints.
+    interface_manager.shutdown_all();
 
     info!("Shutdown complete");
 }

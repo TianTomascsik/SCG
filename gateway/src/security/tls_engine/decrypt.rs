@@ -285,6 +285,12 @@ pub(crate) fn handle_tcp_decrypt(
 
     // ── Connect to upstream (plain) ──────────────────────────────────────────
     match upstream_proto {
+        Proto::Uds | Proto::Shm => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("upstream protocol {} is not valid on the TLS decrypt path", upstream_proto),
+            ));
+        }
         Proto::Tcp => {
             let upstream = connect_with_retry(
                 upstream_addr,

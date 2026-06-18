@@ -123,6 +123,15 @@ pub fn start_rules(
         Arc::new(Mutex::new(HashMap::new()));
 
     for rule in &config.rules {
+        // uds/shm rules are templates consumed by the InterfaceManager and
+        // started on demand via the management API — not as static listeners.
+        if matches!(rule.listen_proto, Proto::Uds | Proto::Shm) {
+            debug!(
+                "[{}] uds/shm rule registered as a local-interface template (started on demand)",
+                rule.name
+            );
+            continue;
+        }
         let handle = start_single_rule(
             rule,
             config,

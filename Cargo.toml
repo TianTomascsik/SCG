@@ -7,6 +7,13 @@ members = [
     "crates/ktls_pipe",
     "crates/tls_pipe",
     "crates/bench_log",
+
+    # Local-interface IPC primitives and gRPC management protocol
+    "crates/scg-ipc",
+    "crates/scg-proto",
+
+    # Client library (Rust core + C/C++ ABI) for the local interfaces
+    "crates/scg-client",
 ]
 resolver = "2"
 

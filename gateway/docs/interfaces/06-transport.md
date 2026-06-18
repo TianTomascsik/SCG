@@ -157,3 +157,31 @@ the factory; `transport` generalizes it to `uds`/`shm`.)
 - [ ] TPROXY original-destination is exposed for `upstream_addr: "auto"`.
 - [ ] Half-close via `shutdown_write` is supported for stream transports.
 - [ ] Factory/connector are `Send + Sync`; listeners/conns are `Send`.
+
+---
+
+## Implemented — UDS & SHM local interfaces
+
+The UDS and SHM transports are **implemented today** as on-demand *local
+interfaces* rather than statically-bound listeners. They are provisioned per
+application and per traffic class through the management API; the wire and
+security details live in [Architecture.md](../../Architecture.md) → *Local
+Interfaces* and [10 — Management API](10-management-api.md). Transport-relevant
+specifics:
+
+- **UDS** ([src/interfaces/uds.rs](../../src/interfaces/uds.rs)) is a **transparent
+  byte pipe**: the gateway's TLS byte stream (`[len][traffic_id][data]` frames)
+  passes through untouched, so a UDS client and an SHM client interoperate
+  end-to-end. The endpoint socket is `0600`, owned by the authorized uid, inside
+  a per-uid `0700` directory.
+- **SHM** ([src/interfaces/shm.rs](../../src/interfaces/shm.rs)) uses **two
+  unidirectional rings** (client→gateway, gateway→client) in a sealed memfd. The
+  client-readable ring is `F_SEAL_WRITE` so the client maps it **read-only**
+  (`Conn::raw_fd` is `None`, matching the checklist). Descriptors are handed to
+  the client over the control socket via `SCM_RIGHTS`.
+- **Wakeup** defaults to **eventfd** so the single-threaded relay can multiplex
+  the upstream fd and the ring notification through one `poll`/`epoll`. The
+  trade-off (eventfd vs. strict/hybrid futex vs. busy-poll) is quantified by the
+  `wakeup_bench` micro-benchmark in
+  [SCG-Interface-benchmarks/bench_shm](../../../SCG-Interface-benchmarks/bench_shm);
+  busy-poll/hybrid remain available as a dedicated-core low-latency knob.

@@ -148,3 +148,54 @@ impl ManagementApi for CoreManagement {
 - [ ] `rotate_keys` overlaps epochs so live handshakes are unaffected.
 - [ ] Health probes distinguish liveness from readiness.
 - [ ] Served off the data path (separate listener) and is `Send + Sync`.
+
+---
+
+## Implemented — Local-interface provisioning (gRPC over UDS)
+
+The shipped management surface is the **`scg.management.v1.ManagementApi`** gRPC
+service ([crates/scg-proto](../../../crates/scg-proto)), served on a dedicated
+thread off the data path ([src/api/grpc.rs](../../src/api/grpc.rs)). It is the
+control plane through which co-located apps obtain **per-app, per-traffic-class**
+UDS/SHM endpoints (see [Architecture.md](../../Architecture.md) → *Local
+Interfaces*).
+
+### Transport & caller identity
+
+- **Default:** gRPC-over-UDS at `api.uds_path` (`/run/scg/management.sock`). The
+  Unix socket gives a kernel-verified `SO_PEERCRED` → `CallerCred { uid, gid,
+  pid }` with no network exposure.
+- **Optional:** `api.tcp_addr` enables a TCP listener for remote admin.
+
+### RPCs
+
+| RPC | Contract |
+|---|---|
+| `CreateUdsEndpoint(app_id, traffic_class, direction)` | Authorize the caller against the matching uds rule template, enforce the per-uid quota + rate limit, mint a **single-use 256-bit token**, spawn the endpoint, and return `{ socket_path, token, endpoint_id }`. |
+| `CreateShmEndpoint(app_id, traffic_class, direction, ring_capacity)` | As above but returns `{ control_socket_path, token, endpoint_id, cap_c2g, cap_g2c, notify }`; the client connects the control socket, presents the token, and receives the memfd + eventfd descriptors via `SCM_RIGHTS`. |
+| `CloseEndpoint(endpoint_id)` | Only the owning uid may close; tears the endpoint down (create-or-replace also tears down the previous endpoint for the same slot). |
+| `Health()` | `{ healthy, version }`. |
+| `ListRules()` | Snapshot of the configured pipeline rules. |
+
+### Token / HELLO flow
+
+The token returned by a `Create*` RPC is presented as the **first data-plane
+frame** (`HELLO`) on the endpoint/control socket. `authenticate_peer`
+re-checks `SO_PEERCRED` (peer uid must equal the endpoint owner and be in
+`allowed_uids`; pid checked when `allowed_pids` is set), compares the token in
+**constant time**, and **consumes it under a lock** so a racing connection cannot
+reuse it. Tokens never appear in logs (Debug masks them as `***`).
+
+### Errors & audit
+
+| Condition | gRPC status |
+|---|---|
+| Unknown `app_id`/class/direction | `NOT_FOUND` |
+| uid/pid not authorized | `PERMISSION_DENIED` |
+| Per-uid quota or rate limit exceeded | `RESOURCE_EXHAUSTED` |
+| `decrypt` direction (v1) | `UNIMPLEMENTED` |
+
+Every denial emits one greppable audit line:
+`AUDIT deny op=… uid=… pid=… app_id=…: reason`. Resource guards are configured
+via `api.max_endpoints_per_uid` and `api.create_rate_per_min` (see
+[09 — Configuration](09-configuration.md)).

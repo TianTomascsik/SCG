@@ -43,6 +43,13 @@ impl CryptoProvider for KtlsProvider {
         match ctx.listen_proto {
             Proto::Tcp => encrypt::run_tcp_encrypt_listener(ctx),
             Proto::Udp => encrypt::run_udp_encrypt_relay(ctx),
+            Proto::Uds | Proto::Shm => {
+                return Err(format!(
+                    "security provider cannot listen on {} directly; UDS/SHM endpoints \
+                     are driven by the interface manager",
+                    ctx.listen_proto
+                ));
+            }
         }
         Ok(())
     }

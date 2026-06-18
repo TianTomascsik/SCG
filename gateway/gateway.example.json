@@ -122,6 +122,42 @@
       "traffic_class": "normal",
       "app_id": "diagnostics",
       "app_protocol": "ale"
+    },
+    {
+      "name": "local-uds-safety",
+      "direction": "encrypt",
+      "listen_proto": "uds",
+      "listen_addr": "local",
+      "upstream_addr": "remote-gw:5443",
+      "security_provider": "ktls",
+      "traffic_class": "safety",
+      "app_id": "etcs_onboard",
+      "allowed_uids": [1000],
+      "allowed_pids": []
+    },
+    {
+      "name": "local-shm-safety",
+      "direction": "encrypt",
+      "listen_proto": "shm",
+      "listen_addr": "local",
+      "upstream_addr": "remote-gw:5443",
+      "security_provider": "ktls",
+      "traffic_class": "safety",
+      "app_id": "etcs_onboard_shm",
+      "allowed_uids": [1000],
+      "allowed_pids": []
+    },
+    {
+      "name": "local-uds-normal",
+      "direction": "encrypt",
+      "listen_proto": "uds",
+      "listen_addr": "local",
+      "upstream_addr": "remote-gw:5444",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "app_id": "diagnostics_local",
+      "allowed_uids": [1000, 1001],
+      "allowed_pids": []
     }
   ],
   "traffic_rules": [
@@ -154,5 +190,14 @@
   "cache": {
     "max_entries": 10000,
     "ttl_secs": 300
+  },
+  "api": {
+    "enabled": true,
+    "uds_path": "/run/scg/management.sock",
+    "tcp_addr": null,
+    "runtime_dir": "/run/scg",
+    "shm_ring_capacity": 1048576,
+    "max_endpoints_per_uid": 64,
+    "create_rate_per_min": 120
   }
 }

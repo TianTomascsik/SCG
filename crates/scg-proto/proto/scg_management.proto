@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+// Management API for the Secure Communication Gateway.
+//
+// This service runs on a dedicated management thread (its own tokio runtime),
+// completely off the synchronous data path. The default transport is gRPC over
+// a Unix-domain socket so the gateway can read SO_PEERCRED and authenticate the
+// caller's uid/gid/pid; an optional TCP bind is available for remote admin.
+package scg.management.v1;
+
+// Traffic priority class. Mirrors the gateway's `TrafficClass`.
+enum TrafficClass {
+  TRAFFIC_CLASS_NORMAL = 0;
+  TRAFFIC_CLASS_SAFETY = 1;
+}
+
+// Proxy direction from the client's point of view. Mirrors `Direction`.
+enum Direction {
+  // Client sends plaintext; the gateway encrypts and forwards upstream.
+  DIRECTION_ENCRYPT = 0;
+  // Gateway decrypts inbound traffic and delivers plaintext to the client.
+  DIRECTION_DECRYPT = 1;
+}
+
+// Wakeup mechanism for shared-memory rings.
+enum Notify {
+  NOTIFY_EVENTFD = 0;
+  NOTIFY_FUTEX = 1;
+}
+
+service ManagementApi {
+  // Create (or atomically replace) a UDS endpoint bound to the caller's
+  // (app_id, traffic_class, direction). Returns the socket path and the
+  // single-use capability token the client must present as its first frame.
+  rpc CreateUdsEndpoint(CreateEndpointRequest) returns (UdsEndpointResponse);
+
+  // Create (or atomically replace) a shared-memory endpoint. The response
+  // carries the path of a control socket; the client connects to it, presents
+  // the token, and receives the memfd/eventfd descriptors via SCM_RIGHTS.
+  rpc CreateShmEndpoint(CreateEndpointRequest) returns (ShmEndpointResponse);
+
+  // Tear down a previously created endpoint and revoke its token.
+  rpc CloseEndpoint(CloseEndpointRequest) returns (CloseEndpointResponse);
+
+  // Liveness/version probe.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Enumerate the configured pipeline rules (admin/diagnostics).
+  rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
+}
+
+message CreateEndpointRequest {
+  // Application identity; must map to the caller's uid in gateway config.
+  string app_id = 1;
+  TrafficClass traffic_class = 2;
+  Direction direction = 3;
+  // Desired ring capacity in bytes per direction (SHM only; 0 = gateway default).
+  uint64 ring_capacity = 4;
+}
+
+message UdsEndpointResponse {
+  // Filesystem path of the per-endpoint UDS the client connects to.
+  string socket_path = 1;
+  // 32-byte single-use capability token.
+  bytes token = 2;
+  // Opaque gateway-side endpoint identifier (used to close it later).
+  uint32 endpoint_id = 3;
+}
+
+message ShmEndpointResponse {
+  // 32-byte single-use capability token.
+  bytes token = 1;
+  uint32 endpoint_id = 2;
+  // Control socket over which the client sends the token and receives the
+  // memfd/eventfd descriptors via SCM_RIGHTS.
+  string control_socket_path = 3;
+  // Capacity in bytes of the client->gateway data ring.
+  uint64 cap_c2g = 4;
+  // Capacity in bytes of the gateway->client data ring.
+  uint64 cap_g2c = 5;
+  // Notification mechanism negotiated for the rings.
+  Notify notify = 6;
+}
+
+message CloseEndpointRequest {
+  uint32 endpoint_id = 1;
+}
+
+message CloseEndpointResponse {
+  bool closed = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+}
+
+message ListRulesRequest {}
+
+message RuleInfo {
+  string name = 1;
+  string app_id = 2;
+  TrafficClass traffic_class = 3;
+  string listen_proto = 4;
+  string upstream_proto = 5;
+}
+
+message ListRulesResponse {
+  repeated RuleInfo rules = 1;
+}

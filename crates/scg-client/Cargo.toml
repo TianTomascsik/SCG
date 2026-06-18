@@ -1,0 +1,30 @@
+[package]
+name = "scg-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Client library (Rust core + C/C++ ABI) for the SCG local interfaces (UDS and shared memory)."
+
+[lib]
+name = "scg_client"
+# rlib   : consumed by Rust programs and the crate's own examples.
+# cdylib : shared library (`libscg_client.so`) for C/C++ via the C ABI.
+# staticlib: static archive (`libscg_client.a`) for static linking.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+scg-ipc = { path = "../scg-ipc" }
+scg-proto = { path = "../scg-proto" }
+tonic = "0.12"
+prost = "0.13"
+# A small current-thread runtime is created only for the (rare) gRPC management
+# calls; the data plane stays synchronous.
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+log = "0.4"
+
+[build-dependencies]
+# Generates the C header (`include/scg_client.h`) from the `extern "C"` surface.
+cbindgen = { version = "0.27", default-features = false }

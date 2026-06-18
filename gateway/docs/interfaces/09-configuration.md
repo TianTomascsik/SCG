@@ -129,3 +129,79 @@ gateway --config-source etcd://cluster/scg/cfg  # alternative source (proposed)
 - [ ] Hot-reload leaves existing connections untouched.
 - [ ] `watch()` honours the shutdown flag; dropping `WatchHandle` stops it.
 - [ ] Trait is `Send + Sync`.
+
+---
+
+## Implemented — Local-interface configuration (UDS/SHM + `api`)
+
+Local interfaces are configured through the **same** `GatewayConfig` schema
+already validated by `GatewayConfig::load`/`validate`. Two additions are
+relevant.
+
+### Local-interface rules
+
+A UDS or SHM endpoint is declared as a normal rule whose `listen_proto` is
+`"uds"` or `"shm"`. Such rules are **templates** consumed by the
+`InterfaceManager`: they have no static listen socket, so `validate()` skips the
+`listen_addr` parse and instead requires a non-empty `app_id` and at least one
+`allowed_uids` entry.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `listen_proto` | yes | `"uds"` or `"shm"`. |
+| `app_id` | yes | Identifies the application slot the client requests. |
+| `traffic_class` | no (default `normal`) | `"safety"` or `"normal"` — endpoints are provisioned **per app and per class**. |
+| `direction` | yes | v1 supports `"encrypt"` only; `"decrypt"` is rejected at create time (`UNIMPLEMENTED`). |
+| `upstream_addr` | yes | `HOST:PORT` TLS upstream the endpoint relays to. |
+| `security_provider` | no | `"tls"` (default) or `"ktls"` for the upstream leg. |
+| `allowed_uids` | yes (non-empty) | uids permitted to open the endpoint; enforced via `SO_PEERCRED`. An empty list disables the local interface for the rule. |
+| `allowed_pids` | no | When non-empty, the peer pid must also match. |
+
+```json
+{
+  "name": "local-uds-safety",
+  "direction": "encrypt",
+  "listen_proto": "uds",
+  "listen_addr": "local",
+  "upstream_addr": "remote-gw:5443",
+  "security_provider": "ktls",
+  "traffic_class": "safety",
+  "app_id": "etcs_onboard",
+  "allowed_uids": [1000],
+  "allowed_pids": []
+}
+```
+
+### The `api` block
+
+Optional; when omitted it defaults to gRPC-over-UDS at
+`/run/scg/management.sock` with no TCP listener. It also tunes the per-uid
+resource guards added for security hardening.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Start the management API. |
+| `uds_path` | `/run/scg/management.sock` | gRPC-over-UDS control socket (`SO_PEERCRED`-authenticated). |
+| `tcp_addr` | `null` | Optional TCP bind for remote admin (e.g. `"127.0.0.1:50080"`). |
+| `runtime_dir` | `/run/scg` | Base dir for per-uid endpoint sockets (`<dir>/<uid>`, `0700`). |
+| `shm_ring_capacity` | `1048576` | Default SHM ring size per direction (bytes, page-rounded). |
+| `max_endpoints_per_uid` | `64` | Max simultaneously-live endpoints per uid (`0` = unlimited). Exceeding it returns `RESOURCE_EXHAUSTED`. |
+| `create_rate_per_min` | `120` | Per-uid token-bucket limit on create requests (`0` = unlimited). |
+
+```json
+"api": {
+  "enabled": true,
+  "uds_path": "/run/scg/management.sock",
+  "tcp_addr": null,
+  "runtime_dir": "/run/scg",
+  "shm_ring_capacity": 1048576,
+  "max_endpoints_per_uid": 64,
+  "create_rate_per_min": 120
+}
+```
+
+Validate any config (including the local-interface rules and `api` block) with:
+
+```bash
+gateway --config gateway/gateway.example.json --validate
+```

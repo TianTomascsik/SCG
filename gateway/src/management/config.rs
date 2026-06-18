@@ -53,6 +53,93 @@ pub struct GatewayConfig {
     /// Can be overridden by --log-level CLI flag.
     #[serde(default)]
     pub log_level: Option<String>,
+
+    /// Management API (gRPC) configuration (optional). When omitted, defaults
+    /// to gRPC-over-UDS at `/run/scg/management.sock` with no TCP listener.
+    #[serde(default)]
+    pub api: Option<ApiConfig>,
+}
+
+/// Management API (gRPC) configuration.
+///
+/// The control plane runs on a dedicated thread off the data path. UDS is the
+/// default transport because it yields `SO_PEERCRED`-authenticated caller
+/// identity and exposes no network port; TCP is opt-in for remote admin.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiConfig {
+    /// Whether the management API is started (default: true).
+    #[serde(default = "default_api_enabled")]
+    pub enabled: bool,
+
+    /// Path of the gRPC-over-UDS management socket
+    /// (default: `/run/scg/management.sock`).
+    #[serde(default = "default_mgmt_uds")]
+    pub uds_path: String,
+
+    /// Optional TCP bind address for remote admin (e.g. "127.0.0.1:50080").
+    /// Disabled when unset.
+    #[serde(default)]
+    pub tcp_addr: Option<String>,
+
+    /// Directory under which per-endpoint UDS/SHM control sockets are created
+    /// (default: `/run/scg`). A per-uid subdirectory is created beneath it.
+    #[serde(default = "default_runtime_dir")]
+    pub runtime_dir: String,
+
+    /// Default shared-memory ring capacity in bytes, per direction
+    /// (default: 1 MiB).
+    #[serde(default = "default_shm_ring_capacity")]
+    pub shm_ring_capacity: usize,
+
+    /// Maximum number of simultaneously-live local endpoints a single uid may
+    /// own. Guards against local resource exhaustion from a buggy or hostile
+    /// authorised client (default: 64; `0` disables the quota).
+    #[serde(default = "default_max_endpoints_per_uid")]
+    pub max_endpoints_per_uid: u32,
+
+    /// Maximum endpoint-creation requests a single uid may issue per minute.
+    /// Token-bucket rate limit protecting the control plane (default: 120;
+    /// `0` disables the limit).
+    #[serde(default = "default_create_rate_per_min")]
+    pub create_rate_per_min: u32,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        ApiConfig {
+            enabled: default_api_enabled(),
+            uds_path: default_mgmt_uds(),
+            tcp_addr: None,
+            runtime_dir: default_runtime_dir(),
+            shm_ring_capacity: default_shm_ring_capacity(),
+            max_endpoints_per_uid: default_max_endpoints_per_uid(),
+            create_rate_per_min: default_create_rate_per_min(),
+        }
+    }
+}
+
+fn default_api_enabled() -> bool {
+    true
+}
+
+fn default_mgmt_uds() -> String {
+    "/run/scg/management.sock".to_string()
+}
+
+fn default_runtime_dir() -> String {
+    "/run/scg".to_string()
+}
+
+fn default_shm_ring_capacity() -> usize {
+    1024 * 1024 // 1 MiB
+}
+
+fn default_max_endpoints_per_uid() -> u32 {
+    64
+}
+
+fn default_create_rate_per_min() -> u32 {
+    120
 }
 
 fn default_log_dir() -> String {
@@ -160,6 +247,19 @@ pub struct RuleConfig {
     /// Default: None (TLS 1.2 for tls/ktls, DTLS 1.2 for dtls).
     #[serde(default)]
     pub protocol_version: Option<String>,
+
+    /// Local-interface access control: uids permitted to open a dynamically
+    /// created UDS/SHM endpoint bound to this rule's `app_id`. An empty list
+    /// means no local client is authorised (the local interface is disabled
+    /// for this rule). Enforced via `SO_PEERCRED` at connect time.
+    #[serde(default)]
+    pub allowed_uids: Vec<u32>,
+
+    /// Optional stricter access control: when non-empty, the connecting peer's
+    /// pid (from `SO_PEERCRED`) must also appear here. Empty disables the pid
+    /// check (the uid check still applies).
+    #[serde(default)]
+    pub allowed_pids: Vec<i32>,
 }
 
 impl RuleConfig {
@@ -240,6 +340,10 @@ impl fmt::Display for Direction {
 pub enum Proto {
     Tcp,
     Udp,
+    /// Unix-domain-socket local interface (dynamically created per app/class).
+    Uds,
+    /// Shared-memory local interface (dynamically created per app/class).
+    Shm,
 }
 
 impl fmt::Display for Proto {
@@ -247,6 +351,8 @@ impl fmt::Display for Proto {
         match self {
             Proto::Tcp => write!(f, "tcp"),
             Proto::Udp => write!(f, "udp"),
+            Proto::Uds => write!(f, "uds"),
+            Proto::Shm => write!(f, "shm"),
         }
     }
 }
@@ -499,20 +605,41 @@ impl GatewayConfig {
             }
 
             // Validate listen address parses
-            let listen_sock: SocketAddr = rule.listen_addr.parse::<SocketAddr>().map_err(|e| {
-                format!(
-                    "Rule '{}' (index {}): invalid listen_addr '{}': {}",
-                    rule.name, i, rule.listen_addr, e
-                )
-            })?;
+            //
+            // UDS/SHM rules are templates for dynamically-created local
+            // endpoints (consumed by the InterfaceManager and started on demand
+            // via the management API). They have no static TCP/UDP listen
+            // address, so validate their local-interface requirements instead.
+            if matches!(rule.listen_proto, Proto::Uds | Proto::Shm) {
+                if rule.app_id.as_deref().unwrap_or("").is_empty() {
+                    return Err(format!(
+                        "Rule '{}' (index {}): {} rules require a non-empty \"app_id\"",
+                        rule.name, i, rule.listen_proto
+                    ));
+                }
+                if rule.allowed_uids.is_empty() {
+                    return Err(format!(
+                        "Rule '{}' (index {}): {} rules require at least one uid in \"allowed_uids\" \
+                         (an empty list disables the local interface)",
+                        rule.name, i, rule.listen_proto
+                    ));
+                }
+            } else {
+                let listen_sock: SocketAddr = rule.listen_addr.parse::<SocketAddr>().map_err(|e| {
+                    format!(
+                        "Rule '{}' (index {}): invalid listen_addr '{}': {}",
+                        rule.name, i, rule.listen_addr, e
+                    )
+                })?;
 
-            // Duplicate listen addresses (same proto+addr = port conflict)
-            let listen_key = format!("{}:{}", rule.listen_proto, listen_sock);
-            if !seen_listen.insert(listen_key.clone()) {
-                return Err(format!(
-                    "Rule '{}' (index {}): listen address {} ({}) conflicts with another rule",
-                    rule.name, i, rule.listen_addr, rule.listen_proto
-                ));
+                // Duplicate listen addresses (same proto+addr = port conflict)
+                let listen_key = format!("{}:{}", rule.listen_proto, listen_sock);
+                if !seen_listen.insert(listen_key.clone()) {
+                    return Err(format!(
+                        "Rule '{}' (index {}): listen address {} ({}) conflicts with another rule",
+                        rule.name, i, rule.listen_addr, rule.listen_proto
+                    ));
+                }
             }
 
             // Validate upstream address (host:port format) unless "auto"
@@ -709,6 +836,9 @@ impl GatewayConfig {
                 let available = match proto {
                     Proto::Tcp => std::net::TcpListener::bind(&rule.listen_addr).is_ok(),
                     Proto::Udp => std::net::UdpSocket::bind(&rule.listen_addr).is_ok(),
+                    // UDS/SHM endpoints are not network ports and are created
+                    // dynamically; they never reach this `SocketAddr` branch.
+                    Proto::Uds | Proto::Shm => true,
                 };
                 if !available {
                     warnings.push(format!(
