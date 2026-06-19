@@ -1,0 +1,33 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "subset146-psk-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:7101",
+      "listen_proto": "tcp",
+      "upstream_addr": "peer-gw.example:7543",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "protocol_version": "tls1.2",
+      "profile": "subset146-psk",
+      "psk_identity": "etcs-onboard-01",
+      "psk_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "name": "subset146-psk-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:7543",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:7102",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "protocol_version": "tls1.2",
+      "profile": "subset146-psk",
+      "psk_identity": "etcs-onboard-01",
+      "psk_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    }
+  ]
+}

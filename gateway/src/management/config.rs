@@ -666,6 +666,27 @@ impl GatewayConfig {
                 ));
             }
 
+            // kTLS capability gate: kernel TLS cannot offload NULL-encryption
+            // (integrity-only) cipher suites. Reject at load so the error is
+            // surfaced early instead of at connection time. Other non-offloadable
+            // profiles (PKI/PSK/verify) fall back to userspace TLS at runtime.
+            let is_ktls = rule.effective_security_provider() == "ktls"
+                || (rule.tls_mode == TlsMode::Ktls
+                    && rule.effective_security_provider() == "tls");
+            if is_ktls {
+                if let Some(profile) =
+                    rule.provider_params.get("profile").and_then(|v| v.as_str())
+                {
+                    if matches!(profile, "integrity-only" | "integrity" | "null") {
+                        return Err(format!(
+                            "Rule '{}' (index {}): kTLS cannot offload integrity-only (NULL) \
+                             cipher suites; use security_provider = \"tls\" instead",
+                            rule.name, i
+                        ));
+                    }
+                }
+            }
+
             // Buffer config validation
             if rule.buffer_slots == 0 {
                 return Err(format!(

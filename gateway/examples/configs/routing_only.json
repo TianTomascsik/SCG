@@ -1,0 +1,25 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "routing-ingress",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:9100",
+      "listen_proto": "tcp",
+      "upstream_addr": "backend.example:9100",
+      "upstream_proto": "tcp",
+      "security_provider": "routing",
+      "traffic_class": "normal"
+    },
+    {
+      "name": "routing-egress",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:9101",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:9100",
+      "upstream_proto": "tcp",
+      "security_provider": "routing",
+      "traffic_class": "normal"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "integrity-only-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:7201",
+      "listen_proto": "tcp",
+      "upstream_addr": "peer-gw.example:7643",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "protocol_version": "tls1.2",
+      "profile": "integrity-only",
+      "verify": "server",
+      "ca_path": "/etc/scg/pki/peer-ca.crt",
+      "server_name": "peer-gw.example"
+    },
+    {
+      "name": "integrity-only-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:7643",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:7202",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "protocol_version": "tls1.2",
+      "profile": "integrity-only",
+      "verify": "none",
+      "cert_path": "/etc/scg/pki/gateway.crt",
+      "key_path": "/etc/scg/pki/gateway.key"
+    }
+  ]
+}

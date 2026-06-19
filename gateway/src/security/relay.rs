@@ -4,12 +4,12 @@ use super::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::networking::socket_manager::{
     poll_two_fds, set_nonblocking_fd, set_quickack, write_all_nb, TcpCorkGuard,
 };
-use ale_pipe::{AleError, AleFrameReader, AleFrameWriter, ALE_PKT_DI, ALE_PKT_DT};
+use crate::security::udp_framing::UdpFraming;
 
 use crate::management::telemetry::{now_ns, ConnectionMetrics};
 use crate::security::{RELAY_BUF_SIZE, UDP_BUF_SIZE};
 
-use log::{debug, error};
+use log::debug;
 
 use std::io::{self, Read};
 use std::net::{TcpStream, UdpSocket};
@@ -140,6 +140,7 @@ pub fn relay_tls_to_udp(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
+    mut framing: UdpFraming,
 ) -> io::Result<()> {
     let tls_fd = tls_stream.raw_fd();
     let udp_fd = upstream.as_raw_fd();
@@ -157,8 +158,6 @@ pub fn relay_tls_to_udp(
         udp_buf.set_len(UDP_BUF_SIZE);
     }
 
-    let mut ale_reader = AleFrameReader::new();
-    let mut ale_writer = AleFrameWriter::new(0x00);
     let mut batch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     loop {
@@ -178,42 +177,19 @@ pub fn relay_tls_to_udp(
                 match tls_stream.read(&mut tls_buf) {
                     Ok(0) => return Ok(()),
                     Ok(n) => {
-                        match ale_reader.feed(&tls_buf[..n]) {
-                            Ok(frames) => {
-                                for frame in frames {
-                                    match frame.header.packet_type {
-                                        ALE_PKT_DT => {
-                                            apply_geo_delay(delay_ms);
-                                            let t0 = if measure_latency { now_ns() } else { 0 };
-                                            let _ = upstream.send(&frame.user_data);
-                                            let data_len = frame.user_data.len();
-                                            conn_metrics.record_read(data_len);
-                                            let lat =
-                                                if measure_latency { now_ns() - t0 } else { 0 };
-                                            conn_metrics.record_relay(
-                                                data_len,
-                                                if measure_latency { Some(lat) } else { None },
-                                            );
-                                        }
-                                        ALE_PKT_DI => {
-                                            debug!("[{}] Received ALE DI (disconnect)", rule_name);
-                                            return Ok(());
-                                        }
-                                        _ => {} // Ignore other types
-                                    }
-                                }
-                            }
-                            Err(AleError::ChecksumMismatch { expected, got }) => {
-                                error!(
-                                    "[{}] ALE checksum mismatch: expected 0x{:04X}, got 0x{:04X}",
-                                    rule_name, expected, got
-                                );
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                error!("[{}] ALE frame error: {}", rule_name, e);
-                                return Ok(());
-                            }
+                        let deframed = framing.deframe(rule_name, &tls_buf[..n]);
+                        for datagram in deframed.datagrams {
+                            apply_geo_delay(delay_ms);
+                            let t0 = if measure_latency { now_ns() } else { 0 };
+                            let _ = upstream.send(&datagram);
+                            let data_len = datagram.len();
+                            conn_metrics.record_read(data_len);
+                            let lat = if measure_latency { now_ns() - t0 } else { 0 };
+                            conn_metrics
+                                .record_relay(data_len, if measure_latency { Some(lat) } else { None });
+                        }
+                        if deframed.disconnect {
+                            return Ok(());
                         }
                         if tls_stream.ssl_pending() == 0 {
                             break 'tls_read;
@@ -226,13 +202,13 @@ pub fn relay_tls_to_udp(
             }
         }
 
-        // Reverse: UDP → TLS (receive datagrams, wrap in ALE DT frames, batched)
+        // Reverse: UDP → TLS (receive datagrams, frame ALE/raw, batched)
         if b_ready {
             batch_buf.clear();
             'udp_read: loop {
                 match upstream.recv(&mut udp_buf) {
                     Ok(n) => {
-                        let _ = ale_writer.write_alepkt(&mut batch_buf, ALE_PKT_DT, &udp_buf[..n]);
+                        framing.frame_into(&udp_buf[..n], &mut batch_buf);
                         conn_metrics.record_read(n);
                         conn_metrics.record_relay(n, None);
                     }
@@ -241,7 +217,7 @@ pub fn relay_tls_to_udp(
                     Err(_) => return Ok(()),
                 }
             }
-            // Flush batched ALE frames to TLS in a single write
+            // Flush batched frames to TLS in a single write
             if !batch_buf.is_empty() {
                 if write_all_nb_proxy(tls_stream, &batch_buf).is_err() {
                     return Ok(());
@@ -250,8 +226,8 @@ pub fn relay_tls_to_udp(
         }
     }
 
-    // Send ALE DI before closing
-    let _ = ale_writer.write_alepkt(tls_stream, ALE_PKT_DI, &[]);
+    // Send ALE DI before closing (no-op for raw framing)
+    framing.write_disconnect(tls_stream);
     tls_stream.shutdown_write();
     Ok(())
 }

@@ -39,6 +39,7 @@ use processing::traffic_analyzer::TrafficAnalyzer;
 use security::provider::CryptoProvider;
 use security::providers::dtls_provider::DtlsProvider;
 use security::providers::ktls_provider::KtlsProvider;
+use security::providers::routing_provider::RoutingProvider;
 use security::providers::tls_provider::TlsProvider;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -65,6 +66,7 @@ pub fn run(
     registry.register_crypto(Box::new(TlsProvider));
     registry.register_crypto(Box::new(KtlsProvider));
     registry.register_crypto(Box::new(DtlsProvider));
+    registry.register_crypto(Box::new(RoutingProvider));
     for provider in extra_crypto {
         registry.register_crypto(provider);
     }

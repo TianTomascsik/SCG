@@ -1,0 +1,38 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "subset146-pki-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:7001",
+      "listen_proto": "tcp",
+      "upstream_addr": "peer-gw.example:7443",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "protocol_version": "tls1.2",
+      "profile": "subset146-pki",
+      "verify": "mutual",
+      "cert_path": "/etc/scg/pki/onboard.crt",
+      "key_path": "/etc/scg/pki/onboard.key",
+      "ca_path": "/etc/scg/pki/subset146-ca.crt",
+      "server_name": "peer-gw.example"
+    },
+    {
+      "name": "subset146-pki-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:7443",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:7002",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "protocol_version": "tls1.2",
+      "profile": "subset146-pki",
+      "verify": "mutual",
+      "cert_path": "/etc/scg/pki/trackside.crt",
+      "key_path": "/etc/scg/pki/trackside.key",
+      "ca_path": "/etc/scg/pki/subset146-ca.crt"
+    }
+  ]
+}

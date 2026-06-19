@@ -1,0 +1,34 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "dtls12-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:6100",
+      "listen_proto": "udp",
+      "upstream_addr": "collector.example:6143",
+      "upstream_proto": "udp",
+      "security_provider": "dtls",
+      "traffic_class": "safety",
+      "protocol_version": "dtls1.2",
+      "verify": "server",
+      "ca_path": "/etc/scg/pki/collector-ca.crt",
+      "server_name": "collector.example"
+    },
+    {
+      "name": "dtls12-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:6143",
+      "listen_proto": "udp",
+      "upstream_addr": "127.0.0.1:6101",
+      "upstream_proto": "udp",
+      "security_provider": "dtls",
+      "traffic_class": "safety",
+      "protocol_version": "dtls1.2",
+      "verify": "mutual",
+      "cert_path": "/etc/scg/pki/collector.crt",
+      "key_path": "/etc/scg/pki/collector.key",
+      "ca_path": "/etc/scg/pki/sensor-ca.crt"
+    }
+  ]
+}

@@ -53,6 +53,10 @@ pub struct RuleContext {
     pub policy_manager: Option<Arc<RwLock<PolicyManager>>>,
     pub simulated_delay_ms: u64,
     pub protocol_version: Option<String>,
+    /// Application-level framing for UDP-over-TLS paths: `"ale"` (Subset-098
+    /// AU1/AU2 handshake + ALEPKT framing, the default) or `"raw"` (4-byte LE
+    /// length-prefix, no handshake).
+    pub app_protocol: String,
     /// Shared connection thread pool (TCP encrypt/decrypt handlers).
     pub conn_pool: Arc<ConnectionPool>,
 }
@@ -158,7 +162,7 @@ pub fn start_single_rule(
     let rule_name = rule.name.clone();
     let direction = rule.direction;
     let priority = rule.priority;
-    let security_provider = rule.effective_security_provider().to_string();
+    let mut security_provider = rule.effective_security_provider().to_string();
     let app_protocol = rule.effective_app_protocol();
 
     if let Some(app_id) = &rule.app_id {
@@ -166,6 +170,27 @@ pub fn start_single_rule(
             "[{}] Rule metadata: app_id={} app_protocol={}",
             rule_name, app_id, app_protocol
         );
+    }
+
+    // kTLS capability gate: kernel TLS only offloads the default AES-GCM,
+    // server-authenticated path. Profiles, peer verification or PSK cannot be
+    // offloaded, so transparently fall back to the userspace `tls` engine.
+    // (integrity-only on kTLS is rejected earlier at config-load time.)
+    if security_provider == "ktls" {
+        if let Ok(p) = crate::security::tls_engine::params::TlsSecurityParams::from_params(
+            &rule.provider_params,
+            rule.protocol_version.as_deref(),
+        ) {
+            if !p.is_ktls_offloadable() {
+                warn!(
+                    "[{}] kTLS cannot offload profile='{}'/verify settings; \
+                     falling back to userspace TLS",
+                    rule_name,
+                    p.profile.as_str()
+                );
+                security_provider = "tls".to_string();
+            }
+        }
     }
 
     // Per-rule shutdown flag (for hot-reload)
@@ -221,6 +246,7 @@ pub fn start_single_rule(
         policy_manager: Some(pipeline.policy_manager.clone()),
         simulated_delay_ms: rule.simulated_delay_ms,
         protocol_version: rule.protocol_version.clone(),
+        app_protocol: app_protocol.to_string(),
         conn_pool,
     };
 

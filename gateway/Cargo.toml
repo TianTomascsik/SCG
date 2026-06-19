@@ -41,3 +41,5 @@ scg-client = { path = "../crates/scg-client" }
 scg-ipc = { path = "../crates/scg-ipc" }
 serde_json = "1"
 libc = "0.2"
+# Test PKI fixtures and raw TLS test clients (mTLS / verify / SNI tests).
+openssl = "0.10"

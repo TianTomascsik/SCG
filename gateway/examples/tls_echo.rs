@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 
 use gateway::security::tls_engine::build_tls_acceptor;
+use gateway::security::tls_engine::params::TlsSecurityParams;
 
 fn main() {
     let addr = std::env::args()
@@ -23,7 +24,8 @@ fn main() {
     println!("LISTENING {local}");
     let _ = std::io::stdout().flush();
 
-    let acceptor = build_tls_acceptor(None).expect("build tls acceptor");
+    let acceptor =
+        build_tls_acceptor(&TlsSecurityParams::default()).expect("build tls acceptor");
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,

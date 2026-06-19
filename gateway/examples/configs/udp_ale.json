@@ -1,0 +1,32 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "ale-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:5200",
+      "listen_proto": "udp",
+      "upstream_addr": "collector.example:5243",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "app_protocol": "ale",
+      "verify": "server",
+      "ca_path": "/etc/scg/pki/collector-ca.crt",
+      "server_name": "collector.example"
+    },
+    {
+      "name": "ale-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:5243",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:5201",
+      "upstream_proto": "udp",
+      "security_provider": "tls",
+      "traffic_class": "safety",
+      "app_protocol": "ale",
+      "cert_path": "/etc/scg/pki/collector.crt",
+      "key_path": "/etc/scg/pki/collector.key"
+    }
+  ]
+}

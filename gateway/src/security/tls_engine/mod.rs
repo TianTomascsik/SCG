@@ -2,11 +2,16 @@
 
 pub mod decrypt;
 pub mod encrypt;
+pub mod params;
 
-use crate::management::cert_store::get_or_init_cert;
+use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 
 use ktls_pipe::KtlsSession;
-use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion};
+use openssl::ssl::{
+    SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslStream, SslVerifyMode, SslVersion,
+};
+
+use params::{TlsProfile, TlsSecurityParams, VerifyMode};
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -88,62 +93,216 @@ impl io::Write for ProxyStream {
 
 // ─── TLS builders ────────────────────────────────────────────────────────────
 
-/// Build a userspace TLS SslAcceptor (no kTLS).
-/// Accepts an optional protocol version: "tls1.2" (default) or "tls1.3".
-pub fn build_tls_acceptor(
-    version: Option<&str>,
-) -> Result<SslAcceptor, openssl::error::ErrorStack> {
-    let (pkey, cert) = get_or_init_cert()?;
-
-    match version {
-        Some("tls1.3") => {
-            // TLS 1.3 requires a plain builder — mozilla_intermediate restricts protocols
-            let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls())?;
-            builder.set_private_key(pkey)?;
-            builder.set_certificate(cert)?;
-            builder.check_private_key()?;
-            builder.set_ciphersuites("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384")?;
-            builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-            builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-            Ok(builder.build())
-        }
-        _ => {
-            // Default: TLS 1.2
-            let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
-            builder.set_private_key(pkey)?;
-            builder.set_certificate(cert)?;
-            builder.check_private_key()?;
-            builder.set_cipher_list("AES128-GCM-SHA256:AES256-GCM-SHA384")?;
-            builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-            builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
-            Ok(builder.build())
-        }
+/// Build a userspace TLS `SslAcceptor` from resolved security parameters.
+///
+/// Honours the rule's profile (cipher policy), peer verification (`verify`),
+/// file-based identity (`cert_path`/`key_path`), CA trust (`ca_path`) and PSK
+/// configuration. With default parameters this reproduces the historical
+/// behaviour (self-signed cert, `SslVerifyMode::NONE`, AES-GCM).
+pub fn build_tls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String> {
+    let is13 = params.is_tls13();
+    let mut builder = if is13 {
+        SslAcceptor::mozilla_modern_v5(SslMethod::tls())
+    } else {
+        SslAcceptor::mozilla_intermediate(SslMethod::tls())
     }
-}
+    .map_err(|e| format!("acceptor builder: {}", e))?;
 
-/// Build a userspace TLS SslConnector (no kTLS, no cert verification).
-/// Accepts an optional protocol version: "tls1.2" (default) or "tls1.3".
-pub fn build_tls_connector(
-    version: Option<&str>,
-) -> Result<SslConnector, openssl::error::ErrorStack> {
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
-    builder.set_verify(SslVerifyMode::NONE);
-
-    match version {
-        Some("tls1.3") => {
-            builder.set_ciphersuites("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384")?;
-            builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-            builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-        }
-        _ => {
-            // Default: TLS 1.2
-            builder.set_cipher_list("AES128-GCM-SHA256:AES256-GCM-SHA384")?;
-            builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-            builder.set_max_proto_version(Some(SslVersion::TLS1_2))?;
-        }
+    // PSK handshakes carry no certificate; everything else needs an identity.
+    if params.profile != TlsProfile::Subset146Psk {
+        apply_identity(&mut builder, params)?;
     }
+
+    apply_cipher_policy(&mut builder, params, is13)?;
+    apply_acceptor_verify(&mut builder, params)?;
+    apply_psk_server(&mut builder, params)?;
+    pin_version(&mut builder, is13)?;
 
     Ok(builder.build())
+}
+
+/// Build a userspace TLS `SslConnector` from resolved security parameters.
+///
+/// With default parameters verification is disabled (legacy behaviour). When
+/// `verify` is `server`/`mutual` the server certificate is validated against
+/// `ca_path` (and hostname checked at `connect` time); `mutual` additionally
+/// presents the client identity from `cert_path`/`key_path`.
+pub fn build_tls_connector(params: &TlsSecurityParams) -> Result<SslConnector, String> {
+    let is13 = params.is_tls13();
+    let mut builder =
+        SslConnector::builder(SslMethod::tls()).map_err(|e| format!("connector builder: {}", e))?;
+
+    // Present a client identity when configured (required for mutual auth).
+    if params.cert_path.is_some() {
+        apply_identity(&mut builder, params)?;
+    }
+
+    apply_cipher_policy(&mut builder, params, is13)?;
+    apply_connector_verify(&mut builder, params)?;
+    apply_psk_client(&mut builder, params)?;
+    pin_version(&mut builder, is13)?;
+
+    Ok(builder.build())
+}
+
+// ─── Builder helpers ─────────────────────────────────────────────────────────
+
+/// Load the file-based identity if configured, otherwise the cached self-signed
+/// certificate. Applies it to the builder and verifies the key matches.
+fn apply_identity(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+    match (&params.cert_path, &params.key_path) {
+        (Some(cert), Some(key)) => {
+            let (pkey, x509) = load_identity_pem(cert, key)?;
+            builder
+                .set_private_key(&pkey)
+                .map_err(|e| format!("set private key: {}", e))?;
+            builder
+                .set_certificate(&x509)
+                .map_err(|e| format!("set certificate: {}", e))?;
+        }
+        _ => {
+            let (pkey, x509) = get_or_init_cert().map_err(|e| format!("self-signed cert: {}", e))?;
+            builder
+                .set_private_key(pkey)
+                .map_err(|e| format!("set private key: {}", e))?;
+            builder
+                .set_certificate(x509)
+                .map_err(|e| format!("set certificate: {}", e))?;
+        }
+    }
+    builder
+        .check_private_key()
+        .map_err(|e| format!("certificate/key mismatch: {}", e))?;
+    Ok(())
+}
+
+/// Apply the profile-derived (or explicitly overridden) cipher policy.
+fn apply_cipher_policy(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+    is13: bool,
+) -> Result<(), String> {
+    let (list, suites) = params.cipher_policy();
+    if is13 {
+        if let Some(suites) = suites {
+            builder
+                .set_ciphersuites(&suites)
+                .map_err(|e| format!("set ciphersuites '{}': {}", suites, e))?;
+        }
+    } else if let Some(list) = list {
+        builder
+            .set_cipher_list(&list)
+            .map_err(|e| format!("set cipher list '{}': {}", list, e))?;
+    }
+    Ok(())
+}
+
+/// Configure verification for the listen (server) side of a rule.
+///
+/// Only `mutual` requires the client to present a certificate; `none`/`server`
+/// accept any client (a server cannot meaningfully "verify the server").
+fn apply_acceptor_verify(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
+    match params.verify {
+        VerifyMode::Mutual => {
+            set_ca(builder, params)?;
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        VerifyMode::None | VerifyMode::Server => {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+    }
+    Ok(())
+}
+
+/// Configure verification for the upstream (client) side of a rule.
+///
+/// `server`/`mutual` validate the upstream certificate chain against `ca_path`;
+/// hostname checking is performed by `connect()` using the SNI name.
+fn apply_connector_verify(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
+    match params.verify {
+        VerifyMode::Server | VerifyMode::Mutual => {
+            set_ca(builder, params)?;
+            builder.set_verify(SslVerifyMode::PEER);
+        }
+        VerifyMode::None => {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+    }
+    Ok(())
+}
+
+/// Load the configured CA bundle into the builder's trust store.
+fn set_ca(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+    if let Some(ca) = &params.ca_path {
+        builder
+            .set_ca_file(ca)
+            .map_err(|e| format!("load ca_path '{}': {}", ca.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Wire the server-side PSK callback for the `subset146-psk` profile.
+fn apply_psk_server(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+    if params.profile != TlsProfile::Subset146Psk {
+        return Ok(());
+    }
+    let expected_identity = params.psk_identity.clone().unwrap_or_default();
+    let key = params.psk_key.clone().unwrap_or_default();
+    #[allow(deprecated)]
+    builder.set_psk_server_callback(move |_ssl, client_identity, psk_out| {
+        let matches = client_identity
+            .map(|id| id == expected_identity.as_bytes())
+            .unwrap_or(false);
+        if !matches || key.len() > psk_out.len() {
+            return Ok(0); // reject: identity mismatch or buffer too small
+        }
+        psk_out[..key.len()].copy_from_slice(&key);
+        Ok(key.len())
+    });
+    Ok(())
+}
+
+/// Wire the client-side PSK callback for the `subset146-psk` profile.
+fn apply_psk_client(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+    if params.profile != TlsProfile::Subset146Psk {
+        return Ok(());
+    }
+    let identity = params.psk_identity.clone().unwrap_or_default();
+    let key = params.psk_key.clone().unwrap_or_default();
+    #[allow(deprecated)]
+    builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+        // identity_out must be NUL-terminated, so reserve one byte.
+        if identity.len() + 1 > identity_out.len() || key.len() > psk_out.len() {
+            return Ok(0);
+        }
+        identity_out[..identity.len()].copy_from_slice(identity.as_bytes());
+        identity_out[identity.len()] = 0;
+        psk_out[..key.len()].copy_from_slice(&key);
+        Ok(key.len())
+    });
+    Ok(())
+}
+
+/// Pin the protocol version (min == max) to the selected TLS version.
+fn pin_version(builder: &mut SslContextBuilder, is13: bool) -> Result<(), String> {
+    let v = if is13 {
+        SslVersion::TLS1_3
+    } else {
+        SslVersion::TLS1_2
+    };
+    builder
+        .set_min_proto_version(Some(v))
+        .map_err(|e| format!("set min version: {}", e))?;
+    builder
+        .set_max_proto_version(Some(v))
+        .map_err(|e| format!("set max version: {}", e))?;
+    Ok(())
 }
 
 // ─── ProxyStream write helpers ───────────────────────────────────────────────

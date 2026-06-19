@@ -106,12 +106,48 @@ forward plaintext on the protected side when protection cannot be established.
 
 | Provider | `name()` | File | Notes |
 |----------|----------|------|-------|
-| `TlsProvider` | `"tls"` | [providers/tls_provider.rs](../../src/security/providers/tls_provider.rs) | OpenSSL userspace TLS; TCP + UDP-over-TLS. |
-| `KtlsProvider` | `"ktls"` | [providers/ktls_provider.rs](../../src/security/providers/ktls_provider.rs) | Kernel TLS offload; shares the TLS engine. |
-| `DtlsProvider` | `"dtls"` | [providers/dtls_provider.rs](../../src/security/providers/dtls_provider.rs) | Datagram TLS; UDP only. |
+| `TlsProvider` | `"tls"` | [providers/tls_provider.rs](../../src/security/providers/tls_provider.rs) | OpenSSL userspace TLS; TCP + UDP-over-TLS. Honours the security profiles + verify modes below. |
+| `KtlsProvider` | `"ktls"` | [providers/ktls_provider.rs](../../src/security/providers/ktls_provider.rs) | Kernel TLS offload; shares the TLS engine. Non-offloadable profiles fall back to userspace `tls`; integrity-only is rejected at config-load. |
+| `DtlsProvider` | `"dtls"` | [providers/dtls_provider.rs](../../src/security/providers/dtls_provider.rs) | Datagram TLS; UDP only. DTLS 1.0 (CBC) + DTLS 1.2 (AEAD), verify/CA/identity parity with `tls`. |
+| `RoutingProvider` | `"routing"` | [providers/routing_provider.rs](../../src/security/providers/routing_provider.rs) | Plaintext L4 passthrough (no crypto): forward + classify/policy only. TCP encrypt + decrypt. |
 
 Shared engines: [tls_engine/](../../src/security/tls_engine/),
 [dtls_engine.rs](../../src/security/dtls_engine.rs).
+
+## Security profiles & provider parameters
+
+The `tls`, `ktls`, and `dtls` providers read their security configuration from
+the rule's flattened `provider_params` (any field that is not a known top-level
+rule key) plus the typed `protocol_version`. These are resolved into a
+[`TlsSecurityParams`](../../src/security/tls_engine/params.rs) value that drives
+the OpenSSL acceptor/connector.
+
+| Key | Values | Meaning |
+|-----|--------|---------|
+| `profile` | `default` · `subset146-pki` · `subset146-psk` · `integrity-only` | Cipher policy + verify + version preset. Explicit keys below override the preset. |
+| `verify` | `none` · `server` · `mutual` | Peer-certificate verification. `server` verifies the upstream cert (encrypt); `mutual` additionally requires a peer client cert (decrypt). |
+| `cert_path` / `key_path` | PEM file paths | This endpoint's identity (server cert for decrypt, optional client cert for encrypt). Falls back to a self-signed dev identity when omitted. |
+| `ca_path` | PEM file path | Trust anchor used to verify the peer when `verify` is `server`/`mutual`. |
+| `server_name` | hostname | SNI sent by the connector and the name verified against the upstream cert. Defaults to the upstream host. |
+| `psk_identity` / `psk_hex` | string / hex | TLS-PSK identity and key for `profile = subset146-psk` (DHE-PSK, TLS 1.2). |
+| `cipher_list` / `ciphersuites` | OpenSSL strings | Advanced override of the TLS 1.2 / TLS 1.3 cipher selection. |
+| `protocol_version` | `tls1.2` · `tls1.3` · `dtls1.0` · `dtls1.2` | Pins the (D)TLS version (typed top-level field, not in `provider_params`). |
+
+Profiles map to the railway/Subset-146 use cases:
+
+- **`subset146-pki`** — mandatory mutual X.509 auth, ECDHE-ECDSA/RSA-AES-GCM
+  (TLS 1.2) or `TLS_AES_256_GCM` / `TLS_CHACHA20_POLY1305` (TLS 1.3); non-GCM
+  suites are refused, failures fail closed.
+- **`subset146-psk`** — TLS-PSK (DHE-PSK-AES256-GCM, TLS 1.2) from
+  `psk_identity` + `psk_hex`; no certificates required.
+- **`integrity-only`** — authenticated-but-not-encrypted TLS using NULL-cipher
+  suites (OpenSSL eNULL is probed at runtime; rejected on `ktls`).
+- **`default`** — back-compatible self-signed, `verify = none`.
+
+See [05 — Certificate & Key Management](05-cert-key-management.md) for the
+loading details and [examples/configs/](../../examples/configs/) for a runnable
+config per profile.
+
 
 ## Example implementor (skeleton)
 
@@ -150,6 +186,7 @@ Registered once in [main.rs](../../src/main.rs) on the
 registry.register_crypto(Box::new(TlsProvider));
 registry.register_crypto(Box::new(KtlsProvider));
 registry.register_crypto(Box::new(DtlsProvider));
+registry.register_crypto(Box::new(RoutingProvider));
 // registry.register_crypto(Box::new(MyProvider));   // ← add here
 let registry = registry.into_arc();
 ```

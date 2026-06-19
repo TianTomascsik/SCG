@@ -4,12 +4,13 @@
 //! no ordering guarantee, no head-of-line blocking. Unlike UDP-over-TLS
 //! (which tunnels through TCP), DTLS keeps the transport as UDP end-to-end.
 
-use crate::management::cert_store::get_or_init_cert;
+use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 use crate::networking::socket_manager::{
     bind_udp_socket, set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::apply_geo_delay;
+use crate::security::tls_engine::params::{TlsSecurityParams, VerifyMode};
 use crate::security::{RELAY_BUF_SIZE, UDP_BUF_SIZE};
 
 use crate::management::config::Proto;
@@ -18,7 +19,8 @@ use log::{debug, error, info};
 
 use bench_log::{compute_latency_stats, print_latency_stats, CsvLogger};
 use openssl::ssl::{
-    ErrorCode, SslAcceptor, SslConnector, SslMethod, SslStream, SslVerifyMode, SslVersion,
+    ErrorCode, SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslStream, SslVerifyMode,
+    SslVersion,
 };
 
 use std::collections::HashMap;
@@ -65,53 +67,162 @@ impl Write for DtlsUdpStream {
 //                     DTLS builders
 // =============================================================================
 
-/// Build a DTLS SslConnector (client side, no cert verification).
-/// Accepts an optional protocol version: "dtls1.0" or "dtls1.2" (default).
-fn build_dtls_connector(version: Option<&str>) -> Result<SslConnector, openssl::error::ErrorStack> {
-    let mut builder = SslConnector::builder(SslMethod::dtls())?;
-    builder.set_verify(SslVerifyMode::NONE);
+/// Pin the DTLS protocol version (min == max).
+fn pin_dtls_version(builder: &mut SslContextBuilder, is_dtls10: bool) -> Result<(), String> {
+    let v = if is_dtls10 {
+        SslVersion::DTLS1
+    } else {
+        SslVersion::DTLS1_2
+    };
+    builder
+        .set_min_proto_version(Some(v))
+        .map_err(|e| format!("dtls min version: {e}"))?;
+    builder
+        .set_max_proto_version(Some(v))
+        .map_err(|e| format!("dtls max version: {e}"))?;
+    Ok(())
+}
 
-    match version {
-        Some("dtls1.0") => {
-            // DTLS 1.0 does not support GCM ciphers — use CBC
-            builder.set_cipher_list("AES128-SHA:AES256-SHA")?;
-            builder.set_min_proto_version(Some(SslVersion::DTLS1))?;
-            builder.set_max_proto_version(Some(SslVersion::DTLS1))?;
+/// Apply the DTLS cipher policy: an explicit `cipher_list` override wins,
+/// otherwise a version-appropriate default (DTLS 1.0 = CBC, DTLS 1.2 = AEAD).
+/// Both defaults offer ECDHE-ECDSA/RSA so either an RSA or an ECDSA identity
+/// works and the handshake has forward secrecy.
+fn set_dtls_cipher_list(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+    is_dtls10: bool,
+) -> Result<(), String> {
+    let list = params.cipher_list.clone().unwrap_or_else(|| {
+        if is_dtls10 {
+            // DTLS 1.0 predates AEAD — CBC/SHA-1 only. SECLEVEL is lowered so
+            // the legacy MAC suites needed for interop are not filtered out.
+            "ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:AES128-SHA:AES256-SHA:@SECLEVEL=0"
+                .to_string()
+        } else {
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+             ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
+                .to_string()
         }
-        _ => {
-            // Default: DTLS 1.2 with GCM
-            builder.set_cipher_list("AES128-GCM-SHA256:AES256-GCM-SHA384")?;
-            builder.set_min_proto_version(Some(SslVersion::DTLS1_2))?;
-            builder.set_max_proto_version(Some(SslVersion::DTLS1_2))?;
+    });
+    builder
+        .set_cipher_list(&list)
+        .map_err(|e| format!("dtls cipher list '{list}': {e}"))
+}
+
+/// Load the configured CA bundle into the trust store, if any.
+fn set_dtls_ca(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+    if let Some(ref ca) = params.ca_path {
+        builder
+            .set_ca_file(ca)
+            .map_err(|e| format!("dtls ca_file '{}': {e}", ca.display()))?;
+    }
+    Ok(())
+}
+
+/// Server-side peer verification: mutual auth requires + verifies a client cert.
+fn apply_dtls_acceptor_verify(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
+    match params.verify {
+        VerifyMode::Mutual => {
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+            set_dtls_ca(builder, params)?;
         }
+        VerifyMode::None | VerifyMode::Server => builder.set_verify(SslVerifyMode::NONE),
+    }
+    Ok(())
+}
+
+/// Client-side peer verification: server or mutual mode verifies the peer cert
+/// against the configured CA.
+fn apply_dtls_connector_verify(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
+    match params.verify {
+        VerifyMode::Server | VerifyMode::Mutual => {
+            builder.set_verify(SslVerifyMode::PEER);
+            set_dtls_ca(builder, params)?;
+        }
+        VerifyMode::None => builder.set_verify(SslVerifyMode::NONE),
+    }
+    Ok(())
+}
+
+/// Build a DTLS `SslConnector` (client side) from resolved security params.
+///
+/// Honours the verify mode (server/mutual cert verification + CA trust store),
+/// an optional client identity for mutual auth, and the DTLS-version cipher
+/// policy. With no params this is the legacy behaviour: verify none, no client
+/// cert, version-default ciphers.
+fn build_dtls_connector(params: &TlsSecurityParams) -> Result<SslConnector, String> {
+    let mut builder =
+        SslConnector::builder(SslMethod::dtls()).map_err(|e| format!("dtls connector: {e}"))?;
+
+    let is_dtls10 = matches!(params.version.as_deref(), Some("dtls1.0"));
+    pin_dtls_version(&mut builder, is_dtls10)?;
+    set_dtls_cipher_list(&mut builder, params, is_dtls10)?;
+
+    // Optional client identity (required when the upstream demands mutual auth).
+    if let Some(ref cert_path) = params.cert_path {
+        let key_path = params
+            .key_path
+            .as_ref()
+            .ok_or_else(|| "cert_path requires key_path".to_string())?;
+        let (pkey, cert) = load_identity_pem(cert_path, key_path)?;
+        builder
+            .set_certificate(&cert)
+            .map_err(|e| format!("dtls client cert: {e}"))?;
+        builder
+            .set_private_key(&pkey)
+            .map_err(|e| format!("dtls client key: {e}"))?;
+        builder
+            .check_private_key()
+            .map_err(|e| format!("dtls client key mismatch: {e}"))?;
     }
 
+    apply_dtls_connector_verify(&mut builder, params)?;
     Ok(builder.build())
 }
 
-/// Build a DTLS SslAcceptor (server side) with self-signed cert.
-/// Accepts an optional protocol version: "dtls1.0" or "dtls1.2" (default).
-fn build_dtls_acceptor(version: Option<&str>) -> Result<SslAcceptor, openssl::error::ErrorStack> {
-    let (pkey, cert) = get_or_init_cert()?;
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::dtls())?;
-    builder.set_private_key(pkey)?;
-    builder.set_certificate(cert)?;
-    builder.check_private_key()?;
+/// Build a DTLS `SslAcceptor` (server side) from resolved security params.
+///
+/// Uses a file-based identity when `cert_path`/`key_path` are configured, else
+/// the self-signed development certificate. Applies verify mode (mutual auth
+/// requires a client cert), CA trust store, and the DTLS-version cipher policy.
+fn build_dtls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String> {
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::dtls())
+        .map_err(|e| format!("dtls acceptor: {e}"))?;
 
-    match version {
-        Some("dtls1.0") => {
-            // DTLS 1.0 does not support GCM ciphers — use CBC
-            builder.set_cipher_list("AES128-SHA:AES256-SHA")?;
-            builder.set_min_proto_version(Some(SslVersion::DTLS1))?;
-            builder.set_max_proto_version(Some(SslVersion::DTLS1))?;
+    match (&params.cert_path, &params.key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let (pkey, cert) = load_identity_pem(cert_path, key_path)?;
+            builder
+                .set_private_key(&pkey)
+                .map_err(|e| format!("dtls key: {e}"))?;
+            builder
+                .set_certificate(&cert)
+                .map_err(|e| format!("dtls cert: {e}"))?;
         }
         _ => {
-            // Default: DTLS 1.2 with GCM
-            builder.set_cipher_list("AES128-GCM-SHA256:AES256-GCM-SHA384")?;
-            builder.set_min_proto_version(Some(SslVersion::DTLS1_2))?;
-            builder.set_max_proto_version(Some(SslVersion::DTLS1_2))?;
+            let (pkey, cert) = get_or_init_cert().map_err(|e| format!("dtls self-signed: {e}"))?;
+            builder
+                .set_private_key(pkey)
+                .map_err(|e| format!("dtls key: {e}"))?;
+            builder
+                .set_certificate(cert)
+                .map_err(|e| format!("dtls cert: {e}"))?;
         }
     }
+    builder
+        .check_private_key()
+        .map_err(|e| format!("dtls key mismatch: {e}"))?;
+
+    let is_dtls10 = matches!(params.version.as_deref(), Some("dtls1.0"));
+    pin_dtls_version(&mut builder, is_dtls10)?;
+    set_dtls_cipher_list(&mut builder, params, is_dtls10)?;
+    apply_dtls_acceptor_verify(&mut builder, params)?;
 
     // Enable cookie exchange for DTLS (DoS protection)
     // Note: stateless cookie verification adds complexity; skip for POC
@@ -240,8 +351,18 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         Some(ctx.upstream_addr.clone())
     };
 
-    // Build DTLS connector
-    let connector = match build_dtls_connector(ctx.protocol_version.as_deref()) {
+    // Resolve typed security parameters and build the DTLS connector.
+    let tls_params = match TlsSecurityParams::from_params(
+        &ctx.provider_params,
+        ctx.protocol_version.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[{}] DTLS parameter error: {}", ctx.rule_name, e);
+            return;
+        }
+    };
+    let connector = match build_dtls_connector(&tls_params) {
         Ok(c) => c,
         Err(e) => {
             error!("[{}] DTLS connector error: {}", ctx.rule_name, e);
@@ -342,7 +463,8 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                                 .ok();
 
                             let dtls_stream = DtlsUdpStream::new(upstream_sock);
-                            match connector.connect("gateway", dtls_stream) {
+                            let sni = tls_params.sni_name(&target);
+                            match connector.connect(&sni, dtls_stream) {
                                 Ok(ssl_stream) => {
                                     info!(
                                         "[{}] DTLS session established for peer {}",
@@ -478,7 +600,17 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
 ///   3. `acceptor.accept()` -- OpenSSL reads ClientHello and does handshake
 ///   4. Spawn a relay thread, create a new listen socket for the next peer
 pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
-    let acceptor = match build_dtls_acceptor(ctx.protocol_version.as_deref()) {
+    let tls_params = match TlsSecurityParams::from_params(
+        &ctx.provider_params,
+        ctx.protocol_version.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[{}] DTLS parameter error: {}", ctx.rule_name, e);
+            return;
+        }
+    };
+    let acceptor = match build_dtls_acceptor(&tls_params) {
         Ok(a) => a,
         Err(e) => {
             error!("[{}] DTLS acceptor error: {}", ctx.rule_name, e);

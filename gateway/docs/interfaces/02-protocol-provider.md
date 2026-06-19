@@ -102,13 +102,30 @@ be treated as a protocol violation and close the tunnel (fail closed). Returning
 
 ## Current implementation
 
-| Provider | `name()` | File | Framing |
-|----------|----------|------|---------|
-| `AleProtocolProvider` | `"ale"` | [app_protocols/ale_provider.rs](../../src/app_protocols/ale_provider.rs) | ALEPKT DT/DI frames + AU1/AU2 handshake (UNISIG Subset-037/098), CRC-CCITT. |
-| `RawProtocolProvider` | `"raw"` | [app_protocols/raw_provider.rs](../../src/app_protocols/raw_provider.rs) | 4-byte LE length prefix, no handshake. |
+| Framing | `app_protocol` | Notes |
+|---------|----------------|-------|
+| ALE (ETCS) | `"ale"` *(default)* | ALEPKT DT/DI frames + AU1/AU2 association handshake (UNISIG Subset-037/098), CRC-CCITT. |
+| Raw length-prefix | `"raw"` | 4-byte LE length prefix per datagram, no handshake — UDP-over-TLS without the ALE overhead. |
 
-Used by the TLS/kTLS engine's UDP-over-TLS path
-([tls_engine/](../../src/security/tls_engine/)).
+**As-built note.** On the live UDP-over-TLS data path the two framings are
+implemented by the [`UdpFraming`](../../src/security/udp_framing.rs) selector
+(`UdpFraming::for_app_protocol(app_protocol)`), called inline by the TLS engine's
+encrypt relay ([tls_engine/encrypt.rs](../../src/security/tls_engine/encrypt.rs))
+and decrypt relay ([tls_engine/decrypt.rs](../../src/security/tls_engine/decrypt.rs)
+→ [relay.rs](../../src/security/relay.rs)). `ale` performs the AU1/AU2 handshake
+(initiator on encrypt, responder on decrypt); `raw` is handshake-free. The
+default when `app_protocol` is omitted is `ale`
+(`RuleConfig::effective_app_protocol`).
+
+The `AppProtocolProvider` / `FramingSession` traits above are the forward-looking
+**pluggable** form of this same contract (a registered factory + per-connection
+session); migrating the inline selector onto the trait is tracked in
+[11 — Future Interfaces](11-future-interfaces.md). New framings should implement
+the traits and add a matching `UdpFraming` arm until that migration lands.
+
+Round-trip coverage for both framings lives in
+[tests/ale_raw.rs](../../tests/ale_raw.rs).
+
 
 ## Example implementor (skeleton)
 
@@ -151,8 +168,9 @@ registry.register_app_protocol(Box::new(RawProtocolProvider));
 // registry.register_app_protocol(Box::new(MyProtocolProvider));  // ← add here
 ```
 
-Selected per rule by `registry.find_app_protocol(&rule.app_protocol)` on the
-UDP-over-TLS path.
+Selected per rule by the rule's `app_protocol` field
+(`UdpFraming::for_app_protocol` on the UDP-over-TLS path today; the registry's
+`find_app_protocol` once the trait migration lands).
 
 ```json
 { "security_provider": "tls", "listen_proto": "udp", "app_protocol": "myproto" }

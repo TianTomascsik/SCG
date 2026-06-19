@@ -1,0 +1,34 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "web-frontend-terminate",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:8443",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:8080",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "protocol_version": "tls1.3",
+      "verify": "mutual",
+      "cert_path": "/etc/scg/pki/frontend.crt",
+      "key_path": "/etc/scg/pki/frontend.key",
+      "ca_path": "/etc/scg/pki/client-ca.crt"
+    },
+    {
+      "name": "web-frontend-originate",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:8081",
+      "listen_proto": "tcp",
+      "upstream_addr": "backend.example:443",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "protocol_version": "tls1.3",
+      "verify": "server",
+      "ca_path": "/etc/scg/pki/upstream-ca.crt",
+      "server_name": "backend.example"
+    }
+  ]
+}

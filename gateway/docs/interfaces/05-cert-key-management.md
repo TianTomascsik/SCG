@@ -41,6 +41,37 @@ cert is obtained" and "how it is used." An interface removes the global, unifies
 key sources, and creates a place to add rotation/revocation/HSM later (see
 [11 — Future interfaces](11-future-interfaces.md)).
 
+## As-built today (incremental, config-driven)
+
+Ahead of the full provider trait layer below, key/cert material is now loaded
+**from rule config** (not just the self-signed global). The `tls`, `ktls`, and
+`dtls` engines resolve a typed
+[`TlsSecurityParams`](../../src/security/tls_engine/params.rs) from the rule's
+flattened `provider_params` + `protocol_version`, and the builders consume it:
+
+- **Identity from files** —
+  [`load_identity_pem(cert_path, key_path)`](../../src/management/cert_store.rs)
+  loads a PEM cert + private key; `get_or_init_cert()` remains the self-signed
+  fallback when no `cert_path` is given, so existing configs are unchanged. A
+  `generate_self_signed_ecdsa` helper backs the test PKI.
+- **Trust + verification** — `ca_path` sets the peer trust store and `verify`
+  (`none` | `server` | `mutual`) maps to the OpenSSL verify mode; the connector
+  also checks the `server_name`/SNI hostname. Configured in
+  [`build_tls_acceptor` / `build_tls_connector`](../../src/security/tls_engine/mod.rs)
+  and [`build_dtls_acceptor` / `build_dtls_connector`](../../src/security/dtls_engine.rs).
+- **PSK** — `profile = subset146-psk` wires the OpenSSL PSK server/client
+  callbacks from `psk_identity` + `psk_hex` (DHE-PSK, TLS 1.2). This is the
+  concrete fill-in for the former PSK TODO.
+- **Cipher policy** — selected per `profile` (`subset146-pki`, `integrity-only`,
+  …) with optional `cipher_list`/`ciphersuites` overrides.
+
+This covers the **core handshake** material the engines need today; the trait
+abstraction below (rotation, revocation/OCSP, HSM, named MAC keys) remains the
+forward-looking design. Keys are still read from files at build time — fail-closed
+on a missing/invalid file — without the rotation/epoch semantics the traits add.
+See the per-profile runnable configs in
+[examples/configs/](../../examples/configs/).
+
 ## Traits
 
 ```rust

@@ -132,6 +132,29 @@ gateway --config-source etcd://cluster/scg/cfg  # alternative source (proposed)
 
 ---
 
+## Implemented — Crypto security parameters (`provider_params`)
+
+Rules using the `tls`, `ktls`, or `dtls` provider accept additional security
+fields. They are flattened into the rule object (any key that is not a known
+top-level field becomes part of `provider_params`) and resolved into a
+[`TlsSecurityParams`](../../src/security/tls_engine/params.rs).
+
+| Field | Required | Meaning |
+|---|---|---|
+| `protocol_version` | no | `"tls1.2"` · `"tls1.3"` · `"dtls1.0"` · `"dtls1.2"`. |
+| `profile` | no | `"default"` · `"subset146-pki"` · `"subset146-psk"` · `"integrity-only"`. |
+| `verify` | no (default `none`) | `"none"` · `"server"` · `"mutual"`. |
+| `cert_path` / `key_path` | when serving an identity | PEM identity; self-signed fallback when omitted. |
+| `ca_path` | with `verify` server/mutual | PEM trust anchor for peer verification. |
+| `server_name` | no | SNI + verified hostname (defaults to the upstream host). |
+| `psk_identity` / `psk_hex` | with `subset146-psk` | TLS-PSK identity + key. |
+| `app_protocol` | no (default `ale`) | UDP-over-TLS framing: `"ale"` or `"raw"`. |
+
+`ktls` + `integrity-only` is rejected at load (a NULL cipher cannot be
+offloaded); other non-offloadable profiles fall back to userspace `tls` with a
+warning. Full reference: [01 — Crypto Provider](01-crypto-provider.md); runnable
+configs: [examples/configs/](../../examples/configs/).
+
 ## Implemented — Local-interface configuration (UDS/SHM + `api`)
 
 Local interfaces are configured through the **same** `GatewayConfig` schema

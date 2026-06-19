@@ -5,6 +5,7 @@
 //! - `run_udp_encrypt_relay` -- receive UDP datagrams, tunnel through TLS with framing
 
 use super::{build_tls_connector, write_all_nb_proxy, ProxyStream};
+use super::params::TlsSecurityParams;
 use crate::networking::connector::{connect_with_retry, sleep_with_shutdown_check};
 use crate::networking::socket_manager::{
     accept_with_timeout, bind_tcp_listener, bind_udp_socket, poll_two_fds, set_nodelay,
@@ -15,9 +16,9 @@ use crate::security::relay::{
     apply_geo_delay, relay_bidirectional_splice, relay_encrypt_bidirectional,
 };
 use crate::security::{ACCEPT_TIMEOUT, RELAY_BUF_SIZE, UDP_BUF_SIZE};
+use crate::security::udp_framing::UdpFraming;
 use ale_pipe::{
-    AleAu1Info, AleAu2Info, AleError, AleFrameReader, AleFrameWriter, ALE_CLASS_D, ALE_PKT_AU1,
-    ALE_PKT_AU2, ALE_PKT_DI, ALE_PKT_DT,
+    AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_CLASS_D, ALE_PKT_AU1, ALE_PKT_AU2,
 };
 
 use crate::interfaces::tproxy;
@@ -60,6 +61,18 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         )
         .ok(),
     ));
+
+    // Resolve typed security parameters once; shared by all connections.
+    let tls_params = match TlsSecurityParams::from_params(
+        &ctx.provider_params,
+        ctx.protocol_version.as_deref(),
+    ) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
+            return;
+        }
+    };
 
     while !ctx.shutdown.load(Ordering::Relaxed) {
         let (client_stream, peer_addr) = match accept_with_timeout(&listener, ACCEPT_TIMEOUT) {
@@ -117,7 +130,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let sock_buf_size = ctx.sock_buf_size;
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
-        let protocol_version = ctx.protocol_version.clone();
+        let tls_params = tls_params.clone();
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
@@ -144,7 +157,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 &mut conn_metrics,
                 &shutdown,
                 simulated_delay_ms,
-                protocol_version.as_deref(),
+                &tls_params,
             );
 
             if let Err(e) = result {
@@ -198,7 +211,7 @@ pub(crate) fn handle_tcp_encrypt(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
-    protocol_version: Option<&str>,
+    params: &TlsSecurityParams,
 ) -> io::Result<()> {
     // Connect to upstream with exponential backoff retry
     let upstream_tcp = connect_with_retry(
@@ -212,14 +225,17 @@ pub(crate) fn handle_tcp_encrypt(
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
 
+    // SNI / verification hostname for the upstream connection.
+    let sni = params.sni_name(upstream_addr);
+
     // Establish TLS on the upstream connection
     let hs_start = Instant::now();
     let mut upstream: ProxyStream = match tls_mode {
         TlsMode::Tls => {
-            let connector = build_tls_connector(protocol_version).map_err(|e| {
+            let connector = build_tls_connector(params).map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("TLS connector: {}", e))
             })?;
-            let ssl_stream = connector.connect("gateway", upstream_tcp).map_err(|e| {
+            let ssl_stream = connector.connect(&sni, upstream_tcp).map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {}", e))
             })?;
             info!(
@@ -230,7 +246,7 @@ pub(crate) fn handle_tcp_encrypt(
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let connector = ktls_client_connector(protocol_version).map_err(|e| {
+            let connector = ktls_client_connector(params.version.as_deref()).map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("kTLS connector: {}", e))
             })?;
             let mut ssl = connector
@@ -238,7 +254,7 @@ pub(crate) fn handle_tcp_encrypt(
                 .map_err(|e| {
                     io::Error::new(io::ErrorKind::Other, format!("kTLS configure: {}", e))
                 })?
-                .into_ssl("gateway")
+                .into_ssl(&sni)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS SSL: {}", e)))?;
             ssl.set_connect_state();
             unsafe {
@@ -328,6 +344,19 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
     socket.set_read_timeout(Some(Duration::from_secs(2))).ok();
     tune_socket_buffers(socket.as_raw_fd(), ctx.sock_buf_size);
 
+    // Resolve typed security parameters + SNI for the upstream tunnel.
+    let tls_params = match TlsSecurityParams::from_params(
+        &ctx.provider_params,
+        ctx.protocol_version.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
+            return;
+        }
+    };
+    let sni = tls_params.sni_name(&ctx.upstream_addr);
+
     // Lazy TLS tunnel: established on first UDP datagram, not at startup.
     let mut tls_stream: Option<ProxyStream> = None;
     info!(
@@ -349,9 +378,9 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
     // Set non-blocking for poll-based bidirectional I/O
     socket.set_nonblocking(true).ok();
 
-    // ALE framing state
-    let mut ale_writer = AleFrameWriter::new(0x00); // default app type for gateway mode
-    let mut ale_reader = AleFrameReader::new();
+    // UDP-over-TLS application framing: ALE (Subset-098) or raw length-prefix,
+    // selected by the rule's `app_protocol`.
+    let mut framing = UdpFraming::for_app_protocol(&ctx.app_protocol);
     let mut batch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     while !ctx.shutdown.load(Ordering::Relaxed) {
@@ -410,7 +439,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                 let hs_start = Instant::now();
                 let stream = match ctx.tls_mode {
                     TlsMode::Tls => {
-                        let connector = match build_tls_connector(ctx.protocol_version.as_deref()) {
+                        let connector = match build_tls_connector(&tls_params) {
                             Ok(c) => c,
                             Err(e) => {
                                 error!(
@@ -426,7 +455,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                                 continue;
                             }
                         };
-                        match connector.connect("gateway", upstream_tcp) {
+                        match connector.connect(&sni, upstream_tcp) {
                             Ok(s) => {
                                 info!(
                                     "[{}] TLS tunnel established ({:.2} ms)",
@@ -451,7 +480,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                         }
                     }
                     TlsMode::Ktls => {
-                        let connector = match ktls_client_connector(ctx.protocol_version.as_deref())
+                        let connector = match ktls_client_connector(tls_params.version.as_deref())
                         {
                             Ok(c) => c,
                             Err(e) => {
@@ -471,7 +500,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                         let up_fd = upstream_tcp.as_raw_fd();
                         let ssl_result = connector
                             .configure()
-                            .and_then(|c| c.into_ssl("gateway"))
+                            .and_then(|c| c.into_ssl(&sni))
                             .map_err(|e| {
                                 error!("[{}] kTLS SSL setup error: {}", ctx.rule_name, e);
                             });
@@ -540,11 +569,13 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
             set_nonblocking_fd(established.raw_fd());
             tls_stream = Some(established);
 
-            // Perform ALE handshake (AU1 -> AU2) over the TLS stream
-            {
+            // Perform ALE handshake (AU1 -> AU2) over the TLS stream. Skipped
+            // for raw framing, which has no association handshake.
+            if framing.is_ale() {
                 let tls = tls_stream.as_mut().unwrap();
 
                 // Send AU1 (connection request)
+                let mut ale_writer = AleFrameWriter::new(0x00);
                 let au1_info = AleAu1Info {
                     calling_etcs_id: 0,
                     called_etcs_id: 0,
@@ -647,8 +678,9 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                     Ok((n, src)) => {
                         last_peer = Some(src);
                         conn_metrics.record_read(n);
-                        // Write ALE DT frame into batch buffer (infallible for Vec<u8>)
-                        let _ = ale_writer.write_alepkt(&mut batch_buf, ALE_PKT_DT, &udp_buf[..n]);
+                        // Frame the datagram (ALE DT or raw length-prefix) into
+                        // the batch buffer.
+                        framing.frame_into(&udp_buf[..n], &mut batch_buf);
                         conn_metrics.record_relay(n, None);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break 'udp_fwd,
@@ -673,46 +705,23 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
             }
         }
 
-        // Reverse: TLS -> UDP (read ALE frames from TLS, send user data as datagrams back to client)
+        // Reverse: TLS -> UDP (deframe ALE/raw, send user data as datagrams back to client)
         if tls_ready {
             'tls_read: loop {
                 match tls.read(&mut tls_buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        match ale_reader.feed(&tls_buf[..n]) {
-                            Ok(frames) => {
-                                for frame in frames {
-                                    match frame.header.packet_type {
-                                        ALE_PKT_DT => {
-                                            if let Some(peer) = last_peer {
-                                                let _ = socket.send_to(&frame.user_data, peer);
-                                            }
-                                            let data_len = frame.user_data.len();
-                                            conn_metrics.record_read(data_len);
-                                            conn_metrics.record_relay(data_len, None);
-                                        }
-                                        ALE_PKT_DI => {
-                                            debug!(
-                                                "[{}] Received ALE DI (disconnect)",
-                                                ctx.rule_name
-                                            );
-                                            break 'tls_read;
-                                        }
-                                        _ => {} // Ignore other packet types
-                                    }
-                                }
+                        let deframed = framing.deframe(&ctx.rule_name, &tls_buf[..n]);
+                        for datagram in deframed.datagrams {
+                            if let Some(peer) = last_peer {
+                                let _ = socket.send_to(&datagram, peer);
                             }
-                            Err(AleError::ChecksumMismatch { expected, got }) => {
-                                error!(
-                                    "[{}] ALE checksum mismatch: expected 0x{:04X}, got 0x{:04X} — disconnecting",
-                                    ctx.rule_name, expected, got
-                                );
-                                break 'tls_read;
-                            }
-                            Err(e) => {
-                                error!("[{}] ALE frame error: {}", ctx.rule_name, e);
-                                break 'tls_read;
-                            }
+                            let data_len = datagram.len();
+                            conn_metrics.record_read(data_len);
+                            conn_metrics.record_relay(data_len, None);
+                        }
+                        if deframed.disconnect {
+                            break 'tls_read;
                         }
                         if tls.ssl_pending() == 0 {
                             break 'tls_read;
@@ -726,9 +735,9 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
         }
     }
 
-    // Send ALE DI and shutdown TLS tunnel if established
+    // Send ALE DI (no-op for raw) and shutdown TLS tunnel if established
     if let Some(mut tls) = tls_stream {
-        let _ = ale_writer.write_alepkt(&mut tls, ALE_PKT_DI, &[]);
+        framing.write_disconnect(&mut tls);
         tls.shutdown_write();
     }
 

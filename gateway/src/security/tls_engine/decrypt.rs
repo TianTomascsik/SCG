@@ -1,5 +1,6 @@
 //! Decrypt direction: accept TLS/kTLS connections and relay to plain TCP/UDP upstream.
 
+use super::params::TlsSecurityParams;
 use super::{build_tls_acceptor, ProxyStream};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
@@ -7,6 +8,7 @@ use crate::networking::socket_manager::{
 };
 use crate::processing::RuleContext;
 use crate::security::relay::{relay_bidirectional, relay_bidirectional_splice, relay_tls_to_udp};
+use crate::security::udp_framing::UdpFraming;
 use crate::security::ACCEPT_TIMEOUT;
 use ale_pipe::{AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_PKT_AU1, ALE_PKT_AU2};
 
@@ -51,10 +53,20 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         ctx.rule_name, ctx.listen_addr, ctx.tls_mode, ctx.upstream_addr, ctx.upstream_proto,
     );
 
+    // Resolve typed security parameters from the rule's provider_params.
+    let tls_params = TlsSecurityParams::from_params(
+        &ctx.provider_params,
+        ctx.protocol_version.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
+        std::process::exit(1);
+    });
+
     // Build the TLS acceptor (reused across all connections).
     let acceptor = match ctx.tls_mode {
         TlsMode::Tls => Some(
-            build_tls_acceptor(ctx.protocol_version.as_deref()).unwrap_or_else(|e| {
+            build_tls_acceptor(&tls_params).unwrap_or_else(|e| {
                 error!("[{}] TLS acceptor error: {}", ctx.rule_name, e);
                 std::process::exit(1);
             }),
@@ -141,6 +153,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         let acceptor = acceptor.clone();
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
+        let app_protocol = ctx.app_protocol.clone();
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
@@ -170,6 +183,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
                 &mut conn_metrics,
                 &shutdown,
                 simulated_delay_ms,
+                &app_protocol,
             );
 
             if let Err(e) = result {
@@ -225,6 +239,7 @@ pub(crate) fn handle_tcp_decrypt(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &Arc<AtomicBool>,
     delay_ms: u64,
+    app_protocol: &str,
 ) -> io::Result<()> {
     // ── TLS handshake ────────────────────────────────────────────────────────
     let hs_start = Instant::now();
@@ -347,8 +362,13 @@ pub(crate) fn handle_tcp_decrypt(
                 rule_name, upstream_addr
             );
 
-            // Perform ALE handshake as responder: read AU1, send AU2
-            {
+            // UDP-over-TLS application framing: ALE (Subset-098) or raw
+            // length-prefix, selected by the rule's `app_protocol`.
+            let framing = UdpFraming::for_app_protocol(app_protocol);
+
+            // Perform ALE handshake as responder: read AU1, send AU2. Skipped
+            // for raw framing, which has no association handshake.
+            if framing.is_ale() {
                 let mut ale_writer = AleFrameWriter::new(0x00);
                 let mut ale_reader = AleFrameReader::new();
                 let mut hs_buf = [0u8; 256];
@@ -416,7 +436,7 @@ pub(crate) fn handle_tcp_decrypt(
                 info!("[{}] ALE handshake complete (responder)", rule_name);
             }
 
-            // TLS -> UDP: read ALE frames from TLS, send user data as UDP datagrams
+            // TLS <-> UDP: deframe ALE/raw from TLS to UDP datagrams and back.
             relay_tls_to_udp(
                 rule_name,
                 &mut tls_stream,
@@ -425,6 +445,7 @@ pub(crate) fn handle_tcp_decrypt(
                 conn_metrics,
                 shutdown,
                 delay_ms,
+                framing,
             )
         }
     }

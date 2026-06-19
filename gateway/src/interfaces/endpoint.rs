@@ -12,6 +12,7 @@ use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
     poll_two_fds, set_nodelay, set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
+use crate::security::tls_engine::params::TlsSecurityParams;
 use crate::security::tls_engine::{build_tls_connector, write_all_nb_proxy, ProxyStream};
 use crate::security::RELAY_BUF_SIZE;
 
@@ -133,13 +134,19 @@ pub fn connect_tls_upstream(
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
 
+    // Local interfaces use the default (verify-none) TLS profile; only the
+    // protocol version is configurable here.
+    let params = TlsSecurityParams::from_params(&std::collections::HashMap::new(), protocol_version)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let sni = params.sni_name(upstream_addr);
+
     let hs_start = Instant::now();
     let proxy = match tls_mode {
         TlsMode::Tls => {
-            let connector = build_tls_connector(protocol_version)
+            let connector = build_tls_connector(&params)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS connector: {e}")))?;
             let ssl_stream = connector
-                .connect("gateway", upstream_tcp)
+                .connect(&sni, upstream_tcp)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {e}")))?;
             info!(
                 "[{label}] upstream TLS handshake OK ({:.2} ms)",
@@ -148,13 +155,13 @@ pub fn connect_tls_upstream(
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let connector = ktls_client_connector(protocol_version).map_err(|e| {
+            let connector = ktls_client_connector(params.version.as_deref()).map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("kTLS connector: {e}"))
             })?;
             let mut ssl = connector
                 .configure()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS configure: {e}")))?
-                .into_ssl("gateway")
+                .into_ssl(&sni)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS SSL: {e}")))?;
             ssl.set_connect_state();
             // SAFETY: enabling kTLS on the SSL object before the handshake is the

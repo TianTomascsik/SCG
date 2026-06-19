@@ -1,0 +1,32 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "raw-encrypt",
+      "direction": "encrypt",
+      "listen_addr": "127.0.0.1:5300",
+      "listen_proto": "udp",
+      "upstream_addr": "collector.example:5343",
+      "upstream_proto": "tcp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "app_protocol": "raw",
+      "verify": "server",
+      "ca_path": "/etc/scg/pki/collector-ca.crt",
+      "server_name": "collector.example"
+    },
+    {
+      "name": "raw-decrypt",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:5343",
+      "listen_proto": "tcp",
+      "upstream_addr": "127.0.0.1:5301",
+      "upstream_proto": "udp",
+      "security_provider": "tls",
+      "traffic_class": "normal",
+      "app_protocol": "raw",
+      "cert_path": "/etc/scg/pki/collector.crt",
+      "key_path": "/etc/scg/pki/collector.key"
+    }
+  ]
+}
