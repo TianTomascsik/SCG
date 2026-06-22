@@ -1,7 +1,4 @@
 {
-  "log_dir": "/results",
-  "run_id": "proxy_test_001",
-  "latency": false,
   "sock_buf_size": 16777216,
   "log_level": "info",
   "rules": [

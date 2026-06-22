@@ -15,9 +15,8 @@ use ale_pipe::{AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_PKT_A
 
 use crate::interfaces::tproxy;
 use crate::management::config::{Proto, QosPolicy, TlsMode};
-use crate::management::telemetry::{format_rate, log_connection_csv, ConnectionMetrics};
+use crate::management::telemetry::{format_rate, ConnectionMetrics};
 
-use bench_log::{compute_latency_stats, print_latency_stats, CsvLogger};
 use foreign_types_shared::ForeignTypeRef;
 use ktls_pipe::{
     build_server_acceptor as ktls_server_acceptor, enable_ktls_ssl, get_tcp_ulp,
@@ -30,7 +29,7 @@ use std::io;
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // =============================================================================
@@ -80,16 +79,6 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         ),
         TlsMode::Dtls => unreachable!("DTLS uses run_dtls_decrypt_relay, not tcp decrypt"),
     };
-
-    let csv_logger = Arc::new(Mutex::new(
-        CsvLogger::new(
-            &ctx.log_dir,
-            "gateway",
-            &format!("decrypt-{}", ctx.tls_mode),
-            &ctx.run_id,
-        )
-        .ok(),
-    ));
 
     while !ctx.shutdown.load(Ordering::Relaxed) {
         let (stream, peer_addr) = match accept_with_timeout(&listener, ACCEPT_TIMEOUT) {
@@ -144,12 +133,9 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         // Clone what the handler thread needs — it outlives this loop iteration.
         let metrics = ctx.metrics.clone();
         let rule_name = ctx.rule_name.clone();
-        let csv_logger = csv_logger.clone();
-        let run_id = ctx.run_id.clone();
         let shutdown = ctx.shutdown.clone();
         let tls_mode = ctx.tls_mode;
         let upstream_proto = ctx.upstream_proto;
-        let measure_latency = ctx.measure_latency;
         let sock_buf_size = ctx.sock_buf_size;
         let acceptor = acceptor.clone();
         let traffic_class = ctx.traffic_class;
@@ -176,7 +162,6 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
                 upstream_proto,
                 tls_mode,
                 acceptor.as_ref().unwrap(),
-                measure_latency,
                 sock_buf_size,
                 &mut conn_metrics,
                 &shutdown,
@@ -200,18 +185,6 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
                 format_rate(out_bps),
             );
 
-            if measure_latency {
-                if let Some(stats) = compute_latency_stats(&mut conn_metrics.latency_samples_ns) {
-                    print_latency_stats(0, &format!("{} relay", rule_name), &stats);
-                }
-            }
-
-            if let Ok(mut guard) = csv_logger.lock() {
-                if let Some(ref mut logger) = *guard {
-                    log_connection_csv(logger, &mut conn_metrics, &run_id);
-                }
-            }
-
             metrics.merge_connection(&conn_metrics);
             metrics.connection_closed();
         });
@@ -233,7 +206,6 @@ pub(crate) fn handle_tcp_decrypt(
     upstream_proto: Proto,
     tls_mode: TlsMode,
     acceptor: &SslAcceptor,
-    measure_latency: bool,
     sock_buf_size: usize,
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &Arc<AtomicBool>,
@@ -296,7 +268,6 @@ pub(crate) fn handle_tcp_decrypt(
         }
         TlsMode::Dtls => unreachable!("DTLS uses run_dtls_decrypt_relay"),
     };
-    conn_metrics.handshake_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
 
     // ── Connect to upstream (plain) ──────────────────────────────────────────
     match upstream_proto {
@@ -338,7 +309,6 @@ pub(crate) fn handle_tcp_decrypt(
                     relay_bidirectional_splice(
                         tls_fd,
                         up_fd,
-                        measure_latency,
                         conn_metrics,
                         shutdown,
                         delay_ms,
@@ -347,7 +317,6 @@ pub(crate) fn handle_tcp_decrypt(
                 _ => relay_bidirectional(
                     &mut tls_stream,
                     upstream,
-                    measure_latency,
                     conn_metrics,
                     shutdown,
                     delay_ms,
@@ -459,7 +428,6 @@ pub(crate) fn handle_tcp_decrypt(
                 rule_name,
                 &mut tls_stream,
                 &upstream,
-                measure_latency,
                 conn_metrics,
                 shutdown,
                 delay_ms,

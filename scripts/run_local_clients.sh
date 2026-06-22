@@ -84,7 +84,6 @@ MGMT="$WORK/mgmt.sock"
 UID_NUM="$(id -u)"
 cat >"$WORK/gw.json" <<JSON
 {
-  "log_dir": "$WORK",
   "rules": [
     { "name": "uds-test", "direction": "encrypt", "listen_addr": "unused",
       "listen_proto": "uds", "upstream_addr": "$UPSTREAM", "upstream_proto": "tcp",

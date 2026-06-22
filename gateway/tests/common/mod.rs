@@ -322,8 +322,7 @@ pub fn connect_tcp_with_retry(addr: &str, attempts: usize) -> Option<TcpStream> 
 /// Write a single-rule gateway config to `tmp/gw.json`, then load + validate it.
 pub fn load_single_rule(tmp: &Path, rule: &str) -> GatewayConfig {
     let json = format!(
-        r#"{{ "log_dir": "{log}", "rules": [{rule}] }}"#,
-        log = tmp.display(),
+        r#"{{ "rules": [{rule}] }}"#,
         rule = rule,
     );
     let path = tmp.join("gw.json");

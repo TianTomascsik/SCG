@@ -6,7 +6,7 @@ use crate::networking::socket_manager::{
 };
 use crate::security::udp_framing::UdpFraming;
 
-use crate::management::telemetry::{now_ns, ConnectionMetrics};
+use crate::management::telemetry::ConnectionMetrics;
 use crate::security::{RELAY_BUF_SIZE, UDP_BUF_SIZE};
 
 use log::debug;
@@ -39,7 +39,6 @@ pub fn apply_geo_delay(delay_ms: u64) {
 pub fn relay_bidirectional(
     tls_stream: &mut ProxyStream,
     mut upstream: TcpStream,
-    measure_latency: bool,
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
@@ -51,7 +50,7 @@ pub fn relay_bidirectional(
     upstream.set_nonblocking(true)?;
     set_quickack(up_fd);
     set_quickack(tls_fd);
-    let enable_cork = !measure_latency && delay_ms == 0;
+    let enable_cork = delay_ms == 0;
 
     // SAFETY: read() always writes data before it is consumed — zeroing is unnecessary.
     let mut buf_fwd = Vec::with_capacity(RELAY_BUF_SIZE);
@@ -85,12 +84,9 @@ pub fn relay_bidirectional(
                     }
                     Ok(n) => {
                         apply_geo_delay(delay_ms);
-                        let t0 = if measure_latency { now_ns() } else { 0 };
                         write_all_nb(&mut upstream, &buf_fwd[..n])?;
                         conn_metrics.record_read(n);
-                        let lat = if measure_latency { now_ns() - t0 } else { 0 };
-                        conn_metrics
-                            .record_relay(n, if measure_latency { Some(lat) } else { None });
+                        conn_metrics.record_relay(n);
                         if tls_stream.ssl_pending() == 0 {
                             break;
                         }
@@ -114,7 +110,7 @@ pub fn relay_bidirectional(
                     Ok(n) => {
                         write_all_nb_proxy(tls_stream, &buf_rev[..n])?;
                         conn_metrics.record_read(n);
-                        conn_metrics.record_relay(n, None);
+                        conn_metrics.record_relay(n);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -136,7 +132,6 @@ pub fn relay_tls_to_udp(
     rule_name: &str,
     tls_stream: &mut ProxyStream,
     upstream: &UdpSocket,
-    measure_latency: bool,
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
@@ -180,13 +175,10 @@ pub fn relay_tls_to_udp(
                         let deframed = framing.deframe(rule_name, &tls_buf[..n]);
                         for datagram in deframed.datagrams {
                             apply_geo_delay(delay_ms);
-                            let t0 = if measure_latency { now_ns() } else { 0 };
                             let _ = upstream.send(&datagram);
                             let data_len = datagram.len();
                             conn_metrics.record_read(data_len);
-                            let lat = if measure_latency { now_ns() - t0 } else { 0 };
-                            conn_metrics
-                                .record_relay(data_len, if measure_latency { Some(lat) } else { None });
+                            conn_metrics.record_relay(data_len);
                         }
                         if deframed.disconnect {
                             return Ok(());
@@ -210,7 +202,7 @@ pub fn relay_tls_to_udp(
                     Ok(n) => {
                         framing.frame_into(&udp_buf[..n], &mut batch_buf);
                         conn_metrics.record_read(n);
-                        conn_metrics.record_relay(n, None);
+                        conn_metrics.record_relay(n);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break 'udp_read,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -236,7 +228,6 @@ pub fn relay_tls_to_udp(
 pub fn relay_encrypt_bidirectional(
     client: TcpStream,
     upstream: &mut ProxyStream,
-    measure_latency: bool,
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
@@ -248,7 +239,7 @@ pub fn relay_encrypt_bidirectional(
     set_nonblocking_fd(tls_fd);
     set_quickack(client_fd);
     set_quickack(tls_fd);
-    let enable_cork = !measure_latency && delay_ms == 0;
+    let enable_cork = delay_ms == 0;
 
     // SAFETY: read() always writes data before it is consumed — zeroing is unnecessary.
     let mut buf_fwd = Vec::with_capacity(RELAY_BUF_SIZE);
@@ -285,12 +276,9 @@ pub fn relay_encrypt_bidirectional(
                     }
                     Ok(n) => {
                         apply_geo_delay(delay_ms);
-                        let t0 = if measure_latency { now_ns() } else { 0 };
                         write_all_nb_proxy(upstream, &buf_fwd[..n])?;
                         conn_metrics.record_read(n);
-                        let lat = if measure_latency { now_ns() - t0 } else { 0 };
-                        conn_metrics
-                            .record_relay(n, if measure_latency { Some(lat) } else { None });
+                        conn_metrics.record_relay(n);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -311,7 +299,7 @@ pub fn relay_encrypt_bidirectional(
                     Ok(n) => {
                         write_all_nb(&mut client_w, &buf_rev[..n])?;
                         conn_metrics.record_read(n);
-                        conn_metrics.record_relay(n, None);
+                        conn_metrics.record_relay(n);
                         if upstream.ssl_pending() == 0 {
                             break;
                         }
@@ -448,7 +436,6 @@ fn splice_one_direction(
 pub fn relay_bidirectional_splice(
     tls_fd: RawFd,
     upstream_fd: RawFd,
-    measure_latency: bool,
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
@@ -479,13 +466,10 @@ pub fn relay_bidirectional_splice(
             if tls_ready {
                 apply_geo_delay(delay_ms);
                 loop {
-                    let t0 = if measure_latency { now_ns() } else { 0 };
                     match splice_one_direction(tls_fd, pipe_fwd_w, pipe_fwd_r, upstream_fd) {
                         Ok(SpliceResult::Moved(n)) => {
                             conn_metrics.record_read(n);
-                            let lat = if measure_latency { now_ns() - t0 } else { 0 };
-                            conn_metrics
-                                .record_relay(n, if measure_latency { Some(lat) } else { None });
+                            conn_metrics.record_relay(n);
                             // Continue draining
                         }
                         Ok(SpliceResult::WouldBlock) => break, // No more data, go back to poll
@@ -506,13 +490,10 @@ pub fn relay_bidirectional_splice(
             // Reverse: upstream fd → pipe → kTLS fd
             if up_ready {
                 loop {
-                    let t0 = if measure_latency { now_ns() } else { 0 };
                     match splice_one_direction(upstream_fd, pipe_rev_w, pipe_rev_r, tls_fd) {
                         Ok(SpliceResult::Moved(n)) => {
                             conn_metrics.record_read(n);
-                            let lat = if measure_latency { now_ns() - t0 } else { 0 };
-                            conn_metrics
-                                .record_relay(n, if measure_latency { Some(lat) } else { None });
+                            conn_metrics.record_relay(n);
                         }
                         Ok(SpliceResult::WouldBlock) => break,
                         Ok(SpliceResult::Eof) => {

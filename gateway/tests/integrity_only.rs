@@ -134,8 +134,7 @@ fn ktls_integrity_only_rejected_at_config_load() {
         "profile": "integrity-only"
     }"#;
     let json = format!(
-        r#"{{ "log_dir": "{log}", "rules": [{rule}] }}"#,
-        log = tmp.display(),
+        r#"{{ "rules": [{rule}] }}"#,
         rule = rule,
     );
     let path = tmp.join("gw.json");

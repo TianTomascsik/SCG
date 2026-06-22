@@ -38,10 +38,7 @@ pub struct RuleContext {
     pub tls_mode: TlsMode,
     pub security_provider: String,
     pub transparent: bool,
-    pub measure_latency: bool,
     pub sock_buf_size: usize,
-    pub log_dir: String,
-    pub run_id: String,
     pub metrics: Arc<RuleMetrics>,
     pub shutdown: Arc<AtomicBool>,
     /// Provider-specific parameters (from the rule's generic `provider_params`).
@@ -284,10 +281,7 @@ pub fn start_single_rule(
         tls_mode: effective_tls_mode,
         security_provider: security_provider.clone(),
         transparent: rule.transparent,
-        measure_latency: config.latency,
         sock_buf_size: config.sock_buf_size,
-        log_dir: config.log_dir.clone(),
-        run_id: config.run_id.clone(),
         metrics: rule_metrics,
         shutdown: Arc::new(AtomicBool::new(false)), // placeholder, replaced below
         provider_params: rule.provider_params.clone(),

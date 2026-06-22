@@ -10,26 +10,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::time::SystemTime;
 
 // ─── Top-level config ────────────────────────────────────────────────────────
 
 /// Top-level gateway configuration loaded from JSON.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
-    /// Directory for CSV log output (default: "/results").
-    #[serde(default = "default_log_dir")]
-    pub log_dir: String,
-
-    /// Run identifier for CSV logs (default: auto-generated timestamp).
-    #[serde(default = "default_run_id")]
-    pub run_id: String,
-
-    /// Enable latency measurement (default: false).
-    #[serde(default)]
-    pub latency: bool,
-
     /// Socket buffer size in bytes for tuning (default: 16 MiB).
     #[serde(default = "default_sock_buf_size")]
     pub sock_buf_size: usize,
@@ -140,18 +126,6 @@ fn default_max_endpoints_per_uid() -> u32 {
 
 fn default_create_rate_per_min() -> u32 {
     120
-}
-
-fn default_log_dir() -> String {
-    "/results".to_string()
-}
-
-fn default_run_id() -> String {
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    format!("gw_{}", ts)
 }
 
 fn default_sock_buf_size() -> usize {
@@ -886,25 +860,6 @@ impl GatewayConfig {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
 
-        // Check log directory is writable
-        if let Err(e) = fs::create_dir_all(&self.log_dir) {
-            errors.push(format!(
-                "Cannot create log directory '{}': {}",
-                self.log_dir, e
-            ));
-        } else {
-            let test_file = PathBuf::from(&self.log_dir).join(".scg_write_test");
-            match fs::write(&test_file, b"test") {
-                Ok(_) => {
-                    let _ = fs::remove_file(&test_file);
-                }
-                Err(e) => errors.push(format!(
-                    "Log directory '{}' is not writable: {}",
-                    self.log_dir, e
-                )),
-            }
-        }
-
         // Check for kTLS kernel support
         let has_ktls_rules = self
             .rules
@@ -1075,9 +1030,6 @@ impl GatewayConfig {
     /// Print a summary of all rules to stderr.
     pub fn print_summary(&self) {
         info!("=== Gateway Proxy Configuration ===");
-        info!("  Log dir:     {}", self.log_dir);
-        info!("  Run ID:      {}", self.run_id);
-        info!("  Latency:     {}", self.latency);
         info!("  Sock buf:    {} KiB", self.sock_buf_size / 1024);
         info!("  Rules:       {}", self.rules.len());
         if !self.traffic_rules.is_empty() {

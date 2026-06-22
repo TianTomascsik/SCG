@@ -107,7 +107,7 @@ pub fn run(
         .and_then(|i| args.get(i + 1))
         .cloned();
 
-    let (mut config, lite_warnings, config_watch_path, lite_source) = if let Some(dir) = config_dir {
+    let (config, lite_warnings, config_watch_path, lite_source) = if let Some(dir) = config_dir {
         let pubkey = config_pubkey.clone().map(PathBuf::from);
         match lite_config::load_with_warnings(Path::new(&dir), pubkey.as_deref()) {
             Ok((c, w)) => {
@@ -142,21 +142,6 @@ pub fn run(
             }
         }
     };
-
-    // CLI overrides
-    if let Some(pos) = args.iter().position(|a| a == "--log-dir") {
-        if let Some(dir) = args.get(pos + 1) {
-            config.log_dir = dir.clone();
-        }
-    }
-    if let Some(pos) = args.iter().position(|a| a == "--run-id") {
-        if let Some(id) = args.get(pos + 1) {
-            config.run_id = id.clone();
-        }
-    }
-    if args.contains(&"--latency".to_string()) {
-        config.latency = true;
-    }
 
     // Parse --log-level CLI flag (overrides config log_level)
     let cli_log_level = args
@@ -254,11 +239,6 @@ pub fn run(
             errors.len()
         );
         error!("Run with --validate for details, or fix the issues above");
-    }
-
-    // Create log directory
-    if let Err(e) = std::fs::create_dir_all(&config.log_dir) {
-        warn!("Could not create log dir '{}': {}", config.log_dir, e);
     }
 
     // Shutdown signal handling
@@ -487,9 +467,6 @@ fn print_usage(prog: &str, registry: &ProviderRegistry) {
     eprintln!("  --config-pubkey PATH Ed25519 signing public key (trust anchor) for");
     eprintln!("                       --config-dir; defaults to DIR/trust/config-signing.pub.pem");
     eprintln!("  --validate           Validate config and environment, then exit");
-    eprintln!("  --log-dir DIR        Override log directory from config");
-    eprintln!("  --run-id ID          Override run ID from config");
-    eprintln!("  --latency            Enable latency measurement");
     eprintln!("  --log-level LVL      Set log level: error, warn, info, debug, trace (default: info)");
     eprintln!("  --watch              Enable config hot-reload via file watching");
     eprintln!("  --log-stdout         Copy log output to stdout (for journald/containers)");
@@ -497,7 +474,7 @@ fn print_usage(prog: &str, registry: &ProviderRegistry) {
     eprintln!();
     eprintln!("Validation (--validate):");
     eprintln!("  Checks: JSON syntax, rule consistency, port conflicts, CAP_NET_ADMIN,");
-    eprintln!("  iptables chains, TPROXY routing policy, log dir writability, kTLS support.");
+    eprintln!("  iptables chains, TPROXY routing policy, kTLS support.");
     eprintln!("  Exits 0 on success, 1 on failure. Safe to run -- makes no changes.");
     eprintln!();
     eprintln!("Hot-reload:");
@@ -508,9 +485,6 @@ fn print_usage(prog: &str, registry: &ProviderRegistry) {
     eprintln!("Configuration file format (JSON):");
     eprintln!();
     eprintln!("  {{");
-    eprintln!("    \"log_dir\": \"/results\",");
-    eprintln!("    \"run_id\": \"test_001\",");
-    eprintln!("    \"latency\": true,");
     eprintln!("    \"rules\": [");
     eprintln!("      {{");
     eprintln!("        \"name\": \"web-encrypt\",");

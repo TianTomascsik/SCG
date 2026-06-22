@@ -23,11 +23,10 @@ Two concerns:
 
 Today metrics live in concrete structs `ConnectionMetrics` (per connection) and
 `RuleMetrics` (per rule, atomic counters), and are surfaced only by
-`RuleMetrics::print_summary()` writing to the `info!` log every ~10s, plus
-optional CSV via `bench_log::CsvLogger`. The collection points are good but the
-**export path is hard-coded**. An interface separates "record a measurement" from
-"where measurements go," so a deployment can add Prometheus scraping without
-editing the engines.
+`RuleMetrics::print_summary()` writing to the `info!` log every ~10s. The
+collection points are good but the **export path is hard-coded**. An interface
+separates "record a measurement" from "where measurements go," so a deployment
+can add Prometheus scraping without editing the engines.
 
 ## Traits
 
@@ -122,12 +121,10 @@ pub enum HealthStatus { Healthy, Degraded, Unhealthy }
 |-------|----------------|
 | `RuleMetrics.total_bytes_in.fetch_add(n)` | `incr_counter(BytesIn, n, labels)` |
 | `RuleMetrics.active_connections` inc/dec | `set_gauge(ConnectionsActive, v, labels)` |
-| `ConnectionMetrics.record_relay(bytes, latency_ns)` | `incr_counter(MessagesRelayed,1,..)` + `observe(MessageLatencySeconds, ns/1e9, ..)` |
-| `handshake_ms` | `observe(HandshakeSeconds, ms/1e3, ..)` |
+| `ConnectionMetrics.record_relay(bytes)` | `incr_counter(MessagesRelayed,1,..)` |
 | `RuleMetrics::print_summary()` | a `MetricsSink` impl that logs `snapshot()` every 10s |
-| `log_connection_csv()` | a `MetricsSink`/exporter impl writing CSV |
 
-`now_ns()`, `format_rate()`, `format_bytes()` remain helper utilities.
+`format_rate()`, `format_bytes()` remain helper utilities.
 
 ## Example implementor (skeleton)
 

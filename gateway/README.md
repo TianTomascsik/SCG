@@ -33,8 +33,6 @@ application.
 | **TPROXY** | Transparent proxy via `IP_TRANSPARENT` + `SO_ORIGINAL_DST` |
 | **Hot-reload** | SIGHUP or file watch -- add/remove rules without restart |
 | **Provider architecture** | Add custom security or protocol providers by implementing a trait |
-| **Latency measurement** | Per-message nanosecond-precision timestamps |
-| **CSV logging** | Per-connection metrics exported to CSV files |
 
 ## Quick Start
 
@@ -48,9 +46,6 @@ sudo ./target/release/gateway --config gateway/gateway.example.json
 # Run with overrides
 sudo ./target/release/gateway \
     --config gateway.json \
-    --log-dir /results \
-    --run-id test_001 \
-    --latency \
     --watch
 
 # Validate config without starting
@@ -63,9 +58,6 @@ sudo ./target/release/gateway --config gateway.json --validate
 |---|---|
 | `--config PATH` | Path to JSON configuration file **(required)** |
 | `--validate` | Validate config and check environment, then exit |
-| `--log-dir DIR` | Override log directory from config |
-| `--run-id ID` | Override run ID for CSV filenames |
-| `--latency` | Enable per-message latency measurement |
 | `--log-level LVL` | Set log level: error, warn, info, debug, trace (default: info) |
 | `--watch` | Enable config file polling every 2 seconds |
 | `--log-stdout` | Copy log output to stdout (for journald/containers) |
@@ -80,9 +72,6 @@ The gateway is configured via a JSON file. See
 
 ```json
 {
-  "log_dir": "/results",
-  "run_id": "test_001",
-  "latency": false,
   "log_level": "info",
   "sock_buf_size": 16777216
 }
@@ -405,7 +394,6 @@ Create `/etc/scg/environment`:
 
 ```bash
 CONFIG=/etc/scg/my_custom.json
-LOG_DIR=/var/log/scg
 ```
 
 ## Hot-Reload
@@ -517,7 +505,6 @@ cargo build --release --bin gateway
 | `openssl` | TLS and DTLS via OpenSSL |
 | `ktls_pipe` | Kernel TLS session management (workspace member) |
 | `tls_pipe` | Userspace TLS helpers (workspace member) |
-| `bench_log` | CSV logging (workspace member) |
 | `ale_pipe` | ALE/ALEPKT framing (workspace member) |
 | `serde` + `serde_json` | JSON config deserialization |
 | `libc` | Low-level system calls (TPROXY, signals, poll) |

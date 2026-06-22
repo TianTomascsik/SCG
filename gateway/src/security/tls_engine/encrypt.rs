@@ -23,9 +23,8 @@ use ale_pipe::{
 
 use crate::interfaces::tproxy;
 use crate::management::config::{QosPolicy, TlsMode};
-use crate::management::telemetry::{format_rate, log_connection_csv, now_ns, ConnectionMetrics};
+use crate::management::telemetry::{format_rate, ConnectionMetrics};
 
-use bench_log::{compute_latency_stats, print_latency_stats, CsvLogger};
 use foreign_types_shared::ForeignTypeRef;
 use ktls_pipe::{
     build_client_connector as ktls_client_connector, enable_ktls_ssl, get_tcp_ulp,
@@ -37,7 +36,7 @@ use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // =============================================================================
@@ -51,16 +50,6 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         None => return,
     };
     listener.set_nonblocking(false).ok();
-
-    let csv_logger = Arc::new(Mutex::new(
-        CsvLogger::new(
-            &ctx.log_dir,
-            "gateway",
-            &format!("encrypt-{}", ctx.tls_mode),
-            &ctx.run_id,
-        )
-        .ok(),
-    ));
 
     // Resolve typed security parameters once; shared by all connections.
     let tls_params = match TlsSecurityParams::from_params(
@@ -125,10 +114,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let metrics = ctx.metrics.clone();
         let rule_name = ctx.rule_name.clone();
         let tls_mode = ctx.tls_mode;
-        let csv_logger = csv_logger.clone();
-        let run_id = ctx.run_id.clone();
         let shutdown = ctx.shutdown.clone();
-        let measure_latency = ctx.measure_latency;
         let sock_buf_size = ctx.sock_buf_size;
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
@@ -151,7 +137,6 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 client_stream,
                 &target,
                 tls_mode,
-                measure_latency,
                 sock_buf_size,
                 &mut conn_metrics,
                 &shutdown,
@@ -175,20 +160,6 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 format_rate(out_bps),
             );
 
-            // Latency stats
-            if measure_latency {
-                if let Some(stats) = compute_latency_stats(&mut conn_metrics.latency_samples_ns) {
-                    print_latency_stats(0, &format!("{} relay", rule_name), &stats);
-                }
-            }
-
-            // CSV logging
-            if let Ok(mut guard) = csv_logger.lock() {
-                if let Some(ref mut logger) = *guard {
-                    log_connection_csv(logger, &mut conn_metrics, &run_id);
-                }
-            }
-
             metrics.merge_connection(&conn_metrics);
             metrics.connection_closed();
         });
@@ -206,7 +177,6 @@ pub(crate) fn handle_tcp_encrypt(
     client: TcpStream,
     upstream_addr: &str,
     tls_mode: TlsMode,
-    measure_latency: bool,
     sock_buf_size: usize,
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
@@ -298,7 +268,6 @@ pub(crate) fn handle_tcp_encrypt(
         }
         TlsMode::Dtls => unreachable!("DTLS uses run_dtls_encrypt_relay, not tcp encrypt"),
     };
-    conn_metrics.handshake_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
 
     // Bidirectional relay: client (plain) <-> upstream (TLS)
     // Use zero-copy splice for kTLS, buffered relay for userspace TLS
@@ -309,7 +278,6 @@ pub(crate) fn handle_tcp_encrypt(
             relay_bidirectional_splice(
                 client_fd,
                 tls_fd,
-                measure_latency,
                 conn_metrics,
                 shutdown,
                 delay_ms,
@@ -319,7 +287,6 @@ pub(crate) fn handle_tcp_encrypt(
             relay_encrypt_bidirectional(
                 client,
                 &mut upstream,
-                measure_latency,
                 conn_metrics,
                 shutdown,
                 delay_ms,
@@ -577,7 +544,6 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                         unreachable!("DTLS uses run_dtls_encrypt_relay, not udp encrypt")
                     }
                 };
-                conn_metrics.handshake_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
                 break stream;
             };
 
@@ -697,7 +663,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                         // Frame the datagram (ALE DT or raw length-prefix) into
                         // the batch buffer.
                         framing.frame_into(&udp_buf[..n], &mut batch_buf);
-                        conn_metrics.record_relay(n, None);
+                        conn_metrics.record_relay(n);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break 'udp_fwd,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -710,13 +676,8 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
             // Flush all accumulated ALE frames in a single TLS write
             if !batch_buf.is_empty() {
                 apply_geo_delay(ctx.simulated_delay_ms);
-                let t0 = if ctx.measure_latency { now_ns() } else { 0 };
                 if write_all_nb_proxy(tls, &batch_buf).is_err() {
                     break; // TLS connection is dead — exit outer loop
-                }
-                if ctx.measure_latency {
-                    let lat = now_ns() - t0;
-                    conn_metrics.latency_samples_ns.push(lat);
                 }
             }
         }
@@ -734,7 +695,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                             }
                             let data_len = datagram.len();
                             conn_metrics.record_read(data_len);
-                            conn_metrics.record_relay(data_len, None);
+                            conn_metrics.record_relay(data_len);
                         }
                         if deframed.disconnect {
                             break 'tls_read;
@@ -765,29 +726,6 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
         conn_metrics.msgs_relayed,
         format_rate(conn_metrics.bytes_out as f64 / elapsed)
     );
-
-    if ctx.measure_latency {
-        if let Some(stats) = compute_latency_stats(&mut conn_metrics.latency_samples_ns) {
-            print_latency_stats(0, &format!("{} relay", ctx.rule_name), &stats);
-        }
-    }
-
-    // CSV logging
-    if let Ok(mut guard) = (Arc::new(Mutex::new(
-        CsvLogger::new(
-            &ctx.log_dir,
-            "gateway",
-            &format!("encrypt-udp-{}", ctx.tls_mode),
-            &ctx.run_id,
-        )
-        .ok(),
-    )))
-    .lock()
-    {
-        if let Some(ref mut logger) = *guard {
-            log_connection_csv(logger, &mut conn_metrics, &ctx.run_id);
-        }
-    }
 
     ctx.metrics.merge_connection(&conn_metrics);
     ctx.metrics.connection_closed();

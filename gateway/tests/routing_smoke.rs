@@ -53,7 +53,6 @@ fn routing_plaintext_passthrough_round_trip() {
     // Safety class so the default deny-all policy passes the per-connection check.
     let json = format!(
         r#"{{
-            "log_dir": "{log}",
             "rules": [{{
                 "name": "route-1",
                 "direction": "encrypt",
@@ -65,7 +64,6 @@ fn routing_plaintext_passthrough_round_trip() {
                 "traffic_class": "safety"
             }}]
         }}"#,
-        log = tmp.display(),
         listen = listen,
         echo = echo.addr,
     );

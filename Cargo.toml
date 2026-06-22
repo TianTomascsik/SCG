@@ -6,7 +6,6 @@ members = [
     # Shared infrastructure crates (consumed by the gateway and by the benches repo)
     "crates/ktls_pipe",
     "crates/tls_pipe",
-    "crates/bench_log",
 
     # Local-interface IPC primitives and gRPC management protocol
     "crates/scg-ipc",

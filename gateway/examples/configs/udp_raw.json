@@ -1,5 +1,4 @@
 {
-  "log_dir": "/var/log/scg",
   "rules": [
     {
       "name": "raw-encrypt",

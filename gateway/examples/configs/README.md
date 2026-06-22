@@ -1,7 +1,7 @@
 # Example configurations & capability matrix
 
 Runnable, per-capability gateway configurations. Each file is a complete
-`GatewayConfig` (a `log_dir` plus a `rules` array) and is validated in CI by
+`GatewayConfig` (a `rules` array) and is validated in CI by
 [`tests/examples_load.rs`](../../tests/examples_load.rs), so a renamed field or a
 newly-rejected combination fails the build.
 

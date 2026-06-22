@@ -11,7 +11,6 @@ applications behind it. Part of the **SCG** project.
 | `gateway/` | Gateway library + binary (`gateway`). Built-in crypto providers: TLS, kTLS, DTLS; app protocols: ALE, raw. |
 | `crates/ktls_pipe/` | Kernel TLS (kTLS) pipe library |
 | `crates/tls_pipe/` | Userspace TLS pipe library (OpenSSL) |
-| `crates/bench_log/` | CSV logging + latency statistics (shared telemetry) |
 
 ## Build & run
 
@@ -19,7 +18,7 @@ applications behind it. Part of the **SCG** project.
 cargo build --release --bin gateway
 
 # Validate a configuration without opening sockets
-./target/release/gateway --config gateway/gateway.example.json --validate --log-dir /tmp/scg
+./target/release/gateway --config gateway/gateway.example.json --validate
 
 # Run (transparent-proxy rules need CAP_NET_ADMIN, e.g. via sudo or the systemd unit)
 sudo ./target/release/gateway --config gateway/gateway.example.json

@@ -61,7 +61,6 @@ fn tcp_encrypt_relay_round_trip() {
     // the encrypt relay path runs a policy check on every connection.
     let json = format!(
         r#"{{
-            "log_dir": "{log}",
             "rules": [{{
                 "name": "tcp-encrypt",
                 "direction": "encrypt",
@@ -73,7 +72,6 @@ fn tcp_encrypt_relay_round_trip() {
                 "traffic_class": "safety"
             }}]
         }}"#,
-        log = tmp.display(),
         listen = listen,
         echo = echo.addr,
     );
@@ -130,7 +128,6 @@ fn udp_and_tproxy_rules_validate() {
 
     let json = format!(
         r#"{{
-            "log_dir": "{log}",
             "rules": [
                 {{
                     "name": "udp-encrypt",
@@ -154,7 +151,6 @@ fn udp_and_tproxy_rules_validate() {
                 }}
             ]
         }}"#,
-        log = tmp.display(),
     );
     let cfg_path = tmp.join("gw.json");
     std::fs::write(&cfg_path, &json).unwrap();

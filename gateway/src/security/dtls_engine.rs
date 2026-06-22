@@ -15,10 +15,9 @@ use crate::security::tls_engine::params::{TlsSecurityParams, VerifyMode};
 use crate::security::{RELAY_BUF_SIZE, UDP_BUF_SIZE};
 
 use crate::management::config::Proto;
-use crate::management::telemetry::{format_rate, log_connection_csv, now_ns, ConnectionMetrics};
+use crate::management::telemetry::{format_rate, ConnectionMetrics};
 use log::{debug, error, info};
 
-use bench_log::{compute_latency_stats, print_latency_stats, CsvLogger};
 use openssl::ssl::{
     ErrorCode, SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslStream, SslVerifyMode,
     SslVersion,
@@ -437,7 +436,6 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                         }
 
                         conn_metrics.record_read(n);
-                        let t0 = if ctx.measure_latency { now_ns() } else { 0 };
 
                         // Get or create DTLS session for this peer
                         if !sessions.contains_key(&peer_addr) {
@@ -512,15 +510,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                             apply_geo_delay(ctx.simulated_delay_ms);
                             match dtls.ssl_write(&fwd_buf[..n]) {
                                 Ok(_) => {
-                                    let lat = if ctx.measure_latency {
-                                        now_ns() - t0
-                                    } else {
-                                        0
-                                    };
-                                    conn_metrics.record_relay(
-                                        n,
-                                        if ctx.measure_latency { Some(lat) } else { None },
-                                    );
+                                    conn_metrics.record_relay(n);
                                 }
                                 Err(e) => {
                                     error!(
@@ -556,7 +546,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                             Ok(n) => {
                                 conn_metrics.record_read(n);
                                 let _ = plain_socket.send_to(&rev_buf[..n], peer_addr);
-                                conn_metrics.record_relay(n, None);
+                                conn_metrics.record_relay(n);
                             }
                             Err(ref e) if e.code() == ErrorCode::WANT_READ => break,
                             Err(e) => {
@@ -594,16 +584,6 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         conn_metrics.msgs_relayed,
         format_rate(conn_metrics.bytes_out as f64 / elapsed)
     );
-
-    if ctx.measure_latency {
-        if let Some(stats) = compute_latency_stats(&mut conn_metrics.latency_samples_ns) {
-            print_latency_stats(0, &format!("{} relay", ctx.rule_name), &stats);
-        }
-    }
-
-    if let Ok(mut logger) = CsvLogger::new(&ctx.log_dir, "gateway", "encrypt-dtls", &ctx.run_id) {
-        log_connection_csv(&mut logger, &mut conn_metrics, &ctx.run_id);
-    }
 
     ctx.metrics.merge_connection(&conn_metrics);
     ctx.metrics.connection_closed();
@@ -748,11 +728,8 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
             ctx.upstream_addr.clone()
         };
         let upstream_proto = ctx.upstream_proto;
-        let measure_latency = ctx.measure_latency;
         let shutdown = ctx.shutdown.clone();
         let metrics = ctx.metrics.clone();
-        let log_dir = ctx.log_dir.clone();
-        let run_id = ctx.run_id.clone();
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let qos = ctx.qos;
         let traffic_class = ctx.traffic_class;
@@ -850,14 +827,8 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                         Ok(n) => {
                                             conn.record_read(n);
                                             apply_geo_delay(simulated_delay_ms);
-                                            let t0 = if measure_latency { now_ns() } else { 0 };
                                             let _ = upstream.send(&fwd_buf[..n]);
-                                            let lat =
-                                                if measure_latency { now_ns() - t0 } else { 0 };
-                                            conn.record_relay(
-                                                n,
-                                                if measure_latency { Some(lat) } else { None },
-                                            );
+                                            conn.record_relay(n);
                                         }
                                         Err(ref e) if e.code() == ErrorCode::WANT_READ => break,
                                         Err(e) => {
@@ -876,7 +847,7 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                             conn.record_read(n);
                                             match ssl.ssl_write(&rev_buf[..n]) {
                                                 Ok(_) => {
-                                                    conn.record_relay(n, None);
+                                                    conn.record_relay(n);
                                                 }
                                                 Err(e) => {
                                                     error!(
@@ -959,16 +930,10 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                         Ok(n) => {
                                             conn.record_read(n);
                                             apply_geo_delay(simulated_delay_ms);
-                                            let t0 = if measure_latency { now_ns() } else { 0 };
                                             if write_all_nb(&mut upstream, &fwd_buf[..n]).is_err() {
                                                 break 'relay;
                                             }
-                                            let lat =
-                                                if measure_latency { now_ns() - t0 } else { 0 };
-                                            conn.record_relay(
-                                                n,
-                                                if measure_latency { Some(lat) } else { None },
-                                            );
+                                            conn.record_relay(n);
                                         }
                                         Err(ref e) if e.code() == ErrorCode::WANT_READ => break,
                                         Err(e) => {
@@ -987,7 +952,7 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                         conn.record_read(n);
                                         match ssl.ssl_write(&rev_buf[..n]) {
                                             Ok(_) => {
-                                                conn.record_relay(n, None);
+                                                conn.record_relay(n);
                                             }
                                             Err(e) => {
                                                 error!("[{}] DTLS write error: {}", rule_name, e);
@@ -1013,17 +978,6 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                     "[{}] DTLS decrypt session {} done: {:.3}s, {} msgs",
                     rule_name, peer_addr, elapsed, conn.msgs_relayed
                 );
-
-                if measure_latency {
-                    if let Some(stats) = compute_latency_stats(&mut conn.latency_samples_ns) {
-                        print_latency_stats(0, &format!("{} dtls-dec", rule_name), &stats);
-                    }
-                }
-
-                if let Ok(mut logger) = CsvLogger::new(&log_dir, "gateway", "decrypt-dtls", &run_id)
-                {
-                    log_connection_csv(&mut logger, &mut conn, &run_id);
-                }
 
                 metrics.merge_connection(&conn);
             })

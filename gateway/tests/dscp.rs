@@ -303,7 +303,6 @@ fn dscp_tag_out_of_range_is_rejected() {
     let listen = format!("127.0.0.1:{}", free_port());
     let json = format!(
         r#"{{
-            "log_dir": "{log}",
             "rules": [{{
                 "name": "bad-dscp",
                 "direction": "encrypt",
@@ -316,7 +315,6 @@ fn dscp_tag_out_of_range_is_rejected() {
                 "dscp_tag": 64
             }}]
         }}"#,
-        log = tmp.display(),
     );
     let path = tmp.join("gw.json");
     std::fs::write(&path, json).unwrap();

@@ -84,7 +84,6 @@ fn chain_config(
     };
     let json = format!(
         r#"{{
-            "log_dir": "{log}",
             "rules": [
                 {{
                     "name": "udp-encrypt",
@@ -110,7 +109,6 @@ fn chain_config(
                 }}
             ]
         }}"#,
-        log = tmp.display(),
         cert = pki.server_cert.display(),
         key = pki.server_key.display(),
     );

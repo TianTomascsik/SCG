@@ -1,7 +1,0 @@
-[package]
-name = "bench_log"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-# Zero external dependencies — only std
