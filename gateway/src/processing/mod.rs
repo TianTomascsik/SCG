@@ -10,7 +10,7 @@ pub mod registry;
 pub mod traffic_analyzer;
 
 use crate::management::config::{
-    Direction, GatewayConfig, Proto, RuleConfig, TlsMode, TrafficClass,
+    Direction, GatewayConfig, Proto, QosPolicy, RuleConfig, TlsMode, TrafficClass,
 };
 use crate::management::telemetry::RuleMetrics;
 use crate::security::conn_pool::ConnectionPool;
@@ -49,6 +49,9 @@ pub struct RuleContext {
     pub provider_params: std::collections::HashMap<String, serde_json::Value>,
     // Traffic policy fields (optional — None means policy pipeline is not active)
     pub traffic_class: TrafficClass,
+    /// Resolved QoS policy (egress DSCP tag / preservation + SO_PRIORITY) for
+    /// this rule's sockets. Applied at every socket creation point.
+    pub qos: QosPolicy,
     pub traffic_analyzer: Option<Arc<TrafficAnalyzer>>,
     pub policy_manager: Option<Arc<RwLock<PolicyManager>>>,
     pub simulated_delay_ms: u64,
@@ -101,9 +104,33 @@ impl RuleContext {
 
         true
     }
-}
 
-// ─── Rule runner ─────────────────────────────────────────────────────────────
+    /// Apply this rule's egress QoS (DSCP tag/preservation + SO_PRIORITY) to a
+    /// socket. `is_v6` selects the IPv4/IPv6 option family; `sampled_inbound`
+    /// is the DSCP read from the ingress side for preservation (pass `None`
+    /// when no inbound sample is available — Safety still gets its EF default).
+    pub fn apply_egress_qos(
+        &self,
+        fd: std::os::unix::io::RawFd,
+        is_v6: bool,
+        sampled_inbound: Option<u8>,
+    ) {
+        crate::networking::socket_manager::apply_egress_qos(
+            fd,
+            self.qos.egress_dscp(sampled_inbound),
+            self.qos.so_priority(),
+            is_v6,
+        );
+    }
+
+    /// Enable inbound DSCP sampling (RECVTOS) on an ingress socket when this
+    /// rule requests DSCP preservation. No-op otherwise.
+    pub fn enable_inbound_dscp_sampling(&self, fd: std::os::unix::io::RawFd, is_v6: bool) {
+        if self.qos.needs_inbound_dscp() {
+            crate::networking::socket_manager::enable_recvtos(fd, is_v6);
+        }
+    }
+}
 
 /// Pipeline components shared across rules.
 pub struct PipelineComponents {
@@ -125,6 +152,23 @@ pub fn start_rules(
     let mut handles = Vec::new();
     let rule_shutdowns: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Preflight: safety-class rules want elevated scheduling priority, which
+    // needs CAP_SYS_NICE. Warn once if it is missing so the operator knows
+    // safety threads will fall back to default nice (DSCP/SO_PRIORITY marking
+    // is unaffected and still works).
+    if config
+        .rules
+        .iter()
+        .any(|r| r.traffic_class == TrafficClass::Safety)
+        && !crate::networking::socket_manager::has_cap_sys_nice()
+    {
+        warn!(
+            "Safety-class rules are configured but the process lacks CAP_SYS_NICE; \
+             safety threads cannot raise their scheduling priority and will run at \
+             the default nice value (DSCP / SO_PRIORITY marking is unaffected)."
+        );
+    }
 
     for rule in &config.rules {
         // uds/shm rules are templates consumed by the InterfaceManager and
@@ -211,9 +255,15 @@ pub fn start_single_rule(
     let rule_shutdown_stats = rule_shutdown.clone();
     let stats_rule_name = rule_name.clone();
 
-    // Build the connection pool for this rule (2× CPUs)
+    // Build the connection pool for this rule (2× CPUs). Safety rules get a
+    // class-aware pool: reserved minimum workers at elevated priority so a
+    // normal-traffic storm cannot starve safety capacity.
     let pool_size = ConnectionPool::default_size();
-    let conn_pool = Arc::new(ConnectionPool::new(pool_size, &rule.name));
+    let conn_pool = Arc::new(ConnectionPool::new_for_class(
+        pool_size,
+        &rule.name,
+        rule.traffic_class,
+    ));
 
     // Derive tls_mode from the effective security provider name so that
     // `"security_provider": "ktls"` in the config correctly activates kTLS,
@@ -242,6 +292,7 @@ pub fn start_single_rule(
         shutdown: Arc::new(AtomicBool::new(false)), // placeholder, replaced below
         provider_params: rule.provider_params.clone(),
         traffic_class: rule.traffic_class,
+        qos: rule.qos(),
         traffic_analyzer: pipeline.traffic_analyzer.clone(),
         policy_manager: Some(pipeline.policy_manager.clone()),
         simulated_delay_ms: rule.simulated_delay_ms,

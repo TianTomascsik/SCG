@@ -6,11 +6,12 @@
 //! classification / policy enforcement, with no TLS on either leg.
 
 use crate::interfaces::tproxy;
-use crate::management::config::TrafficClass;
+use crate::management::config::QosPolicy;
 use crate::management::telemetry::{format_rate, log_connection_csv, ConnectionMetrics};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
-    accept_with_timeout, bind_tcp_listener, set_nodelay, tune_socket_buffers,
+    accept_with_timeout, apply_egress_qos, apply_safety_priority, bind_tcp_listener, set_nodelay,
+    tune_socket_buffers,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::relay_bidirectional_splice;
@@ -85,6 +86,8 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
         let fd = client_stream.as_raw_fd();
         tune_socket_buffers(fd, ctx.sock_buf_size);
         set_nodelay(fd, true);
+        // Prioritise the client-facing (SCG → client) return path.
+        ctx.apply_egress_qos(fd, peer_addr.is_ipv6(), None);
 
         ctx.metrics.connection_opened();
 
@@ -97,15 +100,12 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
         let sock_buf_size = ctx.sock_buf_size;
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
+        let qos = ctx.qos;
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
-            // Set higher OS thread priority for safety traffic.
-            if traffic_class == TrafficClass::Safety {
-                unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, -5);
-                }
-            }
+            // Safety traffic always runs at elevated thread priority.
+            apply_safety_priority(traffic_class);
 
             let mut conn_metrics =
                 ConnectionMetrics::with_rule_metrics("routing", "routing", metrics.clone());
@@ -119,6 +119,7 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
                 &mut conn_metrics,
                 &shutdown,
                 simulated_delay_ms,
+                qos,
             );
 
             if let Err(e) = result {
@@ -160,6 +161,7 @@ fn handle_tcp_routing(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
+    qos: QosPolicy,
 ) -> io::Result<()> {
     let upstream_tcp = connect_with_retry(
         upstream_addr,
@@ -171,6 +173,9 @@ fn handle_tcp_routing(
     let up_fd = upstream_tcp.as_raw_fd();
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
+    // Mark + prioritise the upstream (SCG → upstream) egress socket.
+    let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
 
     // Zero-copy splice passthrough between the two plain TCP sockets. Both
     // `client` and `upstream_tcp` stay owned (and thus open) for the duration.

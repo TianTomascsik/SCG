@@ -1,0 +1,43 @@
+{
+  "log_dir": "/var/log/scg",
+  "rules": [
+    {
+      "name": "safety-ef-tag",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:9200",
+      "listen_proto": "tcp",
+      "upstream_addr": "safety-backend.example:9200",
+      "upstream_proto": "tcp",
+      "security_provider": "routing",
+      "traffic_class": "safety",
+      "dscp_tag": 46
+    },
+    {
+      "name": "safety-preserve-dtls",
+      "direction": "decrypt",
+      "listen_addr": "0.0.0.0:6200",
+      "listen_proto": "udp",
+      "upstream_addr": "127.0.0.1:6201",
+      "upstream_proto": "udp",
+      "security_provider": "dtls",
+      "traffic_class": "safety",
+      "protocol_version": "dtls1.2",
+      "verify": "mutual",
+      "cert_path": "/etc/scg/pki/scg.crt",
+      "key_path": "/etc/scg/pki/scg.key",
+      "ca_path": "/etc/scg/pki/sensor-ca.crt",
+      "preserve_inbound_dscp": true
+    },
+    {
+      "name": "normal-af11-tag",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:9201",
+      "listen_proto": "tcp",
+      "upstream_addr": "bulk-backend.example:9201",
+      "upstream_proto": "tcp",
+      "security_provider": "routing",
+      "traffic_class": "normal",
+      "dscp_tag": 10
+    }
+  ]
+}

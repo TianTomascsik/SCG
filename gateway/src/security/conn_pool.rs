@@ -13,6 +13,8 @@
 //! - Automatically scales up for high-concurrency bursts
 //! - No connection starvation — every job gets a thread
 
+use crate::management::config::TrafficClass;
+use crate::networking::socket_manager::apply_safety_priority;
 use log::{debug, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -21,21 +23,45 @@ use std::thread;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Guaranteed minimum number of base worker threads reserved for a safety
+/// pool, so safety relays always have dedicated capacity even on low-CPU hosts
+/// where `default_size()` would otherwise be tiny.
+const SAFETY_MIN_WORKERS: usize = 2;
+
 /// An elastic thread pool for connection handling.
 ///
 /// Maintains a base set of long-lived worker threads.  When a job is
 /// submitted and no base worker is idle, a temporary overflow thread is
 /// spawned to handle the job immediately, preventing queue stalls.
+///
+/// The pool is *class-aware*: a [`TrafficClass::Safety`] pool reserves a
+/// minimum worker count and runs every worker (base and overflow) at elevated
+/// scheduling priority, so a normal-traffic connection storm can never starve
+/// safety capacity.
 pub struct ConnectionPool {
     sender: mpsc::Sender<Job>,
     idle_count: Arc<AtomicUsize>,
     name_prefix: String,
+    class: TrafficClass,
     _workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl ConnectionPool {
-    /// Create a new pool with `size` base worker threads.
+    /// Create a new `Normal`-class pool with `size` base worker threads.
     pub fn new(size: usize, name_prefix: &str) -> Self {
+        Self::new_for_class(size, name_prefix, TrafficClass::Normal)
+    }
+
+    /// Create a new pool for the given traffic `class`.
+    ///
+    /// `Safety` pools reserve at least [`SAFETY_MIN_WORKERS`] base workers and
+    /// elevate the scheduling priority of every worker thread.
+    pub fn new_for_class(size: usize, name_prefix: &str, class: TrafficClass) -> Self {
+        let size = if class == TrafficClass::Safety {
+            size.max(SAFETY_MIN_WORKERS)
+        } else {
+            size
+        };
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(std::sync::Mutex::new(receiver));
         let idle_count = Arc::new(AtomicUsize::new(0));
@@ -48,6 +74,9 @@ impl ConnectionPool {
             let handle = thread::Builder::new()
                 .name(name)
                 .spawn(move || {
+                    // Safety pools run their reserved workers at elevated
+                    // priority from the start, before any per-connection call.
+                    apply_safety_priority(class);
                     loop {
                         // Mark ourselves idle while waiting for work
                         idle.fetch_add(1, Ordering::Release);
@@ -71,6 +100,7 @@ impl ConnectionPool {
             sender,
             idle_count,
             name_prefix: name_prefix.to_owned(),
+            class,
             _workers: workers,
         }
     }
@@ -97,9 +127,12 @@ impl ConnectionPool {
 
         // Slow path: all base workers busy → spawn overflow thread
         let prefix = self.name_prefix.clone();
+        let class = self.class;
         match thread::Builder::new()
             .name(format!("{}-overflow", prefix))
             .spawn(move || {
+                // Overflow threads inherit the pool's class priority too.
+                apply_safety_priority(class);
                 debug!("pool overflow thread started");
                 f();
             }) {
@@ -121,5 +154,41 @@ impl ConnectionPool {
             .map(|n| n.get())
             .unwrap_or(4);
         cpus * 2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[test]
+    fn safety_pool_reserves_minimum_workers() {
+        // A requested size below the floor is raised to SAFETY_MIN_WORKERS.
+        let pool = ConnectionPool::new_for_class(1, "test-safety", TrafficClass::Safety);
+        assert!(pool._workers.len() >= SAFETY_MIN_WORKERS);
+    }
+
+    #[test]
+    fn normal_pool_uses_requested_size() {
+        let pool = ConnectionPool::new_for_class(1, "test-normal", TrafficClass::Normal);
+        assert_eq!(pool._workers.len(), 1);
+        assert_eq!(pool.class, TrafficClass::Normal);
+    }
+
+    #[test]
+    fn executes_submitted_job() {
+        let pool = ConnectionPool::new(2, "test-exec");
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        assert!(pool.execute(move || f.store(true, Ordering::SeqCst)));
+        for _ in 0..200 {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(flag.load(Ordering::SeqCst));
     }
 }

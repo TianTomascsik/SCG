@@ -4,7 +4,8 @@ use super::params::TlsSecurityParams;
 use super::{build_tls_acceptor, ProxyStream};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
-    accept_with_timeout, bind_tcp_listener, set_nodelay, tune_socket_buffers,
+    accept_with_timeout, apply_egress_qos, apply_safety_priority, bind_tcp_listener, set_nodelay,
+    tune_socket_buffers,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::{relay_bidirectional, relay_bidirectional_splice, relay_tls_to_udp};
@@ -13,7 +14,7 @@ use crate::security::ACCEPT_TIMEOUT;
 use ale_pipe::{AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_PKT_AU1, ALE_PKT_AU2};
 
 use crate::interfaces::tproxy;
-use crate::management::config::{Proto, TlsMode};
+use crate::management::config::{Proto, QosPolicy, TlsMode};
 use crate::management::telemetry::{format_rate, log_connection_csv, ConnectionMetrics};
 
 use bench_log::{compute_latency_stats, print_latency_stats, CsvLogger};
@@ -103,8 +104,8 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         let fd = stream.as_raw_fd();
         tune_socket_buffers(fd, ctx.sock_buf_size);
         set_nodelay(fd, true);
-
-        // Resolve upstream: if transparent + auto, use SO_ORIGINAL_DST
+        // Prioritise the client-facing (SCG → client) return path.
+        ctx.apply_egress_qos(fd, peer_addr.is_ipv6(), None);
         // to discover the original destination IP:port, then forward locally.
         // We use the original destination IP (not 127.0.0.1) because some
         // applications (e.g. a multicast discovery channel) bind to specific
@@ -154,15 +155,12 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let app_protocol = ctx.app_protocol.clone();
+        let qos = ctx.qos;
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
-            // Set higher OS thread priority for safety traffic
-            if traffic_class == crate::management::config::TrafficClass::Safety {
-                unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, -5);
-                }
-            }
+            // Safety traffic always runs at elevated thread priority.
+            apply_safety_priority(traffic_class);
 
             let mut conn_metrics = ConnectionMetrics::with_rule_metrics(
                 "decrypt",
@@ -184,6 +182,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
                 &shutdown,
                 simulated_delay_ms,
                 &app_protocol,
+                qos,
             );
 
             if let Err(e) = result {
@@ -240,6 +239,7 @@ pub(crate) fn handle_tcp_decrypt(
     shutdown: &Arc<AtomicBool>,
     delay_ms: u64,
     app_protocol: &str,
+    qos: QosPolicy,
 ) -> io::Result<()> {
     // ── TLS handshake ────────────────────────────────────────────────────────
     let hs_start = Instant::now();
@@ -316,6 +316,14 @@ pub(crate) fn handle_tcp_decrypt(
             )?;
             tune_socket_buffers(upstream.as_raw_fd(), sock_buf_size);
             set_nodelay(upstream.as_raw_fd(), true);
+            // Mark + prioritise the upstream (SCG → upstream) egress socket.
+            let up_is_v6 = upstream.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+            apply_egress_qos(
+                upstream.as_raw_fd(),
+                qos.egress_dscp(None),
+                qos.so_priority(),
+                up_is_v6,
+            );
             debug!(
                 "[{}] Connected to upstream {} (TCP)",
                 rule_name, upstream_addr
@@ -347,16 +355,26 @@ pub(crate) fn handle_tcp_decrypt(
             }
         }
         Proto::Udp => {
-            let upstream = UdpSocket::bind("0.0.0.0:0")
-                .map_err(|e| io::Error::new(e.kind(), format!("UDP bind: {}", e)))?;
             let target: SocketAddr = upstream_addr.parse().map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("parse {}: {}", upstream_addr, e),
                 )
             })?;
+            // Bind the egress socket in the target's address family so IPv6
+            // upstreams work (an IPv4 wildcard cannot connect to an IPv6 peer).
+            let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let upstream = UdpSocket::bind(bind_addr)
+                .map_err(|e| io::Error::new(e.kind(), format!("UDP bind: {}", e)))?;
             upstream.connect(target)?;
             tune_socket_buffers(upstream.as_raw_fd(), sock_buf_size);
+            // Mark + prioritise the upstream (SCG → upstream) UDP egress socket.
+            apply_egress_qos(
+                upstream.as_raw_fd(),
+                qos.egress_dscp(None),
+                qos.so_priority(),
+                target.is_ipv6(),
+            );
             debug!(
                 "[{}] Connected to upstream {} (UDP)",
                 rule_name, upstream_addr

@@ -10,7 +10,7 @@
 use crate::interfaces::endpoint::upstream_tls_mode;
 use crate::interfaces::shm::{run_shm_endpoint, ShmEndpointTask};
 use crate::interfaces::uds::{run_uds_endpoint, UdsEndpointTask};
-use crate::management::config::{Direction, GatewayConfig, Proto, TlsMode, TrafficClass};
+use crate::management::config::{Direction, GatewayConfig, Proto, QosPolicy, TlsMode, TrafficClass};
 
 use scg_ipc::handshake::SHM_NOTIFY_EVENTFD;
 use scg_ipc::token::CapabilityToken;
@@ -88,6 +88,8 @@ struct EndpointTemplate {
     protocol_version: Option<String>,
     allowed_uids: Arc<Vec<u32>>,
     allowed_pids: Arc<Vec<i32>>,
+    /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
+    qos: QosPolicy,
     /// Default per-direction ring capacity for SHM endpoints (bytes).
     ring_capacity: usize,
 }
@@ -216,6 +218,7 @@ impl InterfaceManager {
                     protocol_version: rule.protocol_version.clone(),
                     allowed_uids: Arc::new(rule.allowed_uids.clone()),
                     allowed_pids: Arc::new(rule.allowed_pids.clone()),
+                    qos: rule.qos(),
                     ring_capacity: api.shm_ring_capacity,
                 },
             );
@@ -372,6 +375,7 @@ impl InterfaceManager {
             tls_mode: template.tls_mode,
             protocol_version: template.protocol_version.clone(),
             sock_buf_size: self.sock_buf_size,
+            qos: template.qos,
             allowed_uids: template.allowed_uids.clone(),
             allowed_pids: template.allowed_pids.clone(),
             owner_uid: caller.uid,
@@ -485,6 +489,7 @@ impl InterfaceManager {
             tls_mode: template.tls_mode,
             protocol_version: template.protocol_version.clone(),
             sock_buf_size: self.sock_buf_size,
+            qos: template.qos,
             cap_c2g: cap,
             cap_g2c: cap,
             allowed_uids: template.allowed_uids.clone(),

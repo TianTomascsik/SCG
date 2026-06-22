@@ -7,7 +7,7 @@
 //! traffic through a TLS/kTLS upstream.
 
 use crate::interfaces::endpoint::{authenticate_peer, connect_tls_upstream, relay_uds_tls};
-use crate::management::config::TlsMode;
+use crate::management::config::{QosPolicy, TlsMode};
 
 use scg_ipc::os::{self, PeerCred};
 use scg_ipc::token::CapabilityToken;
@@ -35,6 +35,8 @@ pub struct UdsEndpointTask {
     pub protocol_version: Option<String>,
     /// Socket buffer tuning size.
     pub sock_buf_size: usize,
+    /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
+    pub qos: QosPolicy,
     /// uids permitted to connect (from the rule's `allowed_uids`).
     pub allowed_uids: Arc<Vec<u32>>,
     /// Optional pid allow-list (from the rule's `allowed_pids`).
@@ -166,6 +168,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
         task.tls_mode,
         task.protocol_version.as_deref(),
         task.sock_buf_size,
+        task.qos,
         &task.shutdown,
     ) {
         Ok(t) => t,

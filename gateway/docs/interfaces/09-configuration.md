@@ -155,6 +155,55 @@ offloaded); other non-offloadable profiles fall back to userspace `tls` with a
 warning. Full reference: [01 — Crypto Provider](01-crypto-provider.md); runnable
 configs: [examples/configs/](../../examples/configs/).
 
+## Implemented — DSCP marking & safety prioritization (QoS)
+
+Every rule carries a traffic class and two optional per-rule QoS fields. Safety
+traffic is **always** prioritized internally and marked for priority on the wire.
+Parsed into a [`QosPolicy`](../../src/management/config.rs) via `RuleConfig::qos`.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `traffic_class` | no (default `normal`) | `"safety"` or `"normal"`. Selects the class default DSCP/priority — safety defaults to **EF (46)**, normal is left unmarked. |
+| `dscp_tag` | no | Explicit egress DSCP `0`–`63`. Overrides the class default and any inbound marking. `> 63` is **rejected at load**. |
+| `preserve_inbound_dscp` | no (default `false`) | When `true` and no `dscp_tag`, the gateway samples the inbound DS field (`IP_RECVTOS` / `IPV6_RECVTCLASS`) and re-applies it on egress. |
+
+**Egress DSCP precedence** ([`RuleConfig::egress_dscp`](../../src/management/config.rs)):
+
+1. explicit `dscp_tag` → that value;
+2. else `preserve_inbound_dscp` + a sampled inbound DSCP → the sampled value;
+3. else the class default: **safety → EF (46)**, normal → unmarked.
+
+**Internal prioritization (always on for safety).** Independent of DSCP, safety
+rules raise their workers' scheduling priority via
+[`apply_safety_priority`](../../src/networking/socket_manager.rs) (`nice -5` when
+the process holds `CAP_SYS_NICE`), set `SO_PRIORITY = 6` on their sockets, and run
+on a class-aware [`ConnectionPool`](../../src/security/conn_pool.rs) with a
+reserved minimum worker count so a normal-traffic flood cannot starve safety
+capacity. Without `CAP_SYS_NICE` the gateway logs a one-time preflight warning and
+degrades to DSCP + `SO_PRIORITY` only.
+
+**Preservation scope.** Per-datagram inbound-DSCP preservation works where the
+gateway owns the receive (UDP / DTLS). On TLS-terminated and `splice` TCP paths
+the gateway cannot sample per-segment marks, so preservation falls back to the
+class default (safety still gets EF). IPv4 (`IP_TOS`) and IPv6 (`IPV6_TCLASS`) are
+both first-class.
+
+```json
+{
+  "name": "safety-ef-tag",
+  "direction": "encrypt",
+  "listen_addr": "0.0.0.0:9200",
+  "listen_proto": "tcp",
+  "upstream_addr": "safety-backend.example:9200",
+  "security_provider": "routing",
+  "traffic_class": "safety",
+  "dscp_tag": 46
+}
+```
+
+Runnable example: [examples/configs/dscp_qos.json](../../examples/configs/dscp_qos.json);
+end-to-end tests: [tests/dscp.rs](../../tests/dscp.rs).
+
 ## Implemented — Local-interface configuration (UDS/SHM + `api`)
 
 Local interfaces are configured through the **same** `GatewayConfig` schema

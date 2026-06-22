@@ -14,6 +14,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -211,6 +212,29 @@ impl Drop for PlainUdpEchoServer {
     }
 }
 
+/// Options for [`dtls_client_round_trip_opts`].
+pub struct DtlsClientOpts<'a> {
+    pub version: &'a str,
+    pub client_identity: Option<(&'a Path, &'a Path)>,
+    /// Address the client socket binds to (selects the IP family); e.g.
+    /// `"127.0.0.1:0"` or `"[::1]:0"`.
+    pub bind_addr: &'a str,
+    /// When `Some`, the client stamps this DSCP (0..=63) on its egress so a
+    /// `preserve_inbound_dscp` rule can sample it and carry it upstream.
+    pub client_dscp: Option<u8>,
+}
+
+impl Default for DtlsClientOpts<'_> {
+    fn default() -> Self {
+        DtlsClientOpts {
+            version: "dtls1.2",
+            client_identity: None,
+            bind_addr: "127.0.0.1:0",
+            client_dscp: None,
+        }
+    }
+}
+
 /// Drive a gateway **decrypt** rule as a raw DTLS client: handshake, send
 /// `payload`, and return the echoed bytes. `client_identity` presents a client
 /// certificate for mutual auth. Returns `Err` when the handshake or I/O fails
@@ -222,11 +246,33 @@ pub fn dtls_client_round_trip(
     client_identity: Option<(&Path, &Path)>,
     payload: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let sock = UdpSocket::bind("127.0.0.1:0")?;
+    dtls_client_round_trip_opts(
+        gateway_addr,
+        DtlsClientOpts {
+            version,
+            client_identity,
+            ..Default::default()
+        },
+        payload,
+    )
+}
+
+/// Like [`dtls_client_round_trip`] but with explicit [`DtlsClientOpts`] so a
+/// test can choose the IP family (`bind_addr`) and stamp a client DSCP.
+pub fn dtls_client_round_trip_opts(
+    gateway_addr: &str,
+    opts: DtlsClientOpts,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let sock = UdpSocket::bind(opts.bind_addr)?;
     sock.connect(gateway_addr)?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    if let Some(d) = opts.client_dscp {
+        let is_v6 = sock.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        gateway::networking::socket_manager::set_dscp(sock.as_raw_fd(), d, is_v6);
+    }
 
-    let (v, ciphers) = version_and_ciphers(version);
+    let (v, ciphers) = version_and_ciphers(opts.version);
     let mut builder = SslConnector::builder(SslMethod::dtls())
         .map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_verify(SslVerifyMode::NONE);
@@ -234,7 +280,7 @@ pub fn dtls_client_round_trip(
     builder
         .set_cipher_list(ciphers)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    if let Some((cert, key)) = client_identity {
+    if let Some((cert, key)) = opts.client_identity {
         let cert = X509::from_pem(&std::fs::read(cert)?).map_err(|e| io::Error::other(e.to_string()))?;
         let key =
             PKey::private_key_from_pem(&std::fs::read(key)?).map_err(|e| io::Error::other(e.to_string()))?;

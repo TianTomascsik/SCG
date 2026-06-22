@@ -6,7 +6,8 @@
 
 use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 use crate::networking::socket_manager::{
-    bind_udp_socket, set_nonblocking_fd, tune_socket_buffers, write_all_nb,
+    apply_safety_priority, bind_udp_socket, peek_from_with_dscp, recvmsg_from_with_dscp,
+    set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::apply_geo_delay;
@@ -336,9 +337,17 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         None => return,
     };
 
+    // Safety traffic always runs at elevated thread priority.
+    apply_safety_priority(ctx.traffic_class);
+
     // Non-blocking for poll()-based bidirectional I/O
     plain_socket.set_nonblocking(true).ok();
     tune_socket_buffers(plain_socket.as_raw_fd(), ctx.sock_buf_size);
+    // Prioritise the client-facing UDP return path; sample inbound DSCP when
+    // the rule preserves it.
+    let plain_is_v6 = plain_socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    ctx.apply_egress_qos(plain_socket.as_raw_fd(), plain_is_v6, None);
+    ctx.enable_inbound_dscp_sampling(plain_socket.as_raw_fd(), plain_is_v6);
 
     // Resolve upstream for DTLS
     let dtls_target = if ctx.upstream_addr == "auto" {
@@ -414,8 +423,8 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         // -- Forward: plain UDP -> DTLS (encrypt and send to upstream) --------
         if pollfds[0].revents & libc::POLLIN != 0 {
             loop {
-                match plain_socket.recv_from(&mut fwd_buf) {
-                    Ok((n, peer_addr)) => {
+                match recvmsg_from_with_dscp(plain_fd, &mut fwd_buf) {
+                    Ok((n, peer_addr, inbound_dscp)) => {
                         // Policy check per datagram
                         let target = match &dtls_target {
                             Some(addr) => addr.clone(),
@@ -432,16 +441,6 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
 
                         // Get or create DTLS session for this peer
                         if !sessions.contains_key(&peer_addr) {
-                            let upstream_sock = match UdpSocket::bind("0.0.0.0:0") {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    error!(
-                                        "[{}] Failed to bind upstream UDP: {}",
-                                        ctx.rule_name, e
-                                    );
-                                    continue;
-                                }
-                            };
                             let target_addr: SocketAddr = match target.parse() {
                                 Ok(a) => a,
                                 Err(e) => {
@@ -452,11 +451,35 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                                     continue;
                                 }
                             };
+                            // Bind the upstream UDP socket in the target's address
+                            // family so IPv6 upstreams are first-class.
+                            let bind_addr = if target_addr.is_ipv6() {
+                                "[::]:0"
+                            } else {
+                                "0.0.0.0:0"
+                            };
+                            let upstream_sock = match UdpSocket::bind(bind_addr) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    error!(
+                                        "[{}] Failed to bind upstream UDP: {}",
+                                        ctx.rule_name, e
+                                    );
+                                    continue;
+                                }
+                            };
                             if let Err(e) = upstream_sock.connect(target_addr) {
                                 error!("[{}] Failed to connect upstream UDP: {}", ctx.rule_name, e);
                                 continue;
                             }
                             tune_socket_buffers(upstream_sock.as_raw_fd(), ctx.sock_buf_size);
+                            // Mark + prioritise the upstream DTLS egress socket,
+                            // preserving the inbound DSCP when configured.
+                            ctx.apply_egress_qos(
+                                upstream_sock.as_raw_fd(),
+                                target_addr.is_ipv6(),
+                                inbound_dscp,
+                            );
                             // Blocking during DTLS handshake
                             upstream_sock
                                 .set_read_timeout(Some(Duration::from_secs(30)))
@@ -654,15 +677,20 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .ok();
         tune_socket_buffers(listen_socket.as_raw_fd(), ctx.sock_buf_size);
+        // Prioritise the client-facing DTLS return path; sample inbound DSCP
+        // when the rule preserves it.
+        let listen_is_v6 = listen_socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        ctx.apply_egress_qos(listen_socket.as_raw_fd(), listen_is_v6, None);
+        ctx.enable_inbound_dscp_sampling(listen_socket.as_raw_fd(), listen_is_v6);
 
         // -- Wait for a DTLS ClientHello using peek_from (MSG_PEEK) -----------
         let mut peek_buf = [0u8; 1500];
-        let peer_addr = loop {
+        let (peer_addr, inbound_dscp) = loop {
             if ctx.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            match listen_socket.peek_from(&mut peek_buf) {
-                Ok((_n, addr)) => break addr,
+            match peek_from_with_dscp(listen_socket.as_raw_fd(), &mut peek_buf) {
+                Ok((_n, addr, dscp)) => break (addr, dscp),
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>
@@ -726,10 +754,15 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
         let log_dir = ctx.log_dir.clone();
         let run_id = ctx.run_id.clone();
         let simulated_delay_ms = ctx.simulated_delay_ms;
+        let qos = ctx.qos;
+        let traffic_class = ctx.traffic_class;
 
         thread::Builder::new()
             .name(format!("{}-dtls-dec-{}", rule_name, peer_addr))
             .spawn(move || {
+                // Safety traffic always runs at elevated thread priority.
+                apply_safety_priority(traffic_class);
+
                 let mut conn =
                     ConnectionMetrics::with_rule_metrics("decrypt-dtls", "dtls", metrics.clone());
                 let mut ssl = ssl_stream;
@@ -747,13 +780,6 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                         return;
                     }
                     Proto::Udp => {
-                        let upstream = match UdpSocket::bind("0.0.0.0:0") {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("[{}] Upstream UDP bind error: {}", rule_name, e);
-                                return;
-                            }
-                        };
                         let target: SocketAddr = match upstream_target.parse() {
                             Ok(a) => a,
                             Err(e) => {
@@ -764,12 +790,26 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                 return;
                             }
                         };
+                        let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                        let upstream = match UdpSocket::bind(bind_addr) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("[{}] Upstream UDP bind error: {}", rule_name, e);
+                                return;
+                            }
+                        };
                         if let Err(e) = upstream.connect(target) {
                             error!("[{}] Upstream UDP connect error: {}", rule_name, e);
                             return;
                         }
                         upstream.set_nonblocking(true).ok();
                         let up_fd = upstream.as_raw_fd();
+                        crate::networking::socket_manager::apply_egress_qos(
+                            up_fd,
+                            qos.egress_dscp(inbound_dscp),
+                            qos.so_priority(),
+                            target.is_ipv6(),
+                        );
 
                         let mut fwd_buf = vec![0u8; UDP_BUF_SIZE];
                         let mut rev_buf = vec![0u8; UDP_BUF_SIZE];
@@ -869,6 +909,13 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                         };
                         upstream.set_nonblocking(true).ok();
                         let up_fd = upstream.as_raw_fd();
+                        let up_is_v6 = upstream.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+                        crate::networking::socket_manager::apply_egress_qos(
+                            up_fd,
+                            qos.egress_dscp(inbound_dscp),
+                            qos.so_priority(),
+                            up_is_v6,
+                        );
 
                         let mut fwd_buf = vec![0u8; RELAY_BUF_SIZE];
                         let mut rev_buf = vec![0u8; RELAY_BUF_SIZE];

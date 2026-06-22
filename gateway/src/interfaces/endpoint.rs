@@ -7,10 +7,11 @@
 //! so a UDS client on one gateway can interoperate with a SHM client on a peer
 //! gateway: both sides see the same length-prefixed frame stream inside TLS.
 
-use crate::management::config::TlsMode;
+use crate::management::config::{QosPolicy, TlsMode};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
-    poll_two_fds, set_nodelay, set_nonblocking_fd, tune_socket_buffers, write_all_nb,
+    apply_egress_qos, poll_two_fds, set_nodelay, set_nonblocking_fd, tune_socket_buffers,
+    write_all_nb,
 };
 use crate::security::tls_engine::params::TlsSecurityParams;
 use crate::security::tls_engine::{build_tls_connector, write_all_nb_proxy, ProxyStream};
@@ -121,6 +122,7 @@ pub fn connect_tls_upstream(
     tls_mode: TlsMode,
     protocol_version: Option<&str>,
     sock_buf_size: usize,
+    qos: QosPolicy,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
     let upstream_tcp = connect_with_retry(
@@ -133,6 +135,9 @@ pub fn connect_tls_upstream(
     let up_fd = upstream_tcp.as_raw_fd();
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
+    // Mark + prioritise the upstream (SCG → upstream) egress socket.
+    let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
 
     // Local interfaces use the default (verify-none) TLS profile; only the
     // protocol version is configurable here.

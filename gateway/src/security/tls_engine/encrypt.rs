@@ -8,8 +8,8 @@ use super::{build_tls_connector, write_all_nb_proxy, ProxyStream};
 use super::params::TlsSecurityParams;
 use crate::networking::connector::{connect_with_retry, sleep_with_shutdown_check};
 use crate::networking::socket_manager::{
-    accept_with_timeout, bind_tcp_listener, bind_udp_socket, poll_two_fds, set_nodelay,
-    set_nonblocking_fd, tune_socket_buffers,
+    accept_with_timeout, apply_egress_qos, apply_safety_priority, bind_tcp_listener,
+    bind_udp_socket, poll_two_fds, set_nodelay, set_nonblocking_fd, tune_socket_buffers,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::{
@@ -22,7 +22,7 @@ use ale_pipe::{
 };
 
 use crate::interfaces::tproxy;
-use crate::management::config::TlsMode;
+use crate::management::config::{QosPolicy, TlsMode};
 use crate::management::telemetry::{format_rate, log_connection_csv, now_ns, ConnectionMetrics};
 
 use bench_log::{compute_latency_stats, print_latency_stats, CsvLogger};
@@ -116,6 +116,8 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let fd = client_stream.as_raw_fd();
         tune_socket_buffers(fd, ctx.sock_buf_size);
         set_nodelay(fd, true);
+        // Prioritise the client-facing (SCG → client) return path.
+        ctx.apply_egress_qos(fd, peer_addr.is_ipv6(), None);
 
         ctx.metrics.connection_opened();
 
@@ -131,15 +133,12 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let tls_params = tls_params.clone();
+        let qos = ctx.qos;
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
-            // Set higher OS thread priority for safety traffic
-            if traffic_class == crate::management::config::TrafficClass::Safety {
-                unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, -5);
-                }
-            }
+            // Safety traffic always runs at elevated thread priority.
+            apply_safety_priority(traffic_class);
 
             let mut conn_metrics = ConnectionMetrics::with_rule_metrics(
                 "encrypt",
@@ -158,6 +157,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 &shutdown,
                 simulated_delay_ms,
                 &tls_params,
+                qos,
             );
 
             if let Err(e) = result {
@@ -212,6 +212,7 @@ pub(crate) fn handle_tcp_encrypt(
     shutdown: &AtomicBool,
     delay_ms: u64,
     params: &TlsSecurityParams,
+    qos: QosPolicy,
 ) -> io::Result<()> {
     // Connect to upstream with exponential backoff retry
     let upstream_tcp = connect_with_retry(
@@ -224,6 +225,12 @@ pub(crate) fn handle_tcp_encrypt(
     let up_fd = upstream_tcp.as_raw_fd();
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
+    // Mark + prioritise the upstream (SCG → upstream) egress socket.
+    let up_is_v6 = upstream_tcp
+        .peer_addr()
+        .map(|a| a.is_ipv6())
+        .unwrap_or(false);
+    apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
 
     // SNI / verification hostname for the upstream connection.
     let sni = params.sni_name(upstream_addr);
@@ -340,11 +347,17 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
         None => return,
     };
 
+    // Safety traffic always runs at elevated thread priority.
+    apply_safety_priority(ctx.traffic_class);
+
     // Set timeout for shutdown checks
     socket.set_read_timeout(Some(Duration::from_secs(2))).ok();
     tune_socket_buffers(socket.as_raw_fd(), ctx.sock_buf_size);
-
-    // Resolve typed security parameters + SNI for the upstream tunnel.
+    // Prioritise the client-facing UDP return path; sample inbound DSCP when
+    // the rule preserves it.
+    let udp_is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    ctx.apply_egress_qos(socket.as_raw_fd(), udp_is_v6, None);
+    ctx.enable_inbound_dscp_sampling(socket.as_raw_fd(), udp_is_v6);
     let tls_params = match TlsSecurityParams::from_params(
         &ctx.provider_params,
         ctx.protocol_version.as_deref(),
@@ -435,6 +448,9 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                     };
                 tune_socket_buffers(upstream_tcp.as_raw_fd(), ctx.sock_buf_size);
                 set_nodelay(upstream_tcp.as_raw_fd(), true);
+                // Mark + prioritise the upstream TLS-tunnel egress socket.
+                let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+                ctx.apply_egress_qos(upstream_tcp.as_raw_fd(), up_is_v6, None);
 
                 let hs_start = Instant::now();
                 let stream = match ctx.tls_mode {

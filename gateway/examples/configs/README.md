@@ -21,6 +21,7 @@ newly-rejected combination fails the build.
 | [dtls.json](dtls.json) | DTLS 1.2 with server + mutual verification (UDP-native). |
 | [udp_ale.json](udp_ale.json) | UDP-over-TLS with ETCS **ALE** framing (`app_protocol = ale`). |
 | [udp_raw.json](udp_raw.json) | UDP-over-TLS with **raw** length-prefix framing (`app_protocol = raw`). |
+| [dscp_qos.json](dscp_qos.json) | **DSCP egress marking + preservation**: safety EF tag, DTLS inbound-DSCP preserve, normal AF11 — mixed safety/normal. |
 
 ## Capability matrix
 
@@ -42,7 +43,45 @@ mapped to its example and its automated test.
 | UDP-over-TLS, raw | `tls` | tls1.2/1.3 | server | raw | udp_raw | [ale_raw.rs](../../tests/ale_raw.rs) |
 | kTLS PSK → userspace fallback | `ktls`→`tls` | tls1.2 | — | subset146-psk | — | [subset146_psk.rs](../../tests/subset146_psk.rs) |
 | kTLS + integrity-only rejected | `ktls` | — | — | integrity-only | — | (config-load reject) |
+| DSCP tag (safety = EF/46, explicit override) | `routing` / `tls` / `dtls` | — | — | `dscp_tag` | dscp_qos | [dscp.rs](../../tests/dscp.rs) |
+| DSCP preserve (inbound DS field → egress) | `dtls` | dtls1.2 | — | `preserve_inbound_dscp` | dscp_qos | [dscp.rs](../../tests/dscp.rs) |
+| Safety prioritization (nice + `SO_PRIORITY` + reserved pool) | — | — | — | `traffic_class = safety` | dscp_qos | [dscp.rs](../../tests/dscp.rs) |
 | All examples load | — | — | — | — | * | [examples_load.rs](../../tests/examples_load.rs) |
+
+## DSCP marking & safety prioritization
+
+Every rule carries a `traffic_class` (`safety` | `normal`, default `normal`) plus
+two optional per-rule QoS fields. Safety traffic is **always** prioritized
+internally and marked for priority on the wire.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `traffic_class` | `"safety"` \| `"normal"` | Selects the class default DSCP/priority. Safety defaults to **EF (46)**; normal is left unmarked. |
+| `dscp_tag` | `0`–`63` | Explicit egress DSCP. Overrides the class default and any inbound marking. Values `> 63` are rejected at config load. |
+| `preserve_inbound_dscp` | `bool` | When `true` (and no `dscp_tag`), the gateway samples the inbound DS field and re-applies it on egress. |
+
+**Egress DSCP precedence** (see [`RuleConfig::egress_dscp`](../../src/management/config.rs)):
+
+1. explicit `dscp_tag` → that value;
+2. else `preserve_inbound_dscp` + a sampled inbound DSCP → the sampled value;
+3. else the class default: **safety → EF (46)**, normal → unmarked.
+
+**Internal prioritization (always on for safety).** Independent of DSCP, safety
+rules raise their workers' scheduling priority
+([`apply_safety_priority`](../../src/networking/socket_manager.rs), `nice -5`
+when the process holds `CAP_SYS_NICE`), set `SO_PRIORITY = 6` on their sockets,
+and run on a class-aware connection pool with a reserved minimum worker count so
+a flood of normal traffic cannot starve safety capacity. Without `CAP_SYS_NICE`
+the gateway logs a one-time preflight warning and degrades to DSCP + `SO_PRIORITY`
+only.
+
+**Preservation scope.** Per-datagram inbound-DSCP preservation works where the
+gateway owns the receive (UDP / DTLS). On TLS-terminated and `splice` TCP paths
+the gateway cannot sample per-segment marks, so preservation falls back to the
+class default (safety still gets EF). On the Linux **loopback** interface the
+received DS field is only observable for UDP, so the end-to-end DSCP assertions
+in [dscp.rs](../../tests/dscp.rs) verify the DTLS/UDP paths; the TCP egress mark
+is verified at the syscall layer by the `socket_manager` unit tests.
 
 ## Running
 
@@ -53,6 +92,7 @@ cargo test -p gateway --test examples_load
 # the capability tests (UDP/DTLS tests are timing-sensitive — pin one thread)
 cargo test -p gateway --test ale_raw      -- --test-threads=1
 cargo test -p gateway --test dtls         -- --test-threads=1
+cargo test -p gateway --test dscp         -- --test-threads=1
 cargo test -p gateway --test tls_verify
 cargo test -p gateway --test subset146_pki
 cargo test -p gateway --test subset146_psk

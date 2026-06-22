@@ -224,6 +224,19 @@ pub struct RuleConfig {
     #[serde(default)]
     pub traffic_class: TrafficClass,
 
+    /// Egress DSCP tag (0..=63) to stamp on packets the gateway sends for this
+    /// rule. When set it overwrites any inbound marking. When unset the value is
+    /// derived from `preserve_inbound_dscp` and then the traffic class (safety
+    /// defaults to EF/46). See [`RuleConfig::egress_dscp`].
+    #[serde(default)]
+    pub dscp_tag: Option<u8>,
+
+    /// When true (and `dscp_tag` is unset), the gateway samples the inbound DS
+    /// field and re-applies it to the egress packets, preserving an upstream
+    /// marking end-to-end. For TCP this is sampled once per connection.
+    #[serde(default)]
+    pub preserve_inbound_dscp: bool,
+
     /// Application identifier for buffer/queue management (optional).
     #[serde(default)]
     pub app_id: Option<String>,
@@ -285,6 +298,37 @@ impl RuleConfig {
         match &self.app_protocol {
             Some(p) => p.as_str(),
             None => "ale",
+        }
+    }
+
+    /// Resolve the DSCP value (0..=63) to stamp on this rule's egress packets,
+    /// or `None` to leave the kernel default. Precedence:
+    ///
+    /// 1. explicit `dscp_tag` (overwrite / tagging),
+    /// 2. else `preserve_inbound_dscp` with a `sampled_inbound` value,
+    /// 3. else the traffic-class default: Safety = EF (46), Normal = none.
+    pub fn egress_dscp(&self, sampled_inbound: Option<u8>) -> Option<u8> {
+        self.qos().egress_dscp(sampled_inbound)
+    }
+
+    /// Whether this rule must sample the inbound DSCP (via RECVTOS) at runtime —
+    /// i.e. preservation is requested and no explicit tag overrides it.
+    pub fn needs_inbound_dscp(&self) -> bool {
+        self.qos().needs_inbound_dscp()
+    }
+
+    /// The `SO_PRIORITY` value for this rule's sockets, derived from its class.
+    pub fn so_priority(&self) -> i32 {
+        self.qos().so_priority()
+    }
+
+    /// The resolved, `Copy`-able QoS policy for this rule, suitable for handing
+    /// to the data path inside a `RuleContext`.
+    pub fn qos(&self) -> QosPolicy {
+        QosPolicy {
+            dscp_tag: self.dscp_tag,
+            preserve_inbound_dscp: self.preserve_inbound_dscp,
+            traffic_class: self.traffic_class,
         }
     }
 }
@@ -403,6 +447,67 @@ impl fmt::Display for TrafficClass {
             TrafficClass::Normal => write!(f, "normal"),
             TrafficClass::Safety => write!(f, "safety"),
         }
+    }
+}
+
+/// Expedited Forwarding DSCP (RFC 3246) — the default egress mark for safety
+/// traffic so downstream routers give it priority queuing.
+pub const DSCP_EF: u8 = 46;
+
+/// `SO_PRIORITY` for safety traffic — the highest value settable without
+/// `CAP_NET_ADMIN`, selecting the top band of the default `pfifo_fast` qdisc.
+pub const SAFETY_SO_PRIORITY: i32 = 6;
+
+/// Thread nice value applied to Safety-class data-path threads (lower = higher
+/// priority) so safety relays preempt normal traffic. Negative values require
+/// `CAP_SYS_NICE`; applied best-effort.
+pub const SAFETY_THREAD_NICE: i32 = -5;
+
+/// Map a traffic class to its `SO_PRIORITY` value (Safety = 6, Normal = 0).
+pub fn so_priority_for(class: TrafficClass) -> i32 {
+    match class {
+        TrafficClass::Safety => SAFETY_SO_PRIORITY,
+        TrafficClass::Normal => 0,
+    }
+}
+
+/// Resolved QoS (DiffServ + scheduling) policy for a rule. `Copy` so it can be
+/// embedded in the per-connection data path without allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct QosPolicy {
+    /// Explicit egress DSCP tag (0..=63), overriding preservation and defaults.
+    pub dscp_tag: Option<u8>,
+    /// Carry the inbound DS field to egress when no explicit tag is set.
+    pub preserve_inbound_dscp: bool,
+    /// Traffic class driving SO_PRIORITY and the default DSCP.
+    pub traffic_class: TrafficClass,
+}
+
+impl QosPolicy {
+    /// See [`RuleConfig::egress_dscp`].
+    pub fn egress_dscp(&self, sampled_inbound: Option<u8>) -> Option<u8> {
+        if let Some(tag) = self.dscp_tag {
+            return Some(tag & 0x3f);
+        }
+        if self.preserve_inbound_dscp {
+            if let Some(v) = sampled_inbound {
+                return Some(v & 0x3f);
+            }
+        }
+        match self.traffic_class {
+            TrafficClass::Safety => Some(DSCP_EF),
+            TrafficClass::Normal => None,
+        }
+    }
+
+    /// Whether the inbound DSCP must be sampled (RECVTOS) for preservation.
+    pub fn needs_inbound_dscp(&self) -> bool {
+        self.preserve_inbound_dscp && self.dscp_tag.is_none()
+    }
+
+    /// The `SO_PRIORITY` for this policy's sockets.
+    pub fn so_priority(&self) -> i32 {
+        so_priority_for(self.traffic_class)
     }
 }
 
@@ -699,6 +804,16 @@ impl GatewayConfig {
                     "Rule '{}' (index {}): buffer_slot_size must be > 0",
                     rule.name, i
                 ));
+            }
+
+            // DSCP tag must be a valid 6-bit DiffServ code point (0..=63).
+            if let Some(dscp) = rule.dscp_tag {
+                if dscp > 63 {
+                    return Err(format!(
+                        "Rule '{}' (index {}): dscp_tag {} is out of range (valid DSCP is 0..=63)",
+                        rule.name, i, dscp
+                    ));
+                }
             }
 
             // TLS/kTLS run over TCP, so a UDP upstream is invalid for them.
@@ -1062,4 +1177,98 @@ pub fn decode_hex(hex: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect()
+}
+
+#[cfg(test)]
+mod dscp_tests {
+    use super::*;
+
+    fn rule_from_json(extra: serde_json::Value) -> RuleConfig {
+        let mut base = serde_json::json!({
+            "name": "r",
+            "direction": "encrypt",
+            "listen_addr": "127.0.0.1:8080"
+        });
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(base).expect("deserialize rule")
+    }
+
+    #[test]
+    fn explicit_tag_overrides_preserve_and_class() {
+        let rule = rule_from_json(serde_json::json!({
+            "traffic_class": "normal",
+            "dscp_tag": 26,
+            "preserve_inbound_dscp": true
+        }));
+        // Explicit tag wins over both preservation and the class default.
+        assert_eq!(rule.egress_dscp(Some(10)), Some(26));
+        assert!(!rule.needs_inbound_dscp());
+    }
+
+    #[test]
+    fn safety_defaults_to_ef_and_priority() {
+        let rule = rule_from_json(serde_json::json!({ "traffic_class": "safety" }));
+        assert_eq!(rule.egress_dscp(None), Some(DSCP_EF));
+        assert_eq!(rule.so_priority(), SAFETY_SO_PRIORITY);
+    }
+
+    #[test]
+    fn normal_defaults_to_none_and_zero_priority() {
+        let rule = rule_from_json(serde_json::json!({ "traffic_class": "normal" }));
+        assert_eq!(rule.egress_dscp(None), None);
+        assert_eq!(rule.so_priority(), 0);
+    }
+
+    #[test]
+    fn preserve_uses_sampled_then_falls_back() {
+        let normal = rule_from_json(serde_json::json!({
+            "traffic_class": "normal",
+            "preserve_inbound_dscp": true
+        }));
+        assert!(normal.needs_inbound_dscp());
+        assert_eq!(normal.egress_dscp(Some(18)), Some(18));
+        assert_eq!(normal.egress_dscp(None), None); // no sample → class default
+
+        let safety = rule_from_json(serde_json::json!({
+            "traffic_class": "safety",
+            "preserve_inbound_dscp": true
+        }));
+        assert_eq!(safety.egress_dscp(Some(18)), Some(18)); // preserve sampled
+        assert_eq!(safety.egress_dscp(None), Some(DSCP_EF)); // fallback EF
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_dscp() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "bad",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8081",
+                "upstream_addr": "127.0.0.1:9000",
+                "dscp_tag": 64
+            }]
+        }))
+        .expect("deserialize config");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("dscp_tag"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_valid_dscp() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "ok",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8082",
+                "upstream_addr": "127.0.0.1:9000",
+                "dscp_tag": 46
+            }]
+        }))
+        .expect("deserialize config");
+        assert!(cfg.validate().is_ok());
+    }
 }

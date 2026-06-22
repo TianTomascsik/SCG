@@ -25,7 +25,7 @@
 //! peer gateway.
 
 use crate::interfaces::endpoint::{authenticate_peer, connect_tls_upstream};
-use crate::management::config::TlsMode;
+use crate::management::config::{QosPolicy, TlsMode};
 use crate::networking::socket_manager::{set_nodelay, set_nonblocking_fd};
 use crate::security::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::security::RELAY_BUF_SIZE;
@@ -64,6 +64,8 @@ pub struct ShmEndpointTask {
     pub protocol_version: Option<String>,
     /// Socket buffer tuning size for the upstream socket.
     pub sock_buf_size: usize,
+    /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
+    pub qos: QosPolicy,
     /// Capacity in bytes of the client→gateway ring (rounded up to a page).
     pub cap_c2g: usize,
     /// Capacity in bytes of the gateway→client ring (rounded up to a page).
@@ -230,6 +232,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
         task.tls_mode,
         task.protocol_version.as_deref(),
         task.sock_buf_size,
+        task.qos,
         &task.shutdown,
     ) {
         Ok(t) => t,
