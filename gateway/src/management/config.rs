@@ -685,6 +685,19 @@ impl GatewayConfig {
         Ok(config)
     }
 
+    /// Build and validate a `GatewayConfig` from an already-rendered classic
+    /// configuration `Value`.
+    ///
+    /// Used by the lite-config loader after it has merged the layered model and
+    /// mapped connections into the flat `rules` array. Runs the same structural
+    /// and semantic validation as [`GatewayConfig::load`].
+    pub fn from_value(value: serde_json::Value) -> Result<Self, String> {
+        let config: GatewayConfig = serde_json::from_value(value)
+            .map_err(|e| format!("Failed to build gateway config from lite mapping: {}", e))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Validate the configuration.
     fn validate(&self) -> Result<(), String> {
         if self.rules.is_empty() {

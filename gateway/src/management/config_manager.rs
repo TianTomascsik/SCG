@@ -4,6 +4,7 @@
 //! for background file-watching and SIGHUP-based reload.
 
 use crate::management::config::{ConfigDiff, GatewayConfig};
+use crate::management::lite_config::{self, LiteSource};
 use log::{debug, error, info, warn};
 
 use std::fs;
@@ -21,6 +22,10 @@ use std::time::SystemTime;
 pub struct SharedConfig {
     inner: Arc<RwLock<GatewayConfig>>,
     pub config_path: PathBuf,
+    /// When set, reloads go through the layered lite-config pipeline (re-running
+    /// signature + schema-hash verification) instead of reading a single JSON
+    /// file. `config_path` then points at the watched user file.
+    lite: Option<LiteSource>,
     last_modified: Arc<RwLock<SystemTime>>,
 }
 
@@ -33,6 +38,23 @@ impl SharedConfig {
         Self {
             inner: Arc::new(RwLock::new(config)),
             config_path: PathBuf::from(path),
+            lite: None,
+            last_modified: Arc::new(RwLock::new(mtime)),
+        }
+    }
+
+    /// Create a SharedConfig backed by a layered lite-config directory. The
+    /// watcher polls `source.watch_path()` (the user file) for changes, and
+    /// each reload re-runs the full verify → merge → map pipeline.
+    pub fn new_lite(config: GatewayConfig, source: LiteSource) -> Self {
+        let watch = source.watch_path();
+        let mtime = fs::metadata(&watch)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+            config_path: watch,
+            lite: Some(source),
             last_modified: Arc::new(RwLock::new(mtime)),
         }
     }
@@ -54,8 +76,18 @@ impl SharedConfig {
 
     /// Reload config from disk. Returns the diff, or an error string.
     pub fn reload(&self) -> Result<ConfigDiff, String> {
-        let path_str = self.config_path.to_string_lossy().to_string();
-        let new_config = GatewayConfig::load(&path_str)?;
+        let new_config = match &self.lite {
+            Some(source) => {
+                // Re-run the full layered pipeline (signatures + schema hash are
+                // re-verified; a tampered or unsigned edit is rejected and the
+                // current config is kept).
+                lite_config::load(&source.dir, source.pubkey.as_deref())?
+            }
+            None => {
+                let path_str = self.config_path.to_string_lossy().to_string();
+                GatewayConfig::load(&path_str)?
+            }
+        };
         let old_config = self.read();
         let diff = old_config.diff(&new_config);
 

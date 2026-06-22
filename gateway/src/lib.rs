@@ -31,6 +31,7 @@ use app_protocols::raw_provider::RawProtocolProvider;
 use log::{error, info, warn};
 use management::config::GatewayConfig;
 use management::config_manager::{spawn_config_watcher, SharedConfig};
+use management::lite_config::{self, LiteSource};
 use processing::cache::TrafficCache;
 use processing::lifecycle::{LifecycleEvent, LifecycleOrchestrator};
 use processing::policy::PolicyManager;
@@ -43,6 +44,7 @@ use security::providers::routing_provider::RoutingProvider;
 use security::providers::tls_provider::TlsProvider;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
 
 /// Run the gateway runtime.
 ///
@@ -82,26 +84,62 @@ pub fn run(
     }
 
     // Parse --config flag
-    let config_path = args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!("Error: --config PATH is required");
-            print_usage(&args[0], &registry);
-            std::process::exit(1);
-        });
-
     let validate_only = args.contains(&"--validate".to_string());
     let log_stdout = args.contains(&"--log-stdout".to_string());
 
-    // Load config
-    let mut config = match GatewayConfig::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Configuration error: {}", e);
-            std::process::exit(1);
+    // ── Resolve the configuration source ─────────────────────────────────────
+    // Two mutually-exclusive modes:
+    //   --config PATH     ... classic single-file gateway config
+    //   --config-dir DIR  ... layered "lite" config (signed defaults + user)
+    //
+    // In lite mode the directory is loaded through the layered pipeline, which
+    // verifies the detached Ed25519 signatures and the pinned schema hash
+    // (fail-closed) before mapping connections to data-plane rules. The trust
+    // anchor is `--config-pubkey PATH` or `<dir>/trust/config-signing.pub.pem`.
+    let config_dir = args
+        .iter()
+        .position(|a| a == "--config-dir")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let config_pubkey = args
+        .iter()
+        .position(|a| a == "--config-pubkey")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    let (mut config, lite_warnings, config_watch_path, lite_source) = if let Some(dir) = config_dir {
+        let pubkey = config_pubkey.clone().map(PathBuf::from);
+        match lite_config::load_with_warnings(Path::new(&dir), pubkey.as_deref()) {
+            Ok((c, w)) => {
+                let source = LiteSource {
+                    dir: PathBuf::from(&dir),
+                    pubkey,
+                };
+                let watch = source.watch_path().to_string_lossy().into_owned();
+                (c, w, watch, Some(source))
+            }
+            Err(e) => {
+                eprintln!("Configuration error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let config_path = args
+            .iter()
+            .position(|a| a == "--config")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| {
+                eprintln!("Error: --config PATH or --config-dir DIR is required");
+                print_usage(&args[0], &registry);
+                std::process::exit(1);
+            });
+        match GatewayConfig::load(&config_path) {
+            Ok(c) => (c, Vec::new(), config_path, None),
+            Err(e) => {
+                eprintln!("Configuration error: {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -152,6 +190,12 @@ pub fn run(
         .filter_level(log_level)
         .format_timestamp_millis()
         .init();
+
+    // Surface any warnings collected while loading a lite config (deferred or
+    // downgraded features) now that the logger is up.
+    for w in &lite_warnings {
+        warn!("[lite-config] {}", w);
+    }
 
     let enable_watch = args.contains(&"--watch".to_string());
 
@@ -308,7 +352,10 @@ pub fn run(
     };
 
     // Start config watcher for hot-reload (if --watch or always via SIGHUP)
-    let shared_config = SharedConfig::new(config.clone(), &config_path);
+    let shared_config = match &lite_source {
+        Some(source) => SharedConfig::new_lite(config.clone(), source.clone()),
+        None => SharedConfig::new(config.clone(), &config_watch_path),
+    };
     let watcher_shutdown = shutdown.clone();
     let watcher_rule_shutdowns = rule_shutdowns.clone();
     let watcher_config = shared_config.clone();
@@ -429,20 +476,24 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
 }
 
 fn print_usage(prog: &str, registry: &ProviderRegistry) {
-    eprintln!("Usage: {} --config PATH [OPTIONS]", prog);
+    eprintln!("Usage: {} (--config PATH | --config-dir DIR) [OPTIONS]", prog);
     eprintln!();
     eprintln!("  Transparent encryption proxy gateway with extensible provider architecture");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --config PATH    Path to JSON configuration file (required)");
-    eprintln!("  --validate       Validate config and environment, then exit");
-    eprintln!("  --log-dir DIR    Override log directory from config");
-    eprintln!("  --run-id ID      Override run ID from config");
-    eprintln!("  --latency        Enable latency measurement");
-    eprintln!("  --log-level LVL  Set log level: error, warn, info, debug, trace (default: info)");
-    eprintln!("  --watch          Enable config hot-reload via file watching");
-    eprintln!("  --log-stdout     Copy log output to stdout (for journald/containers)");
-    eprintln!("  --help           Show this help");
+    eprintln!("  --config PATH        Path to a classic single-file JSON config");
+    eprintln!("  --config-dir DIR     Path to a layered 'lite' config dir (signed");
+    eprintln!("                       scg.defaults.json + scg.user.json + schema)");
+    eprintln!("  --config-pubkey PATH Ed25519 signing public key (trust anchor) for");
+    eprintln!("                       --config-dir; defaults to DIR/trust/config-signing.pub.pem");
+    eprintln!("  --validate           Validate config and environment, then exit");
+    eprintln!("  --log-dir DIR        Override log directory from config");
+    eprintln!("  --run-id ID          Override run ID from config");
+    eprintln!("  --latency            Enable latency measurement");
+    eprintln!("  --log-level LVL      Set log level: error, warn, info, debug, trace (default: info)");
+    eprintln!("  --watch              Enable config hot-reload via file watching");
+    eprintln!("  --log-stdout         Copy log output to stdout (for journald/containers)");
+    eprintln!("  --help               Show this help");
     eprintln!();
     eprintln!("Validation (--validate):");
     eprintln!("  Checks: JSON syntax, rule consistency, port conflicts, CAP_NET_ADMIN,");
