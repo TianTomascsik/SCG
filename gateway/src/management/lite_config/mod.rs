@@ -96,6 +96,12 @@ pub fn load_with_warnings(
     // existing GatewayConfig path.
     let mut root = Map::new();
     root.insert("rules".to_string(), Value::Array(rules));
+
+    // Pass through the policy section so the PolicyManager sees it.
+    if let Some(policy) = merged.get("policy") {
+        root.insert("policy".to_string(), policy.clone());
+    }
+
     let config = GatewayConfig::from_value(Value::Object(root))?;
 
     Ok((config, warnings))

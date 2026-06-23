@@ -132,6 +132,64 @@ fn default_sock_buf_size() -> usize {
     16 * 1024 * 1024 // 16 MiB
 }
 
+// ─── Intercept (firewall self-configuration) ────────────────────────────────
+
+/// Firewall interception mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptMode {
+    /// nat/PREROUTING REDIRECT (inbound traffic on an interface/port → gateway listen port).
+    IngressRedirect,
+    /// nat/OUTPUT REDIRECT (outbound traffic to specific destinations → gateway listen port).
+    EgressRedirect,
+    /// mangle/PREROUTING TPROXY (inbound traffic → gateway transparent listener).
+    Tproxy,
+}
+
+impl fmt::Display for InterceptMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InterceptMode::IngressRedirect => write!(f, "ingress_redirect"),
+            InterceptMode::EgressRedirect => write!(f, "egress_redirect"),
+            InterceptMode::Tproxy => write!(f, "tproxy"),
+        }
+    }
+}
+
+/// Per-rule firewall interception configuration.
+///
+/// When present, the gateway will install iptables rules at startup to redirect
+/// matching traffic to this rule's listen port, and tear them down on shutdown.
+/// Requires `CAP_NET_ADMIN`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InterceptConfig {
+    /// Interception mode (determines which iptables table/chain/target is used).
+    pub mode: InterceptMode,
+
+    /// Network interface for ingress matching (e.g. "eth0"). Only used with
+    /// `ingress_redirect` mode. When omitted, matches on all interfaces.
+    #[serde(default)]
+    pub in_interface: Option<String>,
+
+    /// Destination ports to intercept (e.g. "8080", "4465:4467", "80,443").
+    /// Comma-separated port numbers or ranges. Required for all modes.
+    pub match_dports: String,
+
+    /// Destination IP addresses/CIDRs for egress redirect (e.g. ["192.168.1.2", "10.0.0.0/24"]).
+    /// Required for `egress_redirect` mode.
+    #[serde(default)]
+    pub match_dst: Vec<String>,
+
+    /// Source IP addresses/CIDRs for TPROXY (e.g. ["192.168.1.0/24"]).
+    /// Required for `tproxy` mode.
+    #[serde(default)]
+    pub match_src: Vec<String>,
+
+    /// IP protocol to match. Defaults to the rule's `listen_proto` (tcp or udp).
+    #[serde(default)]
+    pub protocol: Option<String>,
+}
+
 // ─── Rule config ─────────────────────────────────────────────────────────────
 
 /// A single proxy rule defining one forwarding path.
@@ -247,6 +305,25 @@ pub struct RuleConfig {
     /// check (the uid check still applies).
     #[serde(default)]
     pub allowed_pids: Vec<i32>,
+
+    /// Enable zero-copy relay path (splice for routing, sendfile for kTLS).
+    /// Only valid when `security_provider` is `"routing"` or `"ktls"`;
+    /// userspace TLS cannot be zero-copy. Default: false.
+    #[serde(default)]
+    pub zero_copy: bool,
+
+    /// Busy-poll microseconds before blocking on the SHM ring eventfd/futex.
+    /// Only meaningful for `listen_proto: "shm"` rules. A value of 0 (default)
+    /// means block immediately; higher values trade CPU for lower wakeup latency.
+    #[serde(default)]
+    pub spin_wait_us: u64,
+
+    /// Firewall interception configuration. When present, the gateway will
+    /// install iptables rules at startup to redirect matching traffic to this
+    /// rule's listen port and tear them down on graceful shutdown.
+    /// Requires `CAP_NET_ADMIN`. Mutually exclusive with UDS/SHM listen_proto.
+    #[serde(default)]
+    pub intercept: Option<InterceptConfig>,
 }
 
 impl RuleConfig {
@@ -803,6 +880,28 @@ impl GatewayConfig {
                 }
             }
 
+            // zero_copy is only meaningful for routing (splice) and ktls (sendfile).
+            // Userspace TLS must decrypt into a buffer — zero-copy is impossible.
+            if rule.zero_copy {
+                let provider = rule.effective_security_provider();
+                if provider != "routing" && provider != "ktls" {
+                    return Err(format!(
+                        "Rule '{}' (index {}): zero_copy requires security_provider \
+                         \"routing\" or \"ktls\" (userspace TLS cannot be zero-copy)",
+                        rule.name, i
+                    ));
+                }
+            }
+
+            // spin_wait_us is only meaningful for SHM rules.
+            if rule.spin_wait_us > 0 && rule.listen_proto != Proto::Shm {
+                return Err(format!(
+                    "Rule '{}' (index {}): spin_wait_us > 0 is only valid for \
+                     listen_proto = \"shm\" rules",
+                    rule.name, i
+                ));
+            }
+
             // TLS/kTLS run over TCP, so a UDP upstream is invalid for them.
             // DTLS and custom datagram providers (UDP-native) are exempt.
             let provider = rule.effective_security_provider();
@@ -814,6 +913,89 @@ impl GatewayConfig {
                     "Rule '{}' (index {}): encrypt with TLS/kTLS requires a TCP upstream (use DTLS or a UDP datagram provider for UDP-to-UDP)",
                     rule.name, i
                 ));
+            }
+
+            // ── Intercept configuration validation ──────────────────────────
+            if let Some(ref intercept) = rule.intercept {
+                // Intercept is not valid for UDS/SHM local-only rules.
+                if matches!(rule.listen_proto, Proto::Uds | Proto::Shm) {
+                    return Err(format!(
+                        "Rule '{}' (index {}): intercept cannot be used with {} listen_proto",
+                        rule.name, i, rule.listen_proto
+                    ));
+                }
+
+                // TPROXY intercept requires transparent = true on the rule.
+                if intercept.mode == InterceptMode::Tproxy && !rule.transparent {
+                    return Err(format!(
+                        "Rule '{}' (index {}): intercept mode 'tproxy' requires transparent = true",
+                        rule.name, i
+                    ));
+                }
+
+                // match_dports is required for all modes.
+                if intercept.match_dports.trim().is_empty() {
+                    return Err(format!(
+                        "Rule '{}' (index {}): intercept.match_dports must not be empty",
+                        rule.name, i
+                    ));
+                }
+
+                // Validate port spec syntax (comma-separated port numbers or ranges).
+                Self::validate_port_spec(&intercept.match_dports).map_err(|e| {
+                    format!(
+                        "Rule '{}' (index {}): intercept.match_dports: {}",
+                        rule.name, i, e
+                    )
+                })?;
+
+                // egress_redirect requires at least one match_dst.
+                if intercept.mode == InterceptMode::EgressRedirect
+                    && intercept.match_dst.is_empty()
+                {
+                    return Err(format!(
+                        "Rule '{}' (index {}): intercept mode 'egress_redirect' requires at least one match_dst",
+                        rule.name, i
+                    ));
+                }
+
+                // tproxy requires at least one match_src OR match_dports.
+                if intercept.mode == InterceptMode::Tproxy && intercept.match_src.is_empty() {
+                    return Err(format!(
+                        "Rule '{}' (index {}): intercept mode 'tproxy' requires at least one match_src",
+                        rule.name, i
+                    ));
+                }
+
+                // Validate match_dst entries as IP/CIDR.
+                for (j, dst) in intercept.match_dst.iter().enumerate() {
+                    Self::validate_ip_or_cidr(dst).map_err(|e| {
+                        format!(
+                            "Rule '{}' (index {}): intercept.match_dst[{}] '{}': {}",
+                            rule.name, i, j, dst, e
+                        )
+                    })?;
+                }
+
+                // Validate match_src entries as IP/CIDR.
+                for (j, src) in intercept.match_src.iter().enumerate() {
+                    Self::validate_ip_or_cidr(src).map_err(|e| {
+                        format!(
+                            "Rule '{}' (index {}): intercept.match_src[{}] '{}': {}",
+                            rule.name, i, j, src, e
+                        )
+                    })?;
+                }
+
+                // Validate protocol if specified.
+                if let Some(ref proto) = intercept.protocol {
+                    if proto != "tcp" && proto != "udp" {
+                        return Err(format!(
+                            "Rule '{}' (index {}): intercept.protocol must be \"tcp\" or \"udp\" (got \"{}\")",
+                            rule.name, i, proto
+                        ));
+                    }
+                }
             }
         }
 
@@ -931,6 +1113,77 @@ impl GatewayConfig {
             }
         }
 
+        // ── Intercept self-configuration preflight ──────────────────────────
+        let has_intercept = self.rules.iter().any(|r| r.intercept.is_some());
+        if has_intercept {
+            // CAP_NET_ADMIN is mandatory when intercept is configured.
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd >= 0 {
+                let one: libc::c_int = 1;
+                let ret = unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_IP,
+                        19, // IP_TRANSPARENT
+                        &one as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+                unsafe {
+                    libc::close(fd);
+                }
+                if ret != 0 {
+                    errors.push(
+                        "Intercept rules configured but CAP_NET_ADMIN is missing. \
+                         The gateway cannot install iptables rules without it. \
+                         Run as root or use: setcap cap_net_admin,cap_net_raw+ep <binary>"
+                            .to_string(),
+                    );
+                }
+            }
+
+            // iptables binary must exist when self-configuring.
+            match std::process::Command::new("iptables")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(_) => {
+                    errors.push(
+                        "Intercept rules configured but 'iptables' command not found. \
+                         Install iptables or remove the intercept configuration."
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+
+            // ip command needed for TPROXY routing policy.
+            let has_tproxy_intercept = self
+                .rules
+                .iter()
+                .any(|r| matches!(&r.intercept, Some(ic) if ic.mode == InterceptMode::Tproxy));
+            if has_tproxy_intercept {
+                match std::process::Command::new("ip")
+                    .arg("rule")
+                    .arg("show")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    Err(_) => {
+                        errors.push(
+                            "Intercept mode 'tproxy' configured but 'ip' command not found. \
+                             Install iproute2 or remove the tproxy intercept configuration."
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Check for port conflicts with system listeners
         for rule in &self.rules {
             if let Ok(_addr) = rule.listen_addr.parse::<SocketAddr>() {
@@ -1025,6 +1278,66 @@ impl GatewayConfig {
             }
             _ => {} // chain exists
         }
+    }
+
+    /// Validate a port specification string (comma-separated ports or port ranges).
+    /// Examples: "80", "80,443", "4465:4467", "80,443,4465:4467".
+    fn validate_port_spec(spec: &str) -> Result<(), String> {
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err("empty port segment".to_string());
+            }
+            if let Some((lo, hi)) = part.split_once(':') {
+                let lo: u16 = lo
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid port number '{}'", lo.trim()))?;
+                let hi: u16 = hi
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid port number '{}'", hi.trim()))?;
+                if lo == 0 || hi == 0 {
+                    return Err("port numbers must be >= 1".to_string());
+                }
+                if lo > hi {
+                    return Err(format!("port range {}:{} is inverted", lo, hi));
+                }
+            } else {
+                let port: u16 = part
+                    .parse()
+                    .map_err(|_| format!("invalid port number '{}'", part))?;
+                if port == 0 {
+                    return Err("port numbers must be >= 1".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate that a string is a valid IP address or CIDR notation.
+    fn validate_ip_or_cidr(s: &str) -> Result<(), String> {
+        let s = s.trim();
+        if let Some((ip_str, prefix_str)) = s.split_once('/') {
+            let ip: IpAddr = ip_str
+                .parse()
+                .map_err(|e| format!("invalid IP: {}", e))?;
+            let prefix_len: u8 = prefix_str
+                .parse()
+                .map_err(|e| format!("invalid prefix length: {}", e))?;
+            let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+            if prefix_len > max_prefix {
+                return Err(format!(
+                    "prefix length {} exceeds max {}",
+                    prefix_len, max_prefix
+                ));
+            }
+        } else {
+            let _ip: IpAddr = s
+                .parse()
+                .map_err(|e| format!("invalid IP address: {}", e))?;
+        }
+        Ok(())
     }
 
     /// Print a summary of all rules to stderr.
@@ -1235,5 +1548,240 @@ mod dscp_tests {
         }))
         .expect("deserialize config");
         assert!(cfg.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod intercept_tests {
+    use super::*;
+
+    #[test]
+    fn valid_ingress_redirect() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "web",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:8443",
+                "upstream_addr": "127.0.0.1:80",
+                "intercept": {
+                    "mode": "ingress_redirect",
+                    "in_interface": "eth0",
+                    "match_dports": "8080"
+                }
+            }]
+        }))
+        .expect("deserialize");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn valid_egress_redirect() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "enc",
+                "direction": "encrypt",
+                "listen_addr": "0.0.0.0:3128",
+                "upstream_addr": "10.0.0.1:443",
+                "intercept": {
+                    "mode": "egress_redirect",
+                    "match_dports": "4465:4467",
+                    "match_dst": ["192.168.1.2", "192.168.1.3"]
+                }
+            }]
+        }))
+        .expect("deserialize");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn valid_tproxy() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "dec",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:4000",
+                "upstream_addr": "auto",
+                "transparent": true,
+                "intercept": {
+                    "mode": "tproxy",
+                    "match_dports": "4465:4467",
+                    "match_src": ["192.168.1.1"]
+                }
+            }]
+        }))
+        .expect("deserialize");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tproxy_requires_transparent() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "dec",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:4000",
+                "upstream_addr": "auto",
+                "transparent": true,
+                "intercept": {
+                    "mode": "tproxy",
+                    "match_dports": "4465",
+                    "match_src": ["10.0.0.1"]
+                }
+            }]
+        }))
+        .expect("deserialize");
+        // transparent = true should pass.
+        assert!(cfg.validate().is_ok());
+
+        // Now test without transparent.
+        let cfg2: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "dec",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:4000",
+                "upstream_addr": "127.0.0.1:80",
+                "transparent": false,
+                "intercept": {
+                    "mode": "tproxy",
+                    "match_dports": "4465",
+                    "match_src": ["10.0.0.1"]
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg2.validate().unwrap_err();
+        assert!(err.contains("tproxy") && err.contains("transparent"), "got: {err}");
+    }
+
+    #[test]
+    fn egress_redirect_requires_match_dst() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "enc",
+                "direction": "encrypt",
+                "listen_addr": "0.0.0.0:3128",
+                "upstream_addr": "10.0.0.1:443",
+                "intercept": {
+                    "mode": "egress_redirect",
+                    "match_dports": "80"
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("match_dst"), "got: {err}");
+    }
+
+    #[test]
+    fn tproxy_requires_match_src() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "dec",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:4000",
+                "upstream_addr": "auto",
+                "transparent": true,
+                "intercept": {
+                    "mode": "tproxy",
+                    "match_dports": "4465"
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("match_src"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_match_dports_rejected() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "web",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:8443",
+                "upstream_addr": "127.0.0.1:80",
+                "intercept": {
+                    "mode": "ingress_redirect",
+                    "match_dports": ""
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("match_dports"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_port_spec_rejected() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "web",
+                "direction": "decrypt",
+                "listen_addr": "0.0.0.0:8443",
+                "upstream_addr": "127.0.0.1:80",
+                "intercept": {
+                    "mode": "ingress_redirect",
+                    "match_dports": "abc"
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("match_dports") && err.contains("invalid"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_dst_cidr_rejected() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "enc",
+                "direction": "encrypt",
+                "listen_addr": "0.0.0.0:3128",
+                "upstream_addr": "10.0.0.1:443",
+                "intercept": {
+                    "mode": "egress_redirect",
+                    "match_dports": "80",
+                    "match_dst": ["not-an-ip"]
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("match_dst"), "got: {err}");
+    }
+
+    #[test]
+    fn intercept_invalid_on_uds_rules() {
+        let result: Result<GatewayConfig, _> = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "local",
+                "direction": "encrypt",
+                "listen_addr": "0.0.0.0:0",
+                "listen_proto": "uds",
+                "upstream_addr": "127.0.0.1:443",
+                "app_id": "myapp",
+                "allowed_uids": [1000],
+                "intercept": {
+                    "mode": "ingress_redirect",
+                    "match_dports": "80"
+                }
+            }]
+        }));
+        // It should parse but fail validation.
+        let cfg = result.expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("intercept") && err.contains("uds"), "got: {err}");
+    }
+
+    #[test]
+    fn valid_port_specs() {
+        assert!(GatewayConfig::validate_port_spec("80").is_ok());
+        assert!(GatewayConfig::validate_port_spec("80,443").is_ok());
+        assert!(GatewayConfig::validate_port_spec("4465:4467").is_ok());
+        assert!(GatewayConfig::validate_port_spec("80,443,4465:4467").is_ok());
+        assert!(GatewayConfig::validate_port_spec("0").is_err());
+        assert!(GatewayConfig::validate_port_spec("99999").is_err());
+        assert!(GatewayConfig::validate_port_spec("abc").is_err());
+        assert!(GatewayConfig::validate_port_spec("100:50").is_err()); // inverted range
     }
 }

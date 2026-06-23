@@ -253,7 +253,11 @@ fn map_one(
         .get("port")
         .and_then(|v| v.as_u64())
         .ok_or("ingress.endpoint has no numeric 'port'")?;
-    let listen_addr = format!("{ip}:{port}");
+    let listen_addr = if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    };
     let listen_proto = endpoint
         .get("protocol")
         .and_then(|v| v.as_str())
@@ -338,6 +342,37 @@ fn map_one(
     // Carried through `serde(flatten)` into `provider_params` for the provider.
     if let Some(sni) = sni {
         rule.insert("sni".to_string(), Value::String(sni));
+    }
+
+    // ── intercept (firewall self-configuration) ─────────────────────────────
+    // Read from `ingress.intercept` on the connection.
+    if let Some(intercept_val) = conn.pointer("/ingress/intercept") {
+        if let Some(ic) = intercept_val.as_object() {
+            let mut intercept = Map::new();
+            // mode is required.
+            if let Some(mode) = ic.get("mode").and_then(|v| v.as_str()) {
+                intercept.insert("mode".to_string(), Value::String(mode.to_string()));
+            } else {
+                return Err("ingress.intercept has no 'mode'".to_string());
+            }
+            // Optional fields pass through.
+            if let Some(iface) = ic.get("in_interface").and_then(|v| v.as_str()) {
+                intercept.insert("in_interface".to_string(), Value::String(iface.to_string()));
+            }
+            if let Some(dports) = ic.get("match_dports").and_then(|v| v.as_str()) {
+                intercept.insert("match_dports".to_string(), Value::String(dports.to_string()));
+            }
+            if let Some(dst) = ic.get("match_dst") {
+                intercept.insert("match_dst".to_string(), dst.clone());
+            }
+            if let Some(src) = ic.get("match_src") {
+                intercept.insert("match_src".to_string(), src.clone());
+            }
+            if let Some(proto) = ic.get("protocol").and_then(|v| v.as_str()) {
+                intercept.insert("protocol".to_string(), Value::String(proto.to_string()));
+            }
+            rule.insert("intercept".to_string(), Value::Object(intercept));
+        }
     }
 
     Ok(Value::Object(rule))
@@ -448,5 +483,43 @@ mod tests {
             "got: {:?}",
             m.warnings
         );
+    }
+
+    #[test]
+    fn intercept_is_mapped_from_ingress() {
+        let m = map(serde_json::json!([{
+            "connection_id": "c-intercept",
+            "app_id": "a",
+            "enabled": true,
+            "protection": { "profile_ref": "tls_c", "role": "server", "mode": "full" },
+            "ingress": {
+                "endpoint": { "ip": "0.0.0.0", "port": 8443, "protocol": "tcp" },
+                "intercept": {
+                    "mode": "ingress_redirect",
+                    "in_interface": "eth0",
+                    "match_dports": "8080"
+                }
+            },
+            "paths": [ { "egress": { "endpoint": { "host": "127.0.0.1", "port": 80 } } } ]
+        }]));
+        let r = rule(&m, "c-intercept");
+        let ic = r.get("intercept").expect("rule should have intercept");
+        assert_eq!(ic["mode"], "ingress_redirect");
+        assert_eq!(ic["in_interface"], "eth0");
+        assert_eq!(ic["match_dports"], "8080");
+    }
+
+    #[test]
+    fn no_intercept_when_absent() {
+        let m = map(serde_json::json!([{
+            "connection_id": "c-no-ic",
+            "app_id": "a",
+            "enabled": true,
+            "protection": { "profile_ref": "tls_c", "role": "client", "mode": "full" },
+            "ingress": { "endpoint": { "ip": "0.0.0.0", "port": 9000, "protocol": "tcp" } },
+            "paths": [ { "egress": { "endpoint": { "host": "10.0.0.1", "port": 443 } } } ]
+        }]));
+        let r = rule(&m, "c-no-ic");
+        assert!(r.get("intercept").is_none());
     }
 }

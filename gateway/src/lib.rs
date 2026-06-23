@@ -32,6 +32,7 @@ use log::{error, info, warn};
 use management::config::GatewayConfig;
 use management::config_manager::{spawn_config_watcher, SharedConfig};
 use management::lite_config::{self, LiteSource};
+use networking::firewall::FirewallManager;
 use processing::cache::TrafficCache;
 use processing::lifecycle::{LifecycleEvent, LifecycleOrchestrator};
 use processing::policy::PolicyManager;
@@ -241,6 +242,24 @@ pub fn run(
         error!("Run with --validate for details, or fix the issues above");
     }
 
+    // ── Firewall self-configuration (iptables intercept rules) ───────────────
+    // Must run before listeners start so redirected traffic has somewhere to go.
+    let firewall = if config.rules.iter().any(|r| r.intercept.is_some()) {
+        match FirewallManager::setup(&config) {
+            Ok(fw) => {
+                info!("Firewall intercept rules installed (will tear down on shutdown)");
+                Some(fw)
+            }
+            Err(e) => {
+                error!("Failed to set up firewall intercept rules: {}", e);
+                error!("Fix the issue or remove 'intercept' from the config");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // Shutdown signal handling
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_signal = shutdown.clone();
@@ -418,6 +437,11 @@ pub fn run(
 
     // Shutdown has fired: tear down any live UDS/SHM endpoints.
     interface_manager.shutdown_all();
+
+    // Tear down firewall intercept rules (iptables chains + routing policy).
+    if let Some(ref fw) = firewall {
+        fw.teardown();
+    }
 
     info!("Shutdown complete");
 }
