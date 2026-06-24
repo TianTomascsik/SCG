@@ -10,25 +10,30 @@
 use crate::management::config::{QosPolicy, TlsMode};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
-    apply_egress_qos, poll_two_fds, set_nodelay, set_nonblocking_fd, tune_socket_buffers,
-    write_all_nb,
+    accept_with_timeout, apply_egress_qos, bind_tcp_listener, poll_two_fds, set_nodelay,
+    set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
 use crate::security::tls_engine::params::TlsSecurityParams;
-use crate::security::tls_engine::{build_tls_connector, write_all_nb_proxy, ProxyStream};
+use crate::security::tls_engine::{
+    build_tls_acceptor, build_tls_connector, write_all_nb_proxy, ProxyStream,
+};
 use crate::security::RELAY_BUF_SIZE;
 
 use foreign_types_shared::ForeignTypeRef;
 use ktls_pipe::{
-    build_client_connector as ktls_client_connector, enable_ktls_ssl, get_tcp_ulp,
-    ktls_privilege_hint, KtlsSession,
+    build_client_connector as ktls_client_connector, build_server_acceptor as ktls_server_acceptor,
+    enable_ktls_ssl, get_tcp_ulp, ktls_privilege_hint, KtlsSession,
 };
 use log::{debug, info, warn};
+use openssl::ssl::{Ssl, SslAcceptor};
 
 use scg_ipc::handshake::{Hello, HELLO_LEN};
 use scg_ipc::os::{self, PeerCred};
 use scg_ipc::token::CapabilityToken;
 
+use std::collections::HashMap;
 use std::io::{self, Read};
+use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -199,6 +204,130 @@ pub fn connect_tls_upstream(
                 "DTLS is not supported for local UDS/SHM interfaces",
             ));
         }
+    };
+    Ok(proxy)
+}
+
+/// Bind a TCP listener on `listen_addr`, accept one inbound connection, and
+/// complete a TLS/kTLS **server** handshake, returning a ready [`ProxyStream`].
+///
+/// This is the decrypt-direction counterpart to [`connect_tls_upstream`]: a
+/// peer (or loopback) gateway's encrypt endpoint dials in, and this endpoint
+/// terminates TLS so the decrypted `[len][traffic_id][data]` frame stream can
+/// be relayed to the local UDS/SHM client. The relay itself is
+/// direction-agnostic, so the only difference from the encrypt path is the
+/// server- vs client-side handshake. The userspace-TLS identity honours the
+/// rule's `cert_path`/`key_path`/profile, falling back to a cached self-signed
+/// certificate for the default profile.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_tls_upstream(
+    label: &str,
+    listen_addr: &str,
+    tls_mode: TlsMode,
+    provider_params: &HashMap<String, serde_json::Value>,
+    protocol_version: Option<&str>,
+    sock_buf_size: usize,
+    qos: QosPolicy,
+    shutdown: &AtomicBool,
+) -> io::Result<ProxyStream> {
+    let listener = bind_tcp_listener(listen_addr, false, label).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("failed to bind decrypt TLS listener on {listen_addr}"),
+        )
+    })?;
+    listener.set_nonblocking(false).ok();
+
+    // Build the server acceptor once. Userspace TLS honours the rule's
+    // cert/key/profile (self-signed fallback for the default profile); kTLS only
+    // needs the negotiated protocol version.
+    let acceptor: Option<SslAcceptor> = match tls_mode {
+        TlsMode::Tls => {
+            let params = TlsSecurityParams::from_params(provider_params, protocol_version)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS params: {e}")))?;
+            Some(
+                build_tls_acceptor(&params)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS acceptor: {e}")))?,
+            )
+        }
+        TlsMode::Ktls => Some(
+            ktls_server_acceptor(protocol_version)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS acceptor: {e}")))?,
+        ),
+        TlsMode::Dtls => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DTLS is not supported for local UDS/SHM interfaces",
+            ));
+        }
+    };
+
+    // Accept the first inbound connection, re-checking the shutdown flag between
+    // polls so a never-arriving peer cannot wedge the endpoint thread.
+    let (stream, peer_addr): (TcpStream, _) = loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shutdown while awaiting decrypt TLS connection",
+            ));
+        }
+        match accept_with_timeout(&listener, Duration::from_millis(200)) {
+            Some(Ok(pair)) => break pair,
+            Some(Err(e)) => return Err(e),
+            None => continue,
+        }
+    };
+
+    let fd = stream.as_raw_fd();
+    tune_socket_buffers(fd, sock_buf_size);
+    set_nodelay(fd, true);
+    // Mark + prioritise the downstream (SCG → peer) egress socket.
+    let is_v6 = peer_addr.is_ipv6();
+    apply_egress_qos(fd, qos.egress_dscp(None), qos.so_priority(), is_v6);
+
+    let hs_start = Instant::now();
+    let proxy = match tls_mode {
+        TlsMode::Tls => {
+            let acceptor = acceptor.as_ref().expect("TLS acceptor built above");
+            let ssl_stream = acceptor
+                .accept(stream)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS accept: {e}")))?;
+            info!(
+                "[{label}] downstream TLS accept from {peer_addr} ({:.2} ms)",
+                hs_start.elapsed().as_secs_f64() * 1000.0
+            );
+            ProxyStream::Tls(ssl_stream)
+        }
+        TlsMode::Ktls => {
+            let acceptor = acceptor.as_ref().expect("kTLS acceptor built above");
+            let mut ssl = Ssl::new(acceptor.context())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS SSL: {e}")))?;
+            ssl.set_accept_state();
+            // SAFETY: enabling kTLS on the SSL object before the handshake is the
+            // documented OpenSSL flow; the pointer is valid for the call.
+            unsafe {
+                enable_ktls_ssl(ssl.as_ptr());
+            }
+            let mut session = KtlsSession::new(ssl, fd as libc::c_int)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS session: {e}")))?;
+            session
+                .accept()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS accept: {e}")))?;
+            let ulp = get_tcp_ulp(&stream).unwrap_or_default();
+            if ulp.starts_with("tls") {
+                debug!(
+                    "[{label}] downstream kTLS accept from {peer_addr} ({:.2} ms, ULP={ulp})",
+                    hs_start.elapsed().as_secs_f64() * 1000.0
+                );
+            } else {
+                warn!("[{label}] WARNING: kTLS not active.{}", ktls_privilege_hint());
+            }
+            ProxyStream::Ktls {
+                session,
+                _stream: stream,
+            }
+        }
+        TlsMode::Dtls => unreachable!("DTLS handled above"),
     };
     Ok(proxy)
 }

@@ -24,8 +24,8 @@
 //! inside TLS, so a SHM client interoperates end-to-end with a UDS client on a
 //! peer gateway.
 
-use crate::interfaces::endpoint::{authenticate_peer, connect_tls_upstream};
-use crate::management::config::{QosPolicy, TlsMode};
+use crate::interfaces::endpoint::{accept_tls_upstream, authenticate_peer, connect_tls_upstream};
+use crate::management::config::{Direction, QosPolicy, TlsMode};
 use crate::networking::socket_manager::{set_nodelay, set_nonblocking_fd};
 use crate::security::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::security::RELAY_BUF_SIZE;
@@ -48,6 +48,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::collections::HashMap;
 
 /// Everything a SHM endpoint thread needs to authenticate a client, hand it the
 /// ring descriptors, and relay framed traffic.
@@ -56,12 +57,18 @@ pub struct ShmEndpointTask {
     pub label: String,
     /// Filesystem path of the control socket used for the descriptor handshake.
     pub control_socket_path: PathBuf,
-    /// Upstream address the gateway connects to as a TLS client.
+    /// Direction of the security pipeline: `Encrypt` dials the upstream as a TLS
+    /// client; `Decrypt` binds `upstream_addr` and terminates TLS as a server.
+    pub direction: Direction,
+    /// Upstream address. For `Encrypt` it is the TLS server to dial; for
+    /// `Decrypt` it is the local address to bind the TLS listener on.
     pub upstream_addr: String,
     /// TLS transport mode for the upstream leg.
     pub tls_mode: TlsMode,
     /// Optional TLS protocol version override.
     pub protocol_version: Option<String>,
+    /// Raw provider params used to build the decrypt-direction TLS acceptor.
+    pub provider_params: HashMap<String, serde_json::Value>,
     /// Socket buffer tuning size for the upstream socket.
     pub sock_buf_size: usize,
     /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
@@ -226,18 +233,35 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
 
     debug!("[{}] SHM descriptors delivered; connecting upstream", task.label);
 
-    let mut tls = match connect_tls_upstream(
-        &task.label,
-        &task.upstream_addr,
-        task.tls_mode,
-        task.protocol_version.as_deref(),
-        task.sock_buf_size,
-        task.qos,
-        &task.shutdown,
-    ) {
+    let tls = match task.direction {
+        Direction::Encrypt => connect_tls_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.tls_mode,
+            task.protocol_version.as_deref(),
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+        Direction::Decrypt => accept_tls_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.tls_mode,
+            &task.provider_params,
+            task.protocol_version.as_deref(),
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+    };
+    let mut tls = match tls {
         Ok(t) => t,
         Err(e) => {
-            error!("[{}] upstream connect failed: {e}", task.label);
+            let verb = match task.direction {
+                Direction::Encrypt => "connect",
+                Direction::Decrypt => "accept",
+            };
+            error!("[{}] upstream {verb} failed: {e}", task.label);
             return;
         }
     };

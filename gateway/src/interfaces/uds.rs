@@ -6,14 +6,17 @@
 //! plus a single-use capability token, then relays the application's framed
 //! traffic through a TLS/kTLS upstream.
 
-use crate::interfaces::endpoint::{authenticate_peer, connect_tls_upstream, relay_uds_tls};
-use crate::management::config::{QosPolicy, TlsMode};
+use crate::interfaces::endpoint::{
+    accept_tls_upstream, authenticate_peer, connect_tls_upstream, relay_uds_tls,
+};
+use crate::management::config::{Direction, QosPolicy, TlsMode};
 
 use scg_ipc::os::{self, PeerCred};
 use scg_ipc::token::CapabilityToken;
 
 use log::{error, info, warn};
 
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -27,12 +30,18 @@ pub struct UdsEndpointTask {
     pub label: String,
     /// Filesystem path the endpoint binds and serves on.
     pub socket_path: PathBuf,
-    /// Upstream address the gateway connects to as a TLS client.
+    /// Direction of the security pipeline: `Encrypt` dials the upstream as a TLS
+    /// client; `Decrypt` binds `upstream_addr` and terminates TLS as a server.
+    pub direction: Direction,
+    /// Upstream address. For `Encrypt` it is the TLS server to dial; for
+    /// `Decrypt` it is the local address to bind the TLS listener on.
     pub upstream_addr: String,
     /// TLS transport mode for the upstream leg.
     pub tls_mode: TlsMode,
     /// Optional TLS protocol version override.
     pub protocol_version: Option<String>,
+    /// Raw provider params used to build the decrypt-direction TLS acceptor.
+    pub provider_params: HashMap<String, serde_json::Value>,
     /// Socket buffer tuning size.
     pub sock_buf_size: usize,
     /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
@@ -160,20 +169,38 @@ fn authenticate(stream: &UnixStream, task: &UdsEndpointTask) -> Result<PeerCred,
     )
 }
 
-/// Connect the upstream and run the bidirectional relay for one client.
+/// Establish the TLS upstream (dial for encrypt, accept for decrypt) and run the
+/// bidirectional relay for one client.
 fn serve(task: &UdsEndpointTask, stream: UnixStream) {
-    let mut tls = match connect_tls_upstream(
-        &task.label,
-        &task.upstream_addr,
-        task.tls_mode,
-        task.protocol_version.as_deref(),
-        task.sock_buf_size,
-        task.qos,
-        &task.shutdown,
-    ) {
+    let tls = match task.direction {
+        Direction::Encrypt => connect_tls_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.tls_mode,
+            task.protocol_version.as_deref(),
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+        Direction::Decrypt => accept_tls_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.tls_mode,
+            &task.provider_params,
+            task.protocol_version.as_deref(),
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+    };
+    let mut tls = match tls {
         Ok(t) => t,
         Err(e) => {
-            error!("[{}] upstream connect failed: {e}", task.label);
+            let verb = match task.direction {
+                Direction::Encrypt => "connect",
+                Direction::Decrypt => "accept",
+            };
+            error!("[{}] upstream {verb} failed: {e}", task.label);
             return;
         }
     };

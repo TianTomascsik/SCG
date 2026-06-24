@@ -86,6 +86,9 @@ struct EndpointTemplate {
     upstream_addr: String,
     tls_mode: TlsMode,
     protocol_version: Option<String>,
+    /// Raw provider params from the rule, used to build the decrypt-direction
+    /// TLS server acceptor (cert/key/profile/verify); empty for encrypt rules.
+    provider_params: HashMap<String, serde_json::Value>,
     allowed_uids: Arc<Vec<u32>>,
     allowed_pids: Arc<Vec<i32>>,
     /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
@@ -216,6 +219,7 @@ impl InterfaceManager {
                     upstream_addr: rule.upstream_addr.clone(),
                     tls_mode,
                     protocol_version: rule.protocol_version.clone(),
+                    provider_params: rule.provider_params.clone(),
                     allowed_uids: Arc::new(rule.allowed_uids.clone()),
                     allowed_pids: Arc::new(rule.allowed_pids.clone()),
                     qos: rule.qos(),
@@ -321,11 +325,6 @@ impl InterfaceManager {
         direction: Direction,
         _ring_capacity: usize,
     ) -> Result<UdsCreated, Status> {
-        if direction != Direction::Encrypt {
-            return Err(Status::unimplemented(
-                "decrypt-direction UDS endpoints are not yet supported",
-            ));
-        }
         let key = template_key(app_id, class, direction, Proto::Uds);
         let template = self.templates.get(&key).ok_or_else(|| {
             Status::not_found(format!(
@@ -371,9 +370,11 @@ impl InterfaceManager {
         let task = UdsEndpointTask {
             label: label.clone(),
             socket_path: socket_path.clone(),
+            direction,
             upstream_addr: template.upstream_addr.clone(),
             tls_mode: template.tls_mode,
             protocol_version: template.protocol_version.clone(),
+            provider_params: template.provider_params.clone(),
             sock_buf_size: self.sock_buf_size,
             qos: template.qos,
             allowed_uids: template.allowed_uids.clone(),
@@ -429,11 +430,6 @@ impl InterfaceManager {
         direction: Direction,
         ring_capacity: usize,
     ) -> Result<ShmCreated, Status> {
-        if direction != Direction::Encrypt {
-            return Err(Status::unimplemented(
-                "decrypt-direction SHM endpoints are not yet supported",
-            ));
-        }
         let key = template_key(app_id, class, direction, Proto::Shm);
         let template = self.templates.get(&key).ok_or_else(|| {
             Status::not_found(format!(
@@ -485,9 +481,11 @@ impl InterfaceManager {
         let task = ShmEndpointTask {
             label: label.clone(),
             control_socket_path: control_socket_path.clone(),
+            direction,
             upstream_addr: template.upstream_addr.clone(),
             tls_mode: template.tls_mode,
             protocol_version: template.protocol_version.clone(),
+            provider_params: template.provider_params.clone(),
             sock_buf_size: self.sock_buf_size,
             qos: template.qos,
             cap_c2g: cap,
@@ -724,6 +722,16 @@ mod tests {
                     "app_id": "app1",
                     "traffic_class": "normal",
                     "allowed_uids": [{allowed_uid}]
+                }}, {{
+                    "name": "uds-app1-dec",
+                    "direction": "decrypt",
+                    "listen_addr": "unused",
+                    "listen_proto": "uds",
+                    "upstream_addr": "127.0.0.1:1",
+                    "security_provider": "tls",
+                    "app_id": "app1",
+                    "traffic_class": "normal",
+                    "allowed_uids": [{allowed_uid}]
                 }}],
                 "api": {{ "runtime_dir": "{}", "uds_path": "{}/mgmt.sock" }}
             }}"#,
@@ -763,14 +771,22 @@ mod tests {
     }
 
     #[test]
-    fn create_uds_decrypt_is_unimplemented() {
+    fn create_uds_decrypt_returns_token_and_path() {
         let tmp = unique_tmp();
-        let mgr = manager_with_uds_rule(1000, &tmp);
-        let caller = CallerCred { uid: 1000, gid: 1000, pid: 1 };
-        let err = mgr
+        let uid = unsafe { libc::getuid() };
+        let mgr = manager_with_uds_rule(uid, &tmp);
+        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        // Decrypt-direction endpoints are now supported and create like encrypt.
+        let created = mgr
             .create_uds(caller, "app1", TrafficClass::Normal, Direction::Decrypt, 0)
-            .unwrap_err();
-        assert_eq!(err.code(), Code::Unimplemented);
+            .expect("decrypt create_uds should succeed for an authorised uid");
+        assert_eq!(created.token.len(), 32, "token must be 256-bit");
+        assert!(
+            created.socket_path.contains("decrypt"),
+            "socket path should encode the direction: {}",
+            created.socket_path
+        );
+        mgr.shutdown_all();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -826,6 +842,16 @@ mod tests {
                     "app_id": "app1",
                     "traffic_class": "safety",
                     "allowed_uids": [{allowed_uid}]
+                }}, {{
+                    "name": "shm-app1-dec",
+                    "direction": "decrypt",
+                    "listen_addr": "unused",
+                    "listen_proto": "shm",
+                    "upstream_addr": "127.0.0.1:1",
+                    "security_provider": "tls",
+                    "app_id": "app1",
+                    "traffic_class": "safety",
+                    "allowed_uids": [{allowed_uid}]
                 }}],
                 "api": {{ "runtime_dir": "{}", "uds_path": "{}/mgmt.sock" }}
             }}"#,
@@ -849,14 +875,21 @@ mod tests {
     }
 
     #[test]
-    fn create_shm_decrypt_is_unimplemented() {
+    fn create_shm_decrypt_returns_token_and_path() {
         let tmp = unique_tmp();
-        let mgr = manager_with_shm_rule(1000, &tmp);
-        let caller = CallerCred { uid: 1000, gid: 1000, pid: 1 };
-        let err = mgr
-            .create_shm(caller, "app1", TrafficClass::Safety, Direction::Decrypt, 0)
-            .unwrap_err();
-        assert_eq!(err.code(), Code::Unimplemented);
+        let uid = unsafe { libc::getuid() };
+        let mgr = manager_with_shm_rule(uid, &tmp);
+        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let created = mgr
+            .create_shm(caller, "app1", TrafficClass::Safety, Direction::Decrypt, 4096)
+            .expect("decrypt create_shm should succeed for an authorised uid");
+        assert_eq!(created.token.len(), 32, "token must be 256-bit");
+        assert!(
+            created.control_socket_path.contains("decrypt"),
+            "control socket path should encode the direction: {}",
+            created.control_socket_path
+        );
+        mgr.shutdown_all();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
