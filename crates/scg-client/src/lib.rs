@@ -205,6 +205,22 @@ impl ScgClient {
         }
     }
 
+    /// Attempt to send without waiting for a full SHM ring to drain.
+    ///
+    /// UDS writes retain their normal blocking behavior and therefore always
+    /// return `Ok(true)` on success. SHM returns `Ok(false)` under backpressure,
+    /// allowing a caller with a cancellation boundary to yield rather than
+    /// become permanently blocked during endpoint teardown.
+    pub fn try_send(&mut self, traffic_id: u32, data: &[u8]) -> Result<bool> {
+        match &mut self.inner {
+            Inner::Uds(c) => {
+                c.send(traffic_id, data)?;
+                Ok(true)
+            }
+            Inner::Shm(c) => c.try_send(traffic_id, data),
+        }
+    }
+
     /// Block until one framed message arrives.
     pub fn recv(&mut self) -> Result<(u32, Vec<u8>)> {
         match &mut self.inner {

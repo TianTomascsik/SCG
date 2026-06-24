@@ -158,18 +158,33 @@ impl ShmClient {
     /// Push one framed message to the gateway, blocking while the ring is full.
     pub fn send(&mut self, traffic_id: u32, data: &[u8]) -> Result<()> {
         loop {
-            match self.producer.try_push(traffic_id, data) {
-                Ok(true) => {
-                    self.c2g_evt.signal()?;
-                    return Ok(());
-                }
-                Ok(false) => {
+            match self.try_send(traffic_id, data)? {
+                true => return Ok(()),
+                false => {
                     // Ring full: nudge the gateway to drain, then back off.
-                    self.c2g_evt.signal()?;
                     std::thread::sleep(SEND_FULL_BACKOFF);
                 }
-                Err(_) => return Err(ScgError::FrameTooLarge),
             }
+        }
+    }
+
+    /// Try to push one framed message without waiting for ring capacity.
+    ///
+    /// Returns `Ok(false)` when the ring is full. Callers that own a shutdown
+    /// signal (such as SESHAT's sender loop) should use this form so they can
+    /// observe cancellation instead of blocking forever after a peer exits.
+    pub fn try_send(&mut self, traffic_id: u32, data: &[u8]) -> Result<bool> {
+        match self.producer.try_push(traffic_id, data) {
+            Ok(true) => {
+                self.c2g_evt.signal()?;
+                Ok(true)
+            }
+            Ok(false) => {
+                // Wake the gateway in case it is sleeping before it drains.
+                self.c2g_evt.signal()?;
+                Ok(false)
+            }
+            Err(_) => Err(ScgError::FrameTooLarge),
         }
     }
 
