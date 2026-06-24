@@ -5,6 +5,7 @@
 //! synchronous data-plane object never has to own async resources.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -18,6 +19,11 @@ use crate::{Direction, TrafficClass, Transport};
 
 /// Default management socket path (matches the gateway's `ApiConfig` default).
 pub const DEFAULT_MGMT_SOCKET: &str = "/run/scg/management.sock";
+
+/// Bound control-plane calls so a gateway that is shutting down or wedged
+/// cannot stall a benchmark while endpoint clients are dropped.
+const MGMT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const MGMT_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Outcome of a successful endpoint-creation request.
 pub enum Created {
@@ -50,6 +56,8 @@ async fn dial(path: PathBuf) -> Result<ManagementApiClient<Channel>> {
     // UDS path instead.
     let channel = Endpoint::try_from("http://[::]:50051")
         .map_err(ScgError::from)?
+        .connect_timeout(MGMT_CONNECT_TIMEOUT)
+        .timeout(MGMT_RPC_TIMEOUT)
         .connect_with_connector(service_fn(move |_: Uri| {
             let path = path.clone();
             async move {

@@ -47,7 +47,7 @@ mod shm;
 mod uds;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scg_ipc::{CapabilityToken, Role, TOKEN_LEN};
 
@@ -56,6 +56,13 @@ pub use mgmt::DEFAULT_MGMT_SOCKET;
 
 use shm::ShmClient;
 use uds::UdsClient;
+
+/// The management API registers an endpoint before its serving thread has
+/// necessarily bound the returned Unix socket.  A client that dials in that
+/// tiny window sees `ENOENT` (or, less commonly, `ECONNREFUSED`).  Bound the
+/// retry so a real endpoint failure is still reported promptly.
+const ENDPOINT_READY_TIMEOUT: Duration = Duration::from_secs(1);
+const ENDPOINT_READY_RETRY: Duration = Duration::from_millis(10);
 
 /// Which local transport to use for the data plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +165,9 @@ impl ScgClient {
                 endpoint_id,
             } => {
                 let token = token_from_slice(&token)?;
-                let c = UdsClient::connect(&socket_path, token, role)?;
+                let c = connect_when_published(|| {
+                    UdsClient::connect(&socket_path, token.clone(), role)
+                })?;
                 (endpoint_id, Inner::Uds(c))
             }
             mgmt::Created::Shm {
@@ -168,7 +177,9 @@ impl ScgClient {
                 ..
             } => {
                 let token = token_from_slice(&token)?;
-                let c = ShmClient::connect(&control_socket_path, token, role)?;
+                let c = connect_when_published(|| {
+                    ShmClient::connect(&control_socket_path, token.clone(), role)
+                })?;
                 (endpoint_id, Inner::Shm(c))
             }
         };
@@ -226,6 +237,36 @@ impl ScgClient {
     }
 }
 
+/// Connect to a just-created local endpoint once its listener has appeared.
+///
+/// Endpoint publication is asynchronous in the gateway: the gRPC response is
+/// returned immediately after the endpoint thread is spawned.  Retrying only
+/// the two publication-race errors avoids hiding permission, token, or framing
+/// faults behind a delay.
+fn connect_when_published<T>(mut connect: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = Instant::now() + ENDPOINT_READY_TIMEOUT;
+    loop {
+        match connect() {
+            Ok(client) => return Ok(client),
+            Err(err) if endpoint_not_ready(&err) && Instant::now() < deadline => {
+                std::thread::sleep(ENDPOINT_READY_RETRY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn endpoint_not_ready(err: &ScgError) -> bool {
+    matches!(
+        err,
+        ScgError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+    )
+}
+
 impl Drop for ScgClient {
     fn drop(&mut self) {
         // Best-effort: deregister the endpoint so it doesn't linger on the
@@ -277,5 +318,38 @@ mod tests {
         assert!(token_from_slice(&[0u8; TOKEN_LEN - 1]).is_err());
         assert!(token_from_slice(&[0u8; TOKEN_LEN + 1]).is_err());
         assert!(token_from_slice(&[]).is_err());
+    }
+
+    #[test]
+    fn only_endpoint_publication_races_are_retried() {
+        assert!(endpoint_not_ready(&ScgError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        ))));
+        assert!(endpoint_not_ready(&ScgError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        ))));
+        assert!(!endpoint_not_ready(&ScgError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ))));
+        assert!(!endpoint_not_ready(&ScgError::Closed));
+    }
+
+    #[test]
+    fn endpoint_connection_retries_until_listener_is_published() {
+        let mut attempts = 0;
+        let connected = connect_when_published(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(ScgError::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                )))
+            } else {
+                Ok("connected")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(connected, "connected");
+        assert_eq!(attempts, 3);
     }
 }
