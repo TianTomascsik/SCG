@@ -362,11 +362,10 @@ fn relay(
         // client -> gateway: drain the c2g ring unconditionally (covers any
         // coalesced/lost eventfd signal), coalescing all available frames into
         // one buffer and forwarding them with a single TLS write to amortise
-        // the per-record syscall/crypto cost.
+        // the per-record syscall/crypto cost. The slot ring appends its frames
+        // straight from shared memory (no staging copy / re-encode).
         framed.clear();
-        while let Some(traffic_id) = seg.drain_c2g_into(&mut popbuf) {
-            encode_into(&mut framed, traffic_id, &popbuf);
-        }
+        seg.coalesce_c2g_into(&mut framed, &mut popbuf);
         if !framed.is_empty() {
             write_all_nb_proxy(tls, &framed)?;
         }
@@ -379,9 +378,9 @@ fn relay(
                     Ok(n) => {
                         decoder.feed(&rbuf[..n]);
                         loop {
-                            match decoder.next_frame() {
+                            match decoder.next_frame_borrowed() {
                                 Ok(Some((traffic_id, payload))) => {
-                                    push_g2c(seg, traffic_id, &payload, shutdown)?;
+                                    push_g2c(seg, traffic_id, payload, shutdown)?;
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
@@ -632,14 +631,34 @@ impl ShmSegment {
         }
     }
 
-    /// Pop one frame from the client→gateway ring into `buf`, returning its
-    /// traffic id, or `None` when the ring is empty.
+    /// Coalesce all currently-available client→gateway frames into `framed`
+    /// (the on-wire `[len|traffic_id|payload]` stream forwarded to the TLS
+    /// upstream), returning the number of frames drained.
+    ///
+    /// For the slot ring the frame already sits in the data segment in on-wire
+    /// layout, so it is appended with a single `memcpy` straight from shared
+    /// memory — no intermediate `popbuf` copy and no header re-encode. The
+    /// byte-stream ring stores bare payloads, so it still pops into `scratch`
+    /// and re-frames via `encode_into`.
     #[inline]
-    fn drain_c2g_into(&self, buf: &mut Vec<u8>) -> Option<u32> {
+    fn coalesce_c2g_into(&self, framed: &mut Vec<u8>, scratch: &mut Vec<u8>) -> usize {
+        let mut n = 0;
         match &self.backend {
-            RingBackend::ByteStream { consumer, .. } => consumer.try_pop_into(buf),
-            RingBackend::Slot { consumer, .. } => consumer.try_pop_into(buf),
+            RingBackend::Slot { consumer, .. } => {
+                while let Some(frame) = consumer.peek_frame() {
+                    framed.extend_from_slice(frame);
+                    consumer.advance();
+                    n += 1;
+                }
+            }
+            RingBackend::ByteStream { consumer, .. } => {
+                while let Some(traffic_id) = consumer.try_pop_into(scratch) {
+                    encode_into(framed, traffic_id, scratch);
+                    n += 1;
+                }
+            }
         }
+        n
     }
 
     /// Push one frame into the gateway→client ring. Returns `Ok(Some(was_empty))`

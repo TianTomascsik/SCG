@@ -168,6 +168,21 @@ impl FrameDecoder {
     /// `Err(FrameError::TooLarge)` if a frame's advertised length exceeds the
     /// configured maximum (a corrupt or hostile peer).
     pub fn next_frame(&mut self) -> Result<Option<(u32, Vec<u8>)>, FrameError> {
+        match self.next_frame_borrowed()? {
+            Some((traffic_id, payload)) => Ok(Some((traffic_id, payload.to_vec()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`next_frame`](Self::next_frame) but returns the payload as a
+    /// borrowed slice into the decoder's internal buffer, avoiding a per-frame
+    /// allocation in the hot path.
+    ///
+    /// The returned slice is valid until the next call to any `&mut self`
+    /// method ([`feed`](Self::feed) or another `next_frame*`). Typical use:
+    /// drain in a `while let Some((tid, payload)) = dec.next_frame_borrowed()?`
+    /// loop, consuming `payload` fully within each iteration.
+    pub fn next_frame_borrowed(&mut self) -> Result<Option<(u32, &[u8])>, FrameError> {
         let avail = self.buf.len() - self.pos;
         if avail < FRAME_HEADER_LEN {
             return Ok(None);
@@ -183,9 +198,9 @@ impl FrameDecoder {
         if avail < total {
             return Ok(None);
         }
-        let payload = self.buf[self.pos + FRAME_HEADER_LEN..self.pos + total].to_vec();
+        let start = self.pos + FRAME_HEADER_LEN;
         self.pos += total;
-        Ok(Some((traffic_id, payload)))
+        Ok(Some((traffic_id, &self.buf[start..start + len])))
     }
 }
 
@@ -282,5 +297,36 @@ mod tests {
         let mut dec = FrameDecoder::new(10);
         dec.feed(&hdr);
         assert_eq!(dec.next_frame(), Err(FrameError::TooLarge(100)));
+    }
+
+    #[test]
+    fn decoder_borrowed_matches_owned() {
+        let mut wire = Vec::new();
+        encode_into(&mut wire, 3, b"abc");
+        encode_into(&mut wire, 9, b"");
+        encode_into(&mut wire, 1, &[0xCD; 1234]);
+
+        let mut dec = FrameDecoder::new(DEFAULT_MAX_FRAME_LEN);
+        dec.feed(&wire);
+        // Borrowed view yields the same payloads, without allocating per frame.
+        let (tid, payload) = dec.next_frame_borrowed().unwrap().unwrap();
+        assert_eq!(tid, 3);
+        assert_eq!(payload, b"abc");
+        let (tid, payload) = dec.next_frame_borrowed().unwrap().unwrap();
+        assert_eq!(tid, 9);
+        assert!(payload.is_empty());
+        let (tid, payload) = dec.next_frame_borrowed().unwrap().unwrap();
+        assert_eq!(tid, 1);
+        assert_eq!(payload.len(), 1234);
+        assert!(payload.iter().all(|&b| b == 0xCD));
+        assert!(dec.next_frame_borrowed().unwrap().is_none());
+    }
+
+    #[test]
+    fn decoder_borrowed_rejects_oversized_frame() {
+        let hdr = encode_header(100, 0);
+        let mut dec = FrameDecoder::new(10);
+        dec.feed(&hdr);
+        assert_eq!(dec.next_frame_borrowed(), Err(FrameError::TooLarge(100)));
     }
 }

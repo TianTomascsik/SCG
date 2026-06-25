@@ -692,16 +692,16 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                 match tls.read(&mut tls_buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let deframed = framing.deframe(&ctx.rule_name, &tls_buf[..n]);
-                        for datagram in deframed.datagrams {
-                            if let Some(peer) = last_peer {
-                                let _ = socket.send_to(&datagram, peer);
-                            }
-                            let data_len = datagram.len();
-                            conn_metrics.record_read(data_len);
-                            conn_metrics.record_relay(data_len);
-                        }
-                        if deframed.disconnect {
+                        let disconnect =
+                            framing.deframe_each(&ctx.rule_name, &tls_buf[..n], |datagram| {
+                                if let Some(peer) = last_peer {
+                                    let _ = socket.send_to(datagram, peer);
+                                }
+                                let data_len = datagram.len();
+                                conn_metrics.record_read(data_len);
+                                conn_metrics.record_relay(data_len);
+                            });
+                        if disconnect {
                             break 'tls_read;
                         }
                         if tls.ssl_pending() == 0 {

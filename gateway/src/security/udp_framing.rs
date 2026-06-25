@@ -11,20 +11,10 @@
 //!
 //! The AU1/AU2 association handshake is performed inline by the encrypt/decrypt
 //! relays (gated on [`UdpFraming::is_ale`]); per-datagram framing and inbound
-//! reassembly go through [`UdpFraming::frame_into`] / [`UdpFraming::deframe`].
+//! reassembly go through [`UdpFraming::frame_into`] / [`UdpFraming::deframe_each`].
 
 use ale_pipe::{AleError, AleFrameReader, AleFrameWriter, ALE_PKT_DI, ALE_PKT_DT};
 use log::error;
-
-/// The result of feeding received TLS bytes through the framer.
-#[derive(Default)]
-pub struct Deframed {
-    /// Fully reassembled application datagrams, in order.
-    pub datagrams: Vec<Vec<u8>>,
-    /// The peer signalled a disconnect (ALE DI) or a fatal framing error was
-    /// hit, so the session should be torn down.
-    pub disconnect: bool,
-}
 
 /// Per-session UDP-over-TLS framing state.
 pub enum UdpFraming {
@@ -74,18 +64,29 @@ impl UdpFraming {
         }
     }
 
-    /// Feed inbound TLS bytes, returning any complete datagrams and whether the
-    /// session should disconnect.
-    pub fn deframe(&mut self, rule_name: &str, data: &[u8]) -> Deframed {
+    /// Feed inbound TLS bytes, invoking `on_datagram` with a borrowed slice for
+    /// each complete reassembled datagram (in order) and returning whether the
+    /// session should disconnect (ALE DI or a fatal framing error).
+    ///
+    /// The closure receives a slice that borrows the framer's internal buffer,
+    /// so the relay can forward each datagram with no per-datagram heap
+    /// allocation. For the raw framing the consumed prefix is dropped in a
+    /// single trailing splice rather than once per datagram.
+    pub fn deframe_each<F: FnMut(&[u8])>(
+        &mut self,
+        rule_name: &str,
+        data: &[u8],
+        mut on_datagram: F,
+    ) -> bool {
         match self {
             UdpFraming::Ale { reader, .. } => {
-                let mut out = Deframed::default();
+                let mut disconnect = false;
                 match reader.feed(data) {
                     Ok(frames) => {
                         for frame in frames {
                             match frame.header.packet_type {
-                                ALE_PKT_DT => out.datagrams.push(frame.user_data),
-                                ALE_PKT_DI => out.disconnect = true,
+                                ALE_PKT_DT => on_datagram(&frame.user_data),
+                                ALE_PKT_DI => disconnect = true,
                                 _ => {} // Ignore association/other packet types.
                             }
                         }
@@ -95,34 +96,36 @@ impl UdpFraming {
                             "[{}] ALE checksum mismatch: expected 0x{:04X}, got 0x{:04X} — disconnecting",
                             rule_name, expected, got
                         );
-                        out.disconnect = true;
+                        disconnect = true;
                     }
                     Err(e) => {
                         error!("[{}] ALE frame error: {}", rule_name, e);
-                        out.disconnect = true;
+                        disconnect = true;
                     }
                 }
-                out
+                disconnect
             }
             UdpFraming::Raw { pending } => {
                 pending.extend_from_slice(data);
-                let mut datagrams = Vec::new();
+                let mut consumed = 0usize;
                 loop {
-                    if pending.len() < 4 {
+                    let rem = &pending[consumed..];
+                    if rem.len() < 4 {
                         break;
                     }
-                    let len =
-                        u32::from_le_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
-                    if pending.len() < 4 + len {
+                    let len = u32::from_le_bytes([rem[0], rem[1], rem[2], rem[3]]) as usize;
+                    if rem.len() < 4 + len {
                         break;
                     }
-                    datagrams.push(pending[4..4 + len].to_vec());
-                    pending.drain(..4 + len);
+                    on_datagram(&rem[4..4 + len]);
+                    consumed += 4 + len;
                 }
-                Deframed {
-                    datagrams,
-                    disconnect: false,
+                if consumed == pending.len() {
+                    pending.clear();
+                } else if consumed > 0 {
+                    pending.drain(..consumed);
                 }
+                false
             }
         }
     }
@@ -134,3 +137,50 @@ impl UdpFraming {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_frame(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn raw_deframe_each_yields_borrowed_datagrams_and_drains_fully() {
+        let mut f = UdpFraming::for_app_protocol("raw");
+        let mut wire = raw_frame(b"hello");
+        wire.extend_from_slice(&raw_frame(b"world"));
+
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let disconnect = f.deframe_each("t", &wire, |d| got.push(d.to_vec()));
+
+        assert!(!disconnect);
+        assert_eq!(got, vec![b"hello".to_vec(), b"world".to_vec()]);
+        // A fully-consumed stream must leave no buffered bytes.
+        match &f {
+            UdpFraming::Raw { pending } => assert!(pending.is_empty()),
+            _ => panic!("expected raw framing"),
+        }
+    }
+
+    #[test]
+    fn raw_deframe_each_buffers_partial_frame_across_feeds() {
+        let mut f = UdpFraming::for_app_protocol("raw");
+        let full = raw_frame(b"abcdef");
+        let split = full.len() - 2;
+
+        let mut count = 0usize;
+        // First feed delivers only part of the frame: nothing is emitted yet.
+        f.deframe_each("t", &full[..split], |_| count += 1);
+        assert_eq!(count, 0);
+
+        // Remaining bytes complete the frame on the next feed.
+        let mut out = Vec::new();
+        f.deframe_each("t", &full[split..], |d| out.push(d.to_vec()));
+        assert_eq!(out, vec![b"abcdef".to_vec()]);
+    }
+}
+

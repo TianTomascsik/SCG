@@ -160,15 +160,15 @@ pub fn relay_tls_to_udp(
                 match tls_stream.read(&mut tls_buf) {
                     Ok(0) => return Ok(()),
                     Ok(n) => {
-                        let deframed = framing.deframe(rule_name, &tls_buf[..n]);
-                        for datagram in deframed.datagrams {
-                            apply_geo_delay(delay_ms);
-                            let _ = upstream.send(&datagram);
-                            let data_len = datagram.len();
-                            conn_metrics.record_read(data_len);
-                            conn_metrics.record_relay(data_len);
-                        }
-                        if deframed.disconnect {
+                        let disconnect =
+                            framing.deframe_each(rule_name, &tls_buf[..n], |datagram| {
+                                apply_geo_delay(delay_ms);
+                                let _ = upstream.send(datagram);
+                                let data_len = datagram.len();
+                                conn_metrics.record_read(data_len);
+                                conn_metrics.record_relay(data_len);
+                            });
+                        if disconnect {
                             return Ok(());
                         }
                         if tls_stream.ssl_pending() == 0 {

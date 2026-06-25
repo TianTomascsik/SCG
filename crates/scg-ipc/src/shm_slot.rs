@@ -372,6 +372,48 @@ impl SlotConsumer {
         Some(traffic_id)
     }
 
+    /// Peek the next READY frame's full on-wire bytes (`[len|traffic_id|payload]`)
+    /// without dequeuing, for zero-copy forwarding straight to the upstream.
+    ///
+    /// Returns `None` when the ring is empty. The returned slice borrows the
+    /// shared data segment and is valid until the matching [`advance`](Self::advance)
+    /// call (the slot stays owned by this consumer until then, so the producer
+    /// cannot overwrite it). A hostile/garbled `len` is clamped to the slot's
+    /// payload capacity, mirroring [`try_pop_into`](Self::try_pop_into).
+    pub fn peek_frame(&self) -> Option<&[u8]> {
+        let hdr = self.header();
+        let pos = hdr.read_pos.load(Ordering::Relaxed);
+        let idx = (pos & self.mask) as usize;
+        let seq = self.seq_at(idx).load(Ordering::Acquire);
+        // diff == 0 → slot READY; diff < 0 → producer hasn't published it.
+        if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
+            return None;
+        }
+        let seg = unsafe { self.data.add(idx * self.segment_size) };
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        unsafe {
+            std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
+        }
+        let (len, _traffic_id) = decode_header(&header);
+        let len = (len as usize).min(self.max_payload());
+        let total = FRAME_HEADER_LEN + len;
+        // SAFETY: `total <= segment_size`; the slot is owned by this consumer
+        // (READY, not yet advanced) so the bytes are stable for the borrow.
+        Some(unsafe { std::slice::from_raw_parts(seg, total) })
+    }
+
+    /// Release the slot observed by the most recent [`peek_frame`] and advance
+    /// the read position. Call exactly once per consumed `peek_frame`.
+    pub fn advance(&self) {
+        let hdr = self.header();
+        let pos = hdr.read_pos.load(Ordering::Relaxed);
+        let idx = (pos & self.mask) as usize;
+        // Release the slot for reuse `capacity` laps ahead, then advance.
+        self.seq_at(idx)
+            .store(pos.wrapping_add(self.capacity as u64), Ordering::Release);
+        hdr.read_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
+    }
+
     /// Payload capacity of one slot.
     #[inline]
     pub fn max_payload(&self) -> usize {
@@ -669,6 +711,31 @@ mod tests {
             assert_eq!(&buf[..], &payload[..]);
         }
         assert!(consumer.try_pop_into(&mut buf).is_none());
+    }
+
+    #[test]
+    fn peek_frame_yields_on_wire_bytes_and_advances() {
+        let (_c, _d, producer, consumer) = make(4, segment_size_for(64));
+        // Empty ring → nothing to peek.
+        assert!(consumer.peek_frame().is_none());
+
+        for i in 0..5_000u32 {
+            let len = 1 + (i as usize % 50);
+            let payload = vec![(i & 0xff) as u8; len];
+            assert!(matches!(
+                producer.try_push(i, &payload).unwrap(),
+                PushOutcome::Pushed { .. }
+            ));
+            // Peek must return the exact `[len|traffic_id|payload]` on-wire frame.
+            let frame = consumer.peek_frame().expect("frame ready");
+            let mut expect = encode_header(len as u32, i).to_vec();
+            expect.extend_from_slice(&payload);
+            assert_eq!(frame, &expect[..]);
+            // Peeking again (before advance) returns the same frame.
+            assert_eq!(consumer.peek_frame().unwrap(), &expect[..]);
+            consumer.advance();
+            assert!(consumer.peek_frame().is_none());
+        }
     }
 
     #[test]
