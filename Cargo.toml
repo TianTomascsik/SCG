@@ -13,6 +13,9 @@ members = [
 
     # Client library (Rust core + C/C++ ABI) for the local interfaces
     "crates/scg-client",
+
+    # Benchmark logging/CSV helpers (consumed by the benches repo)
+    "crates/bench_log",
 ]
 resolver = "2"
 

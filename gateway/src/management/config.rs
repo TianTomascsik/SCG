@@ -44,6 +44,12 @@ pub struct GatewayConfig {
     /// to gRPC-over-UDS at `/run/scg/management.sock` with no TCP listener.
     #[serde(default)]
     pub api: Option<ApiConfig>,
+
+    /// Global performance profile controlling how the data plane trades
+    /// throughput against latency. Individual rules may override it via their
+    /// own `perf_profile`. Default: `balanced` (the historical behaviour).
+    #[serde(default)]
+    pub perf_profile: PerfProfile,
 }
 
 /// Management API (gRPC) configuration.
@@ -73,9 +79,34 @@ pub struct ApiConfig {
     pub runtime_dir: String,
 
     /// Default shared-memory ring capacity in bytes, per direction
-    /// (default: 1 MiB).
+    /// (default: 1 MiB). Enlarging the ring trades queueing latency for
+    /// throughput headroom, so it is left to per-deployment config.
     #[serde(default = "default_shm_ring_capacity")]
     pub shm_ring_capacity: usize,
+
+    /// Shared-memory ring data structure to use for new SHM endpoints.
+    /// `byte_stream` (default) is the variable-length packed ring; `slot` is
+    /// the fixed-slot Vyukov ring (cache-line-separated indices, wake-on-empty).
+    #[serde(default)]
+    pub shm_ring_kind: ShmRingKind,
+
+    /// Slot ring only: bytes per segment slot, rounded up to a 64-byte multiple
+    /// (default: 2048). Must be at least the largest expected frame + 8 bytes.
+    #[serde(default = "default_shm_segment_size")]
+    pub shm_segment_size: usize,
+
+    /// Slot ring only: number of segments per ring, rounded up to a power of
+    /// two (default: 512). Fewer/smaller slots lower queueing latency; more/
+    /// larger slots raise throughput headroom.
+    #[serde(default = "default_shm_num_segments")]
+    pub shm_num_segments: usize,
+
+    /// Slot ring only: the gateway→client (client receive) wakeup mechanism.
+    /// `eventfd` (default) is pollable; `futex` has lower wakeup latency and is
+    /// paired with a client-side spin-then-park. The client→gateway direction
+    /// always uses an eventfd so the gateway relay can multiplex it.
+    #[serde(default)]
+    pub shm_g2c_notify: ShmNotify,
 
     /// Maximum number of simultaneously-live local endpoints a single uid may
     /// own. Guards against local resource exhaustion from a buggy or hostile
@@ -98,6 +129,10 @@ impl Default for ApiConfig {
             tcp_addr: None,
             runtime_dir: default_runtime_dir(),
             shm_ring_capacity: default_shm_ring_capacity(),
+            shm_ring_kind: ShmRingKind::default(),
+            shm_segment_size: default_shm_segment_size(),
+            shm_num_segments: default_shm_num_segments(),
+            shm_g2c_notify: ShmNotify::default(),
             max_endpoints_per_uid: default_max_endpoints_per_uid(),
             create_rate_per_min: default_create_rate_per_min(),
         }
@@ -120,6 +155,37 @@ fn default_shm_ring_capacity() -> usize {
     1024 * 1024 // 1 MiB
 }
 
+fn default_shm_segment_size() -> usize {
+    2048
+}
+
+fn default_shm_num_segments() -> usize {
+    512
+}
+
+/// Shared-memory ring data structure selected for SHM endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShmRingKind {
+    /// Variable-length packed byte-stream ring ([`scg_ipc::shm`]).
+    #[default]
+    ByteStream,
+    /// Fixed-slot Vyukov ring ([`scg_ipc::shm_slot`]).
+    Slot,
+}
+
+/// Client-receive (gateway→client) wakeup mechanism for the slot ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShmNotify {
+    /// Pollable `eventfd` notifier (the default, also used by the byte-stream
+    /// ring).
+    #[default]
+    Eventfd,
+    /// Futex on the slot ring's control-page notify word; lower wakeup latency.
+    Futex,
+}
+
 fn default_max_endpoints_per_uid() -> u32 {
     64
 }
@@ -130,6 +196,60 @@ fn default_create_rate_per_min() -> u32 {
 
 fn default_sock_buf_size() -> usize {
     16 * 1024 * 1024 // 16 MiB
+}
+
+// ─── Performance profile ─────────────────────────────────────────────────────
+
+/// High-level performance profile selecting how the data plane balances
+/// throughput against latency. It maps to a set of low-level relay knobs
+/// ([`PerfKnobs`]) resolved per rule: write coalescing via `TCP_CORK` and a
+/// short SHM-ring busy-poll window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfProfile {
+    /// Maximise throughput: coalesce consecutive writes (`TCP_CORK`) and never
+    /// busy-poll.
+    Throughput,
+    /// Minimise latency: flush each write immediately (no cork) and briefly
+    /// busy-poll the SHM ring before blocking on the eventfd.
+    Latency,
+    /// Balanced default: coalesce writes but do not burn CPU busy-polling.
+    #[default]
+    Balanced,
+}
+
+/// Default SHM ring busy-poll window (microseconds) applied by the `latency`
+/// profile when a rule does not set `spin_wait_us` explicitly.
+const LATENCY_SPIN_WAIT_US: u64 = 50;
+
+/// Low-level relay knobs resolved from a [`PerfProfile`] together with a rule's
+/// explicit overrides. Cheap to copy; carried on the rule's hot path.
+#[derive(Debug, Clone, Copy)]
+pub struct PerfKnobs {
+    /// Coalesce consecutive writes with `TCP_CORK` before flushing.
+    pub enable_cork: bool,
+    /// Microseconds to busy-poll the SHM ring before blocking on the eventfd.
+    pub spin_wait_us: u64,
+}
+
+impl PerfKnobs {
+    /// Resolve the effective knobs for a rule. A non-zero `simulated_delay_ms`
+    /// forces cork off (geo-delay needs each packet flushed immediately) and an
+    /// explicit non-zero `spin_wait_us` always wins over the profile default.
+    pub fn resolve(profile: PerfProfile, simulated_delay_ms: u64, spin_wait_us: u64) -> Self {
+        let enable_cork = simulated_delay_ms == 0 && profile != PerfProfile::Latency;
+        let spin_wait_us = if spin_wait_us > 0 {
+            spin_wait_us
+        } else if profile == PerfProfile::Latency {
+            LATENCY_SPIN_WAIT_US
+        } else {
+            0
+        };
+        PerfKnobs {
+            enable_cork,
+            spin_wait_us,
+        }
+    }
 }
 
 // ─── Intercept (firewall self-configuration) ────────────────────────────────
@@ -315,8 +435,14 @@ pub struct RuleConfig {
     /// Busy-poll microseconds before blocking on the SHM ring eventfd/futex.
     /// Only meaningful for `listen_proto: "shm"` rules. A value of 0 (default)
     /// means block immediately; higher values trade CPU for lower wakeup latency.
+    /// When unset, the `latency` perf profile supplies a small default.
     #[serde(default)]
     pub spin_wait_us: u64,
+
+    /// Optional per-rule performance profile override. When unset, the rule
+    /// inherits the gateway-level `perf_profile`.
+    #[serde(default)]
+    pub perf_profile: Option<PerfProfile>,
 
     /// Firewall interception configuration. When present, the gateway will
     /// install iptables rules at startup to redirect matching traffic to this
@@ -327,6 +453,13 @@ pub struct RuleConfig {
 }
 
 impl RuleConfig {
+    /// Resolve this rule's performance knobs, inheriting `global` when the rule
+    /// does not specify its own `perf_profile`.
+    pub fn perf_knobs(&self, global: PerfProfile) -> PerfKnobs {
+        let profile = self.perf_profile.unwrap_or(global);
+        PerfKnobs::resolve(profile, self.simulated_delay_ms, self.spin_wait_us)
+    }
+
     /// Returns the effective security provider name.
     /// Uses `security_provider` if explicitly set (non-default), otherwise
     /// derives from `tls_mode` for backward compatibility.

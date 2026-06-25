@@ -128,7 +128,10 @@ pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Option<std::time::Du
         libc::syscall(
             libc::SYS_futex,
             word.as_ptr(),
-            libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+            // SHARED (not FUTEX_PRIVATE_FLAG): the word lives in a memfd mapped
+            // by both the gateway and the client, so the wait/wake must
+            // rendezvous across processes.
+            libc::FUTEX_WAIT,
             expected,
             ts_ptr,
             std::ptr::null::<u32>(),
@@ -153,7 +156,8 @@ pub fn futex_wake(word: &AtomicU32, count: u32) -> io::Result<u32> {
         libc::syscall(
             libc::SYS_futex,
             word.as_ptr(),
-            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            // SHARED (see `futex_wait`): cross-process wake on shared memory.
+            libc::FUTEX_WAKE,
             count,
             std::ptr::null::<libc::timespec>(),
             std::ptr::null::<u32>(),

@@ -42,6 +42,7 @@ pub fn relay_bidirectional(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
+    enable_cork: bool,
 ) -> io::Result<()> {
     let tls_fd = tls_stream.raw_fd();
     let up_fd = upstream.as_raw_fd();
@@ -50,17 +51,10 @@ pub fn relay_bidirectional(
     upstream.set_nonblocking(true)?;
     set_quickack(up_fd);
     set_quickack(tls_fd);
-    let enable_cork = delay_ms == 0;
 
-    // SAFETY: read() always writes data before it is consumed — zeroing is unnecessary.
-    let mut buf_fwd = Vec::with_capacity(RELAY_BUF_SIZE);
-    unsafe {
-        buf_fwd.set_len(RELAY_BUF_SIZE);
-    }
-    let mut buf_rev = Vec::with_capacity(RELAY_BUF_SIZE);
-    unsafe {
-        buf_rev.set_len(RELAY_BUF_SIZE);
-    }
+    // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
+    let mut buf_fwd = vec![0u8; RELAY_BUF_SIZE];
+    let mut buf_rev = vec![0u8; RELAY_BUF_SIZE];
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -143,15 +137,9 @@ pub fn relay_tls_to_udp(
     set_nonblocking_fd(tls_fd);
     upstream.set_nonblocking(true)?;
 
-    // SAFETY: read() always writes data before it is consumed — zeroing is unnecessary.
-    let mut tls_buf = Vec::with_capacity(RELAY_BUF_SIZE);
-    unsafe {
-        tls_buf.set_len(RELAY_BUF_SIZE);
-    }
-    let mut udp_buf = Vec::with_capacity(UDP_BUF_SIZE);
-    unsafe {
-        udp_buf.set_len(UDP_BUF_SIZE);
-    }
+    // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
+    let mut tls_buf = vec![0u8; RELAY_BUF_SIZE];
+    let mut udp_buf = vec![0u8; UDP_BUF_SIZE];
 
     let mut batch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
@@ -231,6 +219,7 @@ pub fn relay_encrypt_bidirectional(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
+    enable_cork: bool,
 ) -> io::Result<()> {
     let client_fd = client.as_raw_fd();
     let tls_fd = upstream.raw_fd();
@@ -239,17 +228,10 @@ pub fn relay_encrypt_bidirectional(
     set_nonblocking_fd(tls_fd);
     set_quickack(client_fd);
     set_quickack(tls_fd);
-    let enable_cork = delay_ms == 0;
 
-    // SAFETY: read() always writes data before it is consumed — zeroing is unnecessary.
-    let mut buf_fwd = Vec::with_capacity(RELAY_BUF_SIZE);
-    unsafe {
-        buf_fwd.set_len(RELAY_BUF_SIZE);
-    }
-    let mut buf_rev = Vec::with_capacity(RELAY_BUF_SIZE);
-    unsafe {
-        buf_rev.set_len(RELAY_BUF_SIZE);
-    }
+    // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
+    let mut buf_fwd = vec![0u8; RELAY_BUF_SIZE];
+    let mut buf_rev = vec![0u8; RELAY_BUF_SIZE];
     let mut client_w = client.try_clone()?;
     let mut client_r = client;
 

@@ -120,6 +120,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let tls_params = tls_params.clone();
         let qos = ctx.qos;
+        let enable_cork = ctx.perf.enable_cork;
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
@@ -143,6 +144,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 simulated_delay_ms,
                 &tls_params,
                 qos,
+                enable_cork,
             );
 
             if let Err(e) = result {
@@ -183,6 +185,7 @@ pub(crate) fn handle_tcp_encrypt(
     delay_ms: u64,
     params: &TlsSecurityParams,
     qos: QosPolicy,
+    enable_cork: bool,
 ) -> io::Result<()> {
     // Connect to upstream with exponential backoff retry
     let upstream_tcp = connect_with_retry(
@@ -246,7 +249,7 @@ pub(crate) fn handle_tcp_encrypt(
 
             let ulp = get_tcp_ulp(&upstream_tcp).unwrap_or_default();
             let ktls_active = ulp.starts_with("tls");
-            debug!(
+            info!(
                 "[{}] kTLS handshake OK ({:.2} ms, ULP={}, active={})",
                 rule_name,
                 hs_start.elapsed().as_secs_f64() * 1000.0,
@@ -290,6 +293,7 @@ pub(crate) fn handle_tcp_encrypt(
                 conn_metrics,
                 shutdown,
                 delay_ms,
+                enable_cork,
             )?;
         }
     }

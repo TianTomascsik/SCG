@@ -311,6 +311,44 @@ impl RingConsumer {
         Some((traffic_id, payload))
     }
 
+    /// Try to dequeue one frame into a caller-owned buffer, returning the
+    /// frame's `traffic_id`.
+    ///
+    /// This is the allocation-free sibling of [`try_pop`](Self::try_pop): the
+    /// payload is written into `dst` (which is resized to the frame length)
+    /// instead of a freshly allocated `Vec`, so a hot relay loop can reuse one
+    /// buffer across frames. The same untrusted-producer bounds checks apply.
+    pub fn try_pop_into(&self, dst: &mut Vec<u8>) -> Option<u32> {
+        let ix = self.indices();
+        let read = ix.read_idx.load(Ordering::Relaxed);
+        let write = ix.write_idx.load(Ordering::Acquire);
+        let avail_raw = write.wrapping_sub(read);
+        let avail = std::cmp::min(avail_raw as usize, self.cap);
+        if avail < FRAME_HEADER_LEN {
+            return None;
+        }
+
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        let off = (read % self.cap as u64) as usize;
+        let next_off = self.read_wrapping(off, &mut header);
+        let (len, traffic_id) = decode_header(&header);
+        let len = len as usize;
+        if len > self.cap - FRAME_HEADER_LEN || avail < FRAME_HEADER_LEN + len {
+            return None;
+        }
+
+        // Resize without zero-filling the bytes we are about to overwrite.
+        dst.clear();
+        dst.reserve(len);
+        unsafe {
+            self.read_wrapping_ptr(next_off, dst.as_mut_ptr(), len);
+            dst.set_len(len);
+        }
+        ix.read_idx
+            .store(read.wrapping_add((FRAME_HEADER_LEN + len) as u64), Ordering::Release);
+        Some(traffic_id)
+    }
+
     fn read_wrapping(&self, off: usize, dst: &mut [u8]) -> usize {
         let n = dst.len();
         if n == 0 {
@@ -324,6 +362,22 @@ impl RingConsumer {
             }
         }
         (off + n) % self.cap
+    }
+
+    /// Raw-pointer variant of [`read_wrapping`](Self::read_wrapping) used by
+    /// [`try_pop_into`](Self::try_pop_into) to fill uninitialized capacity.
+    ///
+    /// # Safety
+    /// `dst` must point to at least `n` writable bytes.
+    unsafe fn read_wrapping_ptr(&self, off: usize, dst: *mut u8, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let first = std::cmp::min(n, self.cap - off);
+        std::ptr::copy_nonoverlapping(self.data.add(off), dst, first);
+        if n > first {
+            std::ptr::copy_nonoverlapping(self.data, dst.add(first), n - first);
+        }
     }
 }
 
@@ -464,6 +518,32 @@ mod tests {
             assert_eq!(tid, i);
             assert_eq!(got, payload);
         }
+    }
+
+    #[test]
+    fn try_pop_into_matches_try_pop() {
+        let cap = 64usize;
+        let control = buf(SHM_CONTROL_SIZE);
+        let data = buf(cap);
+        unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+        let consumer = unsafe { RingConsumer::new(&ctl.c2g, data.as_ptr(), cap) };
+
+        // Empty ring yields None.
+        let mut popbuf: Vec<u8> = Vec::new();
+        assert!(consumer.try_pop_into(&mut popbuf).is_none());
+
+        // Reuse one buffer across many wrapping frames of varying length.
+        for i in 0..1000u32 {
+            let len = 1 + (i as usize % 24);
+            let payload = vec![(i & 0xff) as u8; len];
+            assert!(producer.try_push(i, &payload).unwrap());
+            let tid = consumer.try_pop_into(&mut popbuf).unwrap();
+            assert_eq!(tid, i);
+            assert_eq!(&popbuf[..], &payload[..]);
+        }
+        assert!(consumer.try_pop_into(&mut popbuf).is_none());
     }
 
     #[test]

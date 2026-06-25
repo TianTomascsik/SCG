@@ -142,6 +142,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let app_protocol = ctx.app_protocol.clone();
         let qos = ctx.qos;
+        let enable_cork = ctx.perf.enable_cork;
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
@@ -168,6 +169,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
                 simulated_delay_ms,
                 &app_protocol,
                 qos,
+                enable_cork,
             );
 
             if let Err(e) = result {
@@ -212,6 +214,7 @@ pub(crate) fn handle_tcp_decrypt(
     delay_ms: u64,
     app_protocol: &str,
     qos: QosPolicy,
+    enable_cork: bool,
 ) -> io::Result<()> {
     // ── TLS handshake ────────────────────────────────────────────────────────
     let hs_start = Instant::now();
@@ -246,14 +249,16 @@ pub(crate) fn handle_tcp_decrypt(
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS accept: {}", e)))?;
 
             let ulp = get_tcp_ulp(&stream).unwrap_or_default();
-            debug!(
-                "[{}] kTLS accept from {} ({:.2} ms, ULP={})",
+            let ktls_active = ulp.starts_with("tls");
+            info!(
+                "[{}] kTLS accept from {} ({:.2} ms, ULP={}, active={})",
                 rule_name,
                 peer_addr,
                 hs_start.elapsed().as_secs_f64() * 1000.0,
                 ulp,
+                ktls_active,
             );
-            if !ulp.starts_with("tls") {
+            if !ktls_active {
                 warn!(
                     "[{}] WARNING: kTLS may not be active.{}",
                     rule_name,
@@ -320,6 +325,7 @@ pub(crate) fn handle_tcp_decrypt(
                     conn_metrics,
                     shutdown,
                     delay_ms,
+                    enable_cork,
                 ),
             }
         }

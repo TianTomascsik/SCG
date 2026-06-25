@@ -119,12 +119,17 @@ impl std::error::Error for HelloError {}
 pub const SHM_OFFER_MAGIC: [u8; 4] = *b"SCGO";
 
 /// Size of the SHM offer payload sent alongside the descriptors.
-pub const SHM_OFFER_LEN: usize = 4 + 1 + 1 + 1 + 1 + 8 + 8; // = 24
+pub const SHM_OFFER_LEN: usize = 4 + 1 + 1 + 1 + 1 + 8 + 8 + 4 + 4; // = 32
 
 /// Notify byte: pollable `eventfd` pair (mirrors proto `NOTIFY_EVENTFD`).
 pub const SHM_NOTIFY_EVENTFD: u8 = 0;
 /// Notify byte: futex on the control-page notify word (proto `NOTIFY_FUTEX`).
 pub const SHM_NOTIFY_FUTEX: u8 = 1;
+
+/// Ring kind byte: variable-length byte-stream ring ([`crate::shm`]).
+pub const SHM_RING_BYTESTREAM: u8 = 0;
+/// Ring kind byte: fixed-slot Vyukov ring ([`crate::shm_slot`]).
+pub const SHM_RING_SLOT: u8 = 1;
 
 /// Index of the control-page memfd in the `SCM_RIGHTS` descriptor array.
 pub const SHM_FD_CONTROL: usize = 0;
@@ -147,22 +152,32 @@ pub const SHM_FD_EVT_G2C: usize = 4;
 /// Layout (fixed [`SHM_OFFER_LEN`] bytes):
 ///
 /// ```text
-/// ┌──────────┬─────────┬─────────┬─────────┬─────────┬───────────┬───────────┐
-/// │ magic[4] │ ver: u8 │ notify  │ n_fds   │ rsv: u8 │ cap_c2g:8 │ cap_g2c:8 │
-/// └──────────┴─────────┴─────────┴─────────┴─────────┴───────────┴───────────┘
+/// ┌──────────┬─────────┬─────────┬─────────┬───────────┬───────────┬───────────┬───────────┬──────────────┐
+/// │ magic[4] │ ver: u8 │ notify  │ n_fds   │ ring_kind │ cap_c2g:8 │ cap_g2c:8 │ capacity:4│ segment_sz:4 │
+/// └──────────┴─────────┴─────────┴─────────┴───────────┴───────────┴───────────┴───────────┴──────────────┘
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShmOffer {
     /// Handshake protocol version (matches [`HELLO_VERSION`]).
     pub version: u8,
     /// Notify mechanism: [`SHM_NOTIFY_EVENTFD`] or [`SHM_NOTIFY_FUTEX`].
+    /// Selects the gateway→client (consumer-side) wakeup; the client→gateway
+    /// direction always uses an eventfd so the gateway can multiplex it.
     pub notify: u8,
     /// Number of descriptors passed in the control message (3 or 5).
     pub n_fds: u8,
-    /// Capacity in bytes of the client→gateway data ring.
+    /// Ring kind: [`SHM_RING_BYTESTREAM`] or [`SHM_RING_SLOT`].
+    pub ring_kind: u8,
+    /// Capacity in bytes of the client→gateway data region.
     pub cap_c2g: u64,
-    /// Capacity in bytes of the gateway→client data ring.
+    /// Capacity in bytes of the gateway→client data region.
     pub cap_g2c: u64,
+    /// Slot ring only: number of segments per ring (power of two). Zero for the
+    /// byte-stream ring.
+    pub capacity: u32,
+    /// Slot ring only: bytes per segment slot (multiple of 64). Zero for the
+    /// byte-stream ring.
+    pub segment_size: u32,
 }
 
 impl ShmOffer {
@@ -173,9 +188,11 @@ impl ShmOffer {
         buf[4] = self.version;
         buf[5] = self.notify;
         buf[6] = self.n_fds;
-        buf[7] = 0; // reserved
+        buf[7] = self.ring_kind;
         buf[8..16].copy_from_slice(&self.cap_c2g.to_le_bytes());
         buf[16..24].copy_from_slice(&self.cap_g2c.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.capacity.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.segment_size.to_le_bytes());
         buf
     }
 
@@ -190,12 +207,17 @@ impl ShmOffer {
         }
         let cap_c2g = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         let cap_g2c = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let capacity = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        let segment_size = u32::from_le_bytes(buf[28..32].try_into().unwrap());
         Ok(ShmOffer {
             version,
             notify: buf[5],
             n_fds: buf[6],
+            ring_kind: buf[7],
             cap_c2g,
             cap_g2c,
+            capacity,
+            segment_size,
         })
     }
 }
@@ -237,11 +259,30 @@ mod tests {
             version: HELLO_VERSION,
             notify: SHM_NOTIFY_EVENTFD,
             n_fds: 5,
+            ring_kind: SHM_RING_BYTESTREAM,
             cap_c2g: 0x0011_2233_4455_6677,
             cap_g2c: 0x8899_aabb_ccdd_eeff,
+            capacity: 0,
+            segment_size: 0,
         };
         let wire = offer.encode();
         assert_eq!(wire.len(), SHM_OFFER_LEN);
+        assert_eq!(ShmOffer::decode(&wire).unwrap(), offer);
+    }
+
+    #[test]
+    fn shm_offer_slot_roundtrip() {
+        let offer = ShmOffer {
+            version: HELLO_VERSION,
+            notify: SHM_NOTIFY_FUTEX,
+            n_fds: 5,
+            ring_kind: SHM_RING_SLOT,
+            cap_c2g: 256 * 1024,
+            cap_g2c: 256 * 1024,
+            capacity: 256,
+            segment_size: 1024,
+        };
+        let wire = offer.encode();
         assert_eq!(ShmOffer::decode(&wire).unwrap(), offer);
     }
 
@@ -251,8 +292,11 @@ mod tests {
             version: HELLO_VERSION,
             notify: SHM_NOTIFY_FUTEX,
             n_fds: 3,
+            ring_kind: SHM_RING_BYTESTREAM,
             cap_c2g: 4096,
             cap_g2c: 4096,
+            capacity: 0,
+            segment_size: 0,
         }
         .encode();
         wire[0] = b'X';

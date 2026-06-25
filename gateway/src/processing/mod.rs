@@ -57,6 +57,8 @@ pub struct RuleContext {
     /// AU1/AU2 handshake + ALEPKT framing, the default) or `"raw"` (4-byte LE
     /// length-prefix, no handshake).
     pub app_protocol: String,
+    /// Resolved performance knobs (cork / busy-poll) for this rule's data path.
+    pub perf: crate::management::config::PerfKnobs,
     /// Shared connection thread pool (TCP encrypt/decrypt handlers).
     pub conn_pool: Arc<ConnectionPool>,
 }
@@ -292,6 +294,7 @@ pub fn start_single_rule(
         simulated_delay_ms: rule.simulated_delay_ms,
         protocol_version: rule.protocol_version.clone(),
         app_protocol: app_protocol.to_string(),
+        perf: rule.perf_knobs(config.perf_profile),
         conn_pool,
     };
 

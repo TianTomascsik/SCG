@@ -13,11 +13,16 @@
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
-use scg_ipc::handshake::{ShmOffer, SHM_NOTIFY_EVENTFD};
+use scg_ipc::handshake::{ShmOffer, SHM_NOTIFY_EVENTFD, SHM_NOTIFY_FUTEX, SHM_RING_SLOT};
+use scg_ipc::notify::futex_wait;
 use scg_ipc::os::{self, MapProt, Mapping};
 use scg_ipc::shm::{client_rings, RingConsumer, RingProducer, SHM_CONTROL_SIZE};
+use scg_ipc::shm_slot::{
+    client_slot_rings, slot_control_size, PushOutcome, SlotConsumer, SlotProducer,
+};
 use scg_ipc::{
     EventFd, CapabilityToken, Hello, Role, SHM_FD_CONTROL, SHM_FD_DATA_C2G, SHM_FD_DATA_G2C,
     SHM_FD_EVT_C2G, SHM_FD_EVT_G2C, SHM_OFFER_LEN,
@@ -29,6 +34,73 @@ use crate::poll::poll_readable;
 /// Back-off applied when the outbound ring is momentarily full.
 const SEND_FULL_BACKOFF: Duration = Duration::from_micros(50);
 
+/// Busy-poll window (microseconds) on the futex receive path before parking.
+const FUTEX_SPIN_US: u64 = 15;
+
+/// Maximum futex park before re-checking the ring (covers any missed wake).
+const FUTEX_PARK: Duration = Duration::from_millis(50);
+
+/// The two interchangeable client-side ring implementations.
+enum ClientBackend {
+    /// Variable-length packed byte-stream ring.
+    ByteStream {
+        producer: RingProducer,
+        consumer: RingConsumer,
+    },
+    /// Fixed-slot Vyukov ring.
+    Slot {
+        producer: SlotProducer,
+        consumer: SlotConsumer,
+    },
+}
+
+impl ClientBackend {
+    /// Try to push one frame to the gateway. `Ok(true)` on success, `Ok(false)`
+    /// if the ring is full, `Err` if the frame can never fit.
+    #[inline]
+    fn try_push(&self, traffic_id: u32, data: &[u8]) -> Result<bool> {
+        match self {
+            ClientBackend::ByteStream { producer, .. } => producer
+                .try_push(traffic_id, data)
+                .map_err(|_| ScgError::FrameTooLarge),
+            ClientBackend::Slot { producer, .. } => match producer
+                .try_push(traffic_id, data)
+                .map_err(|_| ScgError::FrameTooLarge)?
+            {
+                PushOutcome::Pushed { .. } => Ok(true),
+                PushOutcome::Full => Ok(false),
+            },
+        }
+    }
+
+    /// Pop one frame from the gateway, if any.
+    #[inline]
+    fn try_pop(&self) -> Option<(u32, Vec<u8>)> {
+        match self {
+            ClientBackend::ByteStream { consumer, .. } => consumer.try_pop(),
+            ClientBackend::Slot { consumer, .. } => consumer.try_pop(),
+        }
+    }
+
+    /// Whether the gateway→client ring currently appears empty.
+    #[inline]
+    fn consumer_is_empty(&self) -> bool {
+        match self {
+            ClientBackend::ByteStream { consumer, .. } => consumer.is_empty(),
+            ClientBackend::Slot { consumer, .. } => consumer.is_empty(),
+        }
+    }
+
+    /// The gateway→client futex word (slot ring only).
+    #[inline]
+    fn g2c_notify_word(&self) -> Option<&AtomicU32> {
+        match self {
+            ClientBackend::Slot { consumer, .. } => Some(consumer.notify_word()),
+            ClientBackend::ByteStream { .. } => None,
+        }
+    }
+}
+
 /// A connected shared-memory endpoint.
 pub struct ShmClient {
     // The control socket must stay open for the lifetime of the session: the
@@ -38,8 +110,9 @@ pub struct ShmClient {
     _control_map: Mapping,
     _data_c2g_map: Mapping,
     _data_g2c_map: Mapping,
-    producer: RingProducer,
-    consumer: RingConsumer,
+    backend: ClientBackend,
+    /// Gateway→client wakeup mechanism negotiated in the offer.
+    notify: u8,
     c2g_evt: EventFd,
     g2c_evt: EventFd,
 }
@@ -73,8 +146,7 @@ impl ShmClient {
         let offer = ShmOffer::decode(&payload)
             .map_err(|e| ScgError::BadOffer(format!("decode failed: {e}")))?;
 
-        if offer.notify != SHM_NOTIFY_EVENTFD {
-            // v1 clients only implement the eventfd wakeup path.
+        if offer.notify != SHM_NOTIFY_EVENTFD && offer.notify != SHM_NOTIFY_FUTEX {
             return Err(ScgError::BadOffer(format!(
                 "unsupported notify mode {}",
                 offer.notify
@@ -98,7 +170,12 @@ impl ShmClient {
 
         let cap_c2g = offer.cap_c2g as usize;
         let cap_g2c = offer.cap_g2c as usize;
-        let ctl_len = round_up(SHM_CONTROL_SIZE, page_size());
+        let is_slot = offer.ring_kind == SHM_RING_SLOT;
+        let ctl_len = if is_slot {
+            round_up(slot_control_size(offer.capacity as usize), page_size())
+        } else {
+            round_up(SHM_CONTROL_SIZE, page_size())
+        };
 
         // Map the three regions. On any failure the remaining memfds and the
         // eventfds are closed before returning.
@@ -126,16 +203,36 @@ impl ShmClient {
 
         // SAFETY: the mappings are live and at least the stated lengths;
         // `data_g2c` is a read-only mapping, matching the consumer ring.
-        let (producer, consumer) = unsafe {
-            client_rings(
-                control_map.as_ptr(),
-                ctl_len,
-                data_c2g_map.as_ptr(),
-                cap_c2g,
-                data_g2c_map.as_ptr() as *const u8,
-                cap_g2c,
-            )
-            .map_err(|e| ScgError::BadOffer(format!("ring geometry: {e}")))?
+        let backend = if is_slot {
+            let capacity = offer.capacity as usize;
+            let segment_size = offer.segment_size as usize;
+            let (producer, consumer) = unsafe {
+                client_slot_rings(
+                    control_map.as_ptr(),
+                    ctl_len,
+                    capacity,
+                    segment_size,
+                    data_c2g_map.as_ptr(),
+                    cap_c2g,
+                    data_g2c_map.as_ptr() as *const u8,
+                    cap_g2c,
+                )
+                .map_err(|e| ScgError::BadOffer(format!("slot ring geometry: {e}")))?
+            };
+            ClientBackend::Slot { producer, consumer }
+        } else {
+            let (producer, consumer) = unsafe {
+                client_rings(
+                    control_map.as_ptr(),
+                    ctl_len,
+                    data_c2g_map.as_ptr(),
+                    cap_c2g,
+                    data_g2c_map.as_ptr() as *const u8,
+                    cap_g2c,
+                )
+                .map_err(|e| ScgError::BadOffer(format!("ring geometry: {e}")))?
+            };
+            ClientBackend::ByteStream { producer, consumer }
         };
 
         // SAFETY: each eventfd descriptor was just received with CLOEXEC and is
@@ -148,8 +245,8 @@ impl ShmClient {
             _control_map: control_map,
             _data_c2g_map: data_c2g_map,
             _data_g2c_map: data_g2c_map,
-            producer,
-            consumer,
+            backend,
+            notify: offer.notify,
             c2g_evt,
             g2c_evt,
         })
@@ -174,42 +271,63 @@ impl ShmClient {
     /// signal (such as SESHAT's sender loop) should use this form so they can
     /// observe cancellation instead of blocking forever after a peer exits.
     pub fn try_send(&mut self, traffic_id: u32, data: &[u8]) -> Result<bool> {
-        match self.producer.try_push(traffic_id, data) {
-            Ok(true) => {
-                self.c2g_evt.signal()?;
-                Ok(true)
-            }
-            Ok(false) => {
-                // Wake the gateway in case it is sleeping before it drains.
-                self.c2g_evt.signal()?;
-                Ok(false)
-            }
-            Err(_) => Err(ScgError::FrameTooLarge),
-        }
+        let pushed = self.backend.try_push(traffic_id, data)?;
+        // Wake the gateway whether or not we pushed (it may be sleeping before
+        // it drains). The client→gateway direction always uses an eventfd.
+        self.c2g_evt.signal()?;
+        Ok(pushed)
     }
 
     /// Block until one framed message is available from the gateway.
     pub fn recv(&mut self) -> Result<(u32, Vec<u8>)> {
         loop {
-            if let Some(frame) = self.consumer.try_pop() {
+            if let Some(frame) = self.backend.try_pop() {
                 return Ok(frame);
             }
-            // Wait for the gateway to signal new data, then drain the counter.
-            poll_readable(self.g2c_evt.as_raw_fd(), None)?;
-            let _ = self.g2c_evt.drain();
+            self.wait_g2c(None)?;
         }
     }
 
     /// Wait up to `timeout` for a message. Returns `Ok(None)` on timeout.
     pub fn recv_timeout(&mut self, timeout: Option<Duration>) -> Result<Option<(u32, Vec<u8>)>> {
-        if let Some(frame) = self.consumer.try_pop() {
+        if let Some(frame) = self.backend.try_pop() {
             return Ok(Some(frame));
         }
-        if !poll_readable(self.g2c_evt.as_raw_fd(), timeout)? {
+        if !self.wait_g2c(timeout)? {
             return Ok(None);
         }
+        Ok(self.backend.try_pop())
+    }
+
+    /// Wait for a gateway→client notification using the negotiated mechanism.
+    /// Returns `Ok(true)` if it may now have data, `Ok(false)` on timeout.
+    fn wait_g2c(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        if self.notify == SHM_NOTIFY_FUTEX {
+            if let Some(word) = self.backend.g2c_notify_word() {
+                // Spin briefly so a closely-following producer is caught without
+                // a syscall, then park on the futex until the word changes.
+                let observed = word.load(Ordering::Acquire);
+                let deadline = Instant::now() + Duration::from_micros(FUTEX_SPIN_US);
+                while self.backend.consumer_is_empty() && Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                if !self.backend.consumer_is_empty() {
+                    return Ok(true);
+                }
+                let park = match timeout {
+                    Some(t) => t.min(FUTEX_PARK),
+                    None => FUTEX_PARK,
+                };
+                let _ = futex_wait(word, observed, Some(park));
+                return Ok(true);
+            }
+        }
+        // eventfd path.
+        if !poll_readable(self.g2c_evt.as_raw_fd(), timeout)? {
+            return Ok(false);
+        }
         let _ = self.g2c_evt.drain();
-        Ok(self.consumer.try_pop())
+        Ok(true)
     }
 }
 

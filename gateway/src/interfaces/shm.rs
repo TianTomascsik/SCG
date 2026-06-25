@@ -25,17 +25,25 @@
 //! peer gateway.
 
 use crate::interfaces::endpoint::{accept_tls_upstream, authenticate_peer, connect_tls_upstream};
-use crate::management::config::{Direction, QosPolicy, TlsMode};
+use crate::management::config::{Direction, QosPolicy, ShmNotify, ShmRingKind, TlsMode};
 use crate::networking::socket_manager::{set_nodelay, set_nonblocking_fd};
 use crate::security::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::security::RELAY_BUF_SIZE;
 
 use scg_ipc::frame::{encode_into, FrameDecoder, DEFAULT_MAX_FRAME_LEN};
-use scg_ipc::handshake::{ShmOffer, HELLO_VERSION, SHM_NOTIFY_EVENTFD};
-use scg_ipc::notify::EventFd;
+use scg_ipc::handshake::{
+    ShmOffer, HELLO_VERSION, SHM_NOTIFY_EVENTFD, SHM_NOTIFY_FUTEX, SHM_RING_BYTESTREAM,
+    SHM_RING_SLOT,
+};
+use scg_ipc::notify::{futex_wake, EventFd};
 use scg_ipc::os::{self, MapProt, Mapping};
 use scg_ipc::shm::{
-    gateway_rings, RingConsumer, RingProducer, ShmControl, SHM_CONTROL_SIZE, SHM_FLAG_SEALED_G2C,
+    gateway_rings, RingConsumer, RingProducer, ShmControl, ShmError, SHM_CONTROL_SIZE,
+    SHM_FLAG_SEALED_G2C,
+};
+use scg_ipc::shm_slot::{
+    gateway_slot_rings, init_slot_control, ring_data_bytes, segment_size_for, slot_control_size,
+    PushOutcome, SlotConsumer, SlotProducer, CACHE_LINE,
 };
 use scg_ipc::token::CapabilityToken;
 
@@ -47,7 +55,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
 /// Everything a SHM endpoint thread needs to authenticate a client, hand it the
@@ -77,6 +85,17 @@ pub struct ShmEndpointTask {
     pub cap_c2g: usize,
     /// Capacity in bytes of the gateway→client ring (rounded up to a page).
     pub cap_g2c: usize,
+    /// SHM ring busy-poll window (microseconds) before blocking on the eventfd.
+    /// Resolved from the rule's perf profile; 0 means block immediately.
+    pub spin_wait_us: u64,
+    /// SHM ring data structure to use (byte-stream or fixed-slot).
+    pub ring_kind: ShmRingKind,
+    /// Slot ring only: bytes per segment (rounded up to a 64-byte multiple).
+    pub segment_size: usize,
+    /// Slot ring only: number of segments per ring (rounded up to a power of two).
+    pub num_segments: usize,
+    /// Slot ring only: gateway→client wakeup mechanism.
+    pub g2c_notify: ShmNotify,
     /// uids permitted to connect (from the rule's `allowed_uids`).
     pub allowed_uids: Arc<Vec<u32>>,
     /// Optional pid allow-list (from the rule's `allowed_pids`).
@@ -197,7 +216,7 @@ pub fn run_shm_endpoint(task: ShmEndpointTask) {
 /// Create the shared-memory segment, hand its descriptors to the client, then
 /// relay framed traffic between the rings and the TLS upstream.
 fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
-    let mut seg = match ShmSegment::create(task.cap_c2g, task.cap_g2c) {
+    let mut seg = match ShmSegment::create(task) {
         Ok(s) => s,
         Err(e) => {
             error!("[{}] failed to create SHM segment: {e}", task.label);
@@ -206,13 +225,17 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
     };
 
     // Offer the descriptors to the client over the control socket. The payload
-    // carries the geometry; the memfds and eventfds travel via SCM_RIGHTS.
+    // carries the geometry and ring kind; the memfds and eventfds travel via
+    // SCM_RIGHTS.
     let offer = ShmOffer {
         version: HELLO_VERSION,
-        notify: SHM_NOTIFY_EVENTFD,
+        notify: seg.g2c_notify,
         n_fds: 5,
+        ring_kind: seg.ring_kind,
         cap_c2g: seg.cap_c2g as u64,
         cap_g2c: seg.cap_g2c as u64,
+        capacity: seg.capacity,
+        segment_size: seg.segment_size,
     };
     let fds = [
         seg.control_fd,
@@ -266,7 +289,14 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
         }
     };
 
-    if let Err(e) = relay(&task.label, &mut seg, &mut control, &mut tls, &task.shutdown) {
+    if let Err(e) = relay(
+        &task.label,
+        &mut seg,
+        &mut control,
+        &mut tls,
+        &task.shutdown,
+        task.spin_wait_us,
+    ) {
         if e.kind() != io::ErrorKind::UnexpectedEof {
             warn!("[{}] relay ended with error: {e}", task.label);
         }
@@ -280,6 +310,7 @@ fn relay(
     control: &mut UnixStream,
     tls: &mut ProxyStream,
     shutdown: &AtomicBool,
+    spin_wait_us: u64,
 ) -> io::Result<()> {
     let tls_fd = tls.raw_fd();
     set_nonblocking_fd(tls_fd);
@@ -293,10 +324,29 @@ fn relay(
 
     let mut decoder = FrameDecoder::new(DEFAULT_MAX_FRAME_LEN);
     let mut rbuf = vec![0u8; RELAY_BUF_SIZE];
+    // Reused scratch buffer for coalescing client→gateway frames into a single
+    // TLS write (avoids a per-message allocation + syscall).
+    let mut framed: Vec<u8> = Vec::with_capacity(RELAY_BUF_SIZE);
+    // Reused payload buffer for draining the c2g ring (avoids a per-frame
+    // allocation in the hot path; see `RingConsumer::try_pop_into`).
+    let mut popbuf: Vec<u8> = Vec::with_capacity(DEFAULT_MAX_FRAME_LEN.min(RELAY_BUF_SIZE));
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Latency profile: briefly busy-poll the c2g ring before blocking, so
+        // new client data is serviced without waiting for the (possibly
+        // coalesced) eventfd wakeup. Falls back to blocking when idle.
+        if spin_wait_us > 0 && seg.consumer_is_empty() {
+            let deadline = Instant::now() + Duration::from_micros(spin_wait_us);
+            while seg.consumer_is_empty() && Instant::now() < deadline {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
         }
 
         let tls_pending = tls.ssl_pending() > 0;
@@ -310,10 +360,14 @@ fn relay(
         }
 
         // client -> gateway: drain the c2g ring unconditionally (covers any
-        // coalesced/lost eventfd signal) and frame the payloads into TLS.
-        while let Some((traffic_id, data)) = seg.consumer.try_pop() {
-            let mut framed = Vec::with_capacity(8 + data.len());
-            encode_into(&mut framed, traffic_id, &data);
+        // coalesced/lost eventfd signal), coalescing all available frames into
+        // one buffer and forwarding them with a single TLS write to amortise
+        // the per-record syscall/crypto cost.
+        framed.clear();
+        while let Some(traffic_id) = seg.drain_c2g_into(&mut popbuf) {
+            encode_into(&mut framed, traffic_id, &popbuf);
+        }
+        if !framed.is_empty() {
             write_all_nb_proxy(tls, &framed)?;
         }
 
@@ -358,20 +412,19 @@ fn push_g2c(
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     loop {
-        match seg.producer.try_push(traffic_id, data) {
-            Ok(true) => {
-                let _ = seg.g2c_evt.signal();
+        match seg.push_g2c_frame(traffic_id, data) {
+            Ok(Some(was_empty)) => {
+                seg.signal_g2c(was_empty);
                 return Ok(());
             }
-            Ok(false) => {
+            Ok(None) => {
                 if shutdown.load(Ordering::Relaxed) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         "shutdown while gateway->client ring full",
                     ));
                 }
                 // Nudge the client in case it is waiting, then back off.
-                let _ = seg.g2c_evt.signal();
+                seg.signal_g2c(true);
                 std::thread::sleep(RING_FULL_BACKOFF);
             }
             Err(e) => {
@@ -382,6 +435,20 @@ fn push_g2c(
             }
         }
     }
+}
+
+/// The two interchangeable ring implementations behind a SHM segment.
+enum RingBackend {
+    /// Variable-length packed byte-stream ring.
+    ByteStream {
+        consumer: RingConsumer,
+        producer: RingProducer,
+    },
+    /// Fixed-slot Vyukov ring.
+    Slot {
+        consumer: SlotConsumer,
+        producer: SlotProducer,
+    },
 }
 
 /// Owns the gateway side of one SHM segment: the mappings, the gateway rings,
@@ -396,10 +463,17 @@ struct ShmSegment {
     _control_map: Mapping,
     _data_c2g_map: Mapping,
     _data_g2c_map: Mapping,
-    consumer: RingConsumer,
-    producer: RingProducer,
+    backend: RingBackend,
     cap_c2g: usize,
     cap_g2c: usize,
+    /// Ring kind advertised to the client ([`SHM_RING_BYTESTREAM`]/[`SHM_RING_SLOT`]).
+    ring_kind: u8,
+    /// Slot ring only: number of segments per ring (0 for byte-stream).
+    capacity: u32,
+    /// Slot ring only: bytes per segment (0 for byte-stream).
+    segment_size: u32,
+    /// Gateway→client wakeup mechanism ([`SHM_NOTIFY_EVENTFD`]/[`SHM_NOTIFY_FUTEX`]).
+    g2c_notify: u8,
     control_fd: RawFd,
     data_c2g_fd: RawFd,
     data_g2c_fd: RawFd,
@@ -409,14 +483,36 @@ struct ShmSegment {
 
 impl ShmSegment {
     /// Allocate and initialise the control page, both data rings, and the two
-    /// eventfds. The gateway→client data memfd is sealed `F_SEAL_FUTURE_WRITE`
-    /// after the gateway takes its writable mapping, so the client can only map
-    /// it read-only.
-    fn create(cap_c2g: usize, cap_g2c: usize) -> io::Result<ShmSegment> {
+    /// eventfds for the ring kind requested by `task`. The gateway→client data
+    /// memfd is sealed `F_SEAL_FUTURE_WRITE` after the gateway takes its
+    /// writable mapping, so the client can only map it read-only. (For the slot
+    /// ring the consumer writes only the control-page sequence array, never the
+    /// payload region, so the seal still holds.)
+    fn create(task: &ShmEndpointTask) -> io::Result<ShmSegment> {
         let page = page_size();
-        let cap_c2g = round_up(cap_c2g.max(page), page);
-        let cap_g2c = round_up(cap_g2c.max(page), page);
-        let ctl_len = round_up(SHM_CONTROL_SIZE, page);
+
+        // Resolve geometry and the control-page size for the chosen ring kind.
+        let (ring_kind, capacity, segment_size, cap_c2g, cap_g2c, ctl_len) =
+            match task.ring_kind {
+                ShmRingKind::ByteStream => {
+                    let c2g = round_up(task.cap_c2g.max(page), page);
+                    let g2c = round_up(task.cap_g2c.max(page), page);
+                    let ctl = round_up(SHM_CONTROL_SIZE, page);
+                    (SHM_RING_BYTESTREAM, 0u32, 0u32, c2g, g2c, ctl)
+                }
+                ShmRingKind::Slot => {
+                    let cap = (task.num_segments.max(2)).next_power_of_two();
+                    let seg_sz = round_up(task.segment_size.max(segment_size_for(0)), CACHE_LINE);
+                    let data = round_up(ring_data_bytes(cap, seg_sz).max(page), page);
+                    let ctl = round_up(slot_control_size(cap).max(page), page);
+                    (SHM_RING_SLOT, cap as u32, seg_sz as u32, data, data, ctl)
+                }
+            };
+
+        let g2c_notify = match (task.ring_kind, task.g2c_notify) {
+            (ShmRingKind::Slot, ShmNotify::Futex) => SHM_NOTIFY_FUTEX,
+            _ => SHM_NOTIFY_EVENTFD,
+        };
 
         let control_fd = os::memfd_create("scg-shm-ctl")?;
         let data_c2g_fd = match os::memfd_create("scg-shm-c2g") {
@@ -447,25 +543,42 @@ impl ShmSegment {
             let data_c2g_map = os::mmap_shared(data_c2g_fd, cap_c2g, MapProt::Read)?;
             let data_g2c_map = os::mmap_shared(data_g2c_fd, cap_g2c, MapProt::ReadWrite)?;
 
-            // Initialise the control page before either side touches the rings.
-            // SAFETY: `control_map` is a fresh writable mapping of `ctl_len`
-            // (>= SHM_CONTROL_SIZE) bytes that nothing else accesses yet.
-            unsafe {
-                ShmControl::init(control_map.as_ptr(), cap_c2g, cap_g2c, SHM_FLAG_SEALED_G2C);
-            }
-
+            // Initialise the control page before either side touches the rings,
+            // then build the gateway-side ring handles.
             // SAFETY: the three mappings live in the returned struct for as long
-            // as the rings; geometry was validated by `init`.
-            let (consumer, producer) = unsafe {
-                gateway_rings(
-                    control_map.as_ptr(),
-                    ctl_len,
-                    data_c2g_map.as_ptr() as *const u8,
-                    cap_c2g,
-                    data_g2c_map.as_ptr(),
-                    cap_g2c,
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("shm rings: {e}")))?
+            // as the rings; the control mapping is fresh and exclusive here.
+            let backend = match task.ring_kind {
+                ShmRingKind::ByteStream => unsafe {
+                    ShmControl::init(control_map.as_ptr(), cap_c2g, cap_g2c, SHM_FLAG_SEALED_G2C);
+                    let (consumer, producer) = gateway_rings(
+                        control_map.as_ptr(),
+                        ctl_len,
+                        data_c2g_map.as_ptr() as *const u8,
+                        cap_c2g,
+                        data_g2c_map.as_ptr(),
+                        cap_g2c,
+                    )
+                    .map_err(|e| io::Error::other(format!("shm rings: {e}")))?;
+                    RingBackend::ByteStream { consumer, producer }
+                },
+                ShmRingKind::Slot => unsafe {
+                    let cap = capacity as usize;
+                    let seg_sz = segment_size as usize;
+                    init_slot_control(control_map.as_ptr(), cap, seg_sz, 0)
+                        .map_err(|e| io::Error::other(format!("slot control: {e}")))?;
+                    let (consumer, producer) = gateway_slot_rings(
+                        control_map.as_ptr(),
+                        ctl_len,
+                        cap,
+                        seg_sz,
+                        data_c2g_map.as_ptr() as *const u8,
+                        cap_c2g,
+                        data_g2c_map.as_ptr(),
+                        cap_g2c,
+                    )
+                    .map_err(|e| io::Error::other(format!("slot rings: {e}")))?;
+                    RingBackend::Slot { consumer, producer }
+                },
             };
 
             // Fix sizes everywhere; seal g2c future-write so the client can only
@@ -484,10 +597,13 @@ impl ShmSegment {
                 _control_map: control_map,
                 _data_c2g_map: data_c2g_map,
                 _data_g2c_map: data_g2c_map,
-                consumer,
-                producer,
+                backend,
                 cap_c2g,
                 cap_g2c,
+                ring_kind,
+                capacity,
+                segment_size,
+                g2c_notify,
                 control_fd,
                 data_c2g_fd,
                 data_g2c_fd,
@@ -505,6 +621,60 @@ impl ShmSegment {
                 Err(e)
             }
         }
+    }
+
+    /// Whether the client→gateway ring currently appears empty.
+    #[inline]
+    fn consumer_is_empty(&self) -> bool {
+        match &self.backend {
+            RingBackend::ByteStream { consumer, .. } => consumer.is_empty(),
+            RingBackend::Slot { consumer, .. } => consumer.is_empty(),
+        }
+    }
+
+    /// Pop one frame from the client→gateway ring into `buf`, returning its
+    /// traffic id, or `None` when the ring is empty.
+    #[inline]
+    fn drain_c2g_into(&self, buf: &mut Vec<u8>) -> Option<u32> {
+        match &self.backend {
+            RingBackend::ByteStream { consumer, .. } => consumer.try_pop_into(buf),
+            RingBackend::Slot { consumer, .. } => consumer.try_pop_into(buf),
+        }
+    }
+
+    /// Push one frame into the gateway→client ring. Returns `Ok(Some(was_empty))`
+    /// on success (whether the ring had been empty), `Ok(None)` if it is full.
+    #[inline]
+    fn push_g2c_frame(&self, traffic_id: u32, data: &[u8]) -> Result<Option<bool>, ShmError> {
+        match &self.backend {
+            RingBackend::ByteStream { producer, .. } => {
+                // The byte-stream ring always signals (eventfd coalesces), so
+                // report `was_empty = true` to preserve existing behaviour.
+                Ok(producer.try_push(traffic_id, data)?.then_some(true))
+            }
+            RingBackend::Slot { producer, .. } => match producer.try_push(traffic_id, data)? {
+                PushOutcome::Pushed { was_empty } => Ok(Some(was_empty)),
+                PushOutcome::Full => Ok(None),
+            },
+        }
+    }
+
+    /// Wake the client's receive path after a gateway→client push. Uses the
+    /// negotiated mechanism: a futex bump+wake on an empty→non-empty transition
+    /// for the slot ring, otherwise an eventfd signal.
+    #[inline]
+    fn signal_g2c(&self, was_empty: bool) {
+        if self.g2c_notify == SHM_NOTIFY_FUTEX {
+            if let RingBackend::Slot { producer, .. } = &self.backend {
+                if was_empty {
+                    let w = producer.notify_word();
+                    w.fetch_add(1, Ordering::Release);
+                    let _ = futex_wake(w, 1);
+                }
+                return;
+            }
+        }
+        let _ = self.g2c_evt.signal();
     }
 
     /// Close the memfd descriptors once the client holds its own copies. The

@@ -24,6 +24,7 @@ pub mod handshake;
 pub mod notify;
 pub mod os;
 pub mod shm;
+pub mod shm_slot;
 pub mod token;
 
 pub use frame::{
@@ -32,7 +33,13 @@ pub use frame::{
 pub use handshake::{
     Hello, HelloError, Role, ShmOffer, HELLO_LEN, SHM_FD_CONTROL, SHM_FD_DATA_C2G, SHM_FD_DATA_G2C,
     SHM_FD_EVT_C2G, SHM_FD_EVT_G2C, SHM_NOTIFY_EVENTFD, SHM_NOTIFY_FUTEX, SHM_OFFER_LEN,
+    SHM_RING_BYTESTREAM, SHM_RING_SLOT,
 };
 pub use notify::{EventFd, WakeMechanism};
 pub use shm::{RingConsumer, RingProducer, ShmControl, ShmError, SHM_CONTROL_SIZE};
+pub use shm_slot::{
+    client_slot_rings, gateway_slot_rings, init_slot_control, ring_control_bytes, ring_data_bytes,
+    segment_size_for, slot_control_size, PushOutcome, SlotConsumer, SlotProducer, SlotRingHeader,
+    SLOT_HEADER_SIZE, SLOT_MAGIC, SLOT_VERSION,
+};
 pub use token::{CapabilityToken, TOKEN_LEN};
