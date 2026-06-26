@@ -82,6 +82,16 @@ impl ClientBackend {
         }
     }
 
+    /// Pop one frame's payload directly into a caller-owned slice, returning
+    /// `(traffic_id, copied_len)`. Single-copy, allocation-free.
+    #[inline]
+    fn try_pop_into_slice(&self, out: &mut [u8]) -> Option<(u32, usize)> {
+        match self {
+            ClientBackend::ByteStream { consumer, .. } => consumer.try_pop_into_slice(out),
+            ClientBackend::Slot { consumer, .. } => consumer.try_pop_into_slice(out),
+        }
+    }
+
     /// Whether the gateway→client ring currently appears empty.
     #[inline]
     fn consumer_is_empty(&self) -> bool {
@@ -278,6 +288,28 @@ impl ShmClient {
         Ok(pushed)
     }
 
+    /// Try to push a batch of framed messages, signalling the gateway **once**
+    /// for the whole batch instead of once per message.
+    ///
+    /// Returns the number of leading messages accepted: pushing stops at the
+    /// first message the ring rejects (full), so `Ok(n)` with `n < msgs.len()`
+    /// means the caller should retry from index `n`. A single eventfd signal is
+    /// emitted whenever at least one message was pushed, amortising the wakeup
+    /// syscall across the batch (the gateway drains the ring to empty per wake).
+    pub fn try_send_batch(&mut self, traffic_id: u32, msgs: &[&[u8]]) -> Result<usize> {
+        let mut sent = 0;
+        for m in msgs {
+            if !self.backend.try_push(traffic_id, m)? {
+                break;
+            }
+            sent += 1;
+        }
+        if sent > 0 {
+            self.c2g_evt.signal()?;
+        }
+        Ok(sent)
+    }
+
     /// Block until one framed message is available from the gateway.
     pub fn recv(&mut self) -> Result<(u32, Vec<u8>)> {
         loop {
@@ -297,6 +329,30 @@ impl ShmClient {
             return Ok(None);
         }
         Ok(self.backend.try_pop())
+    }
+
+    /// Non-blocking single-copy receive: pop the next frame's payload directly
+    /// into `out`, returning `(traffic_id, copied_len)` or `None` if the ring is
+    /// empty. Performs no allocation and no wait — pair with
+    /// [`wait_readable`](Self::wait_readable) to drain a batch after one wake.
+    pub fn try_recv_into(&mut self, out: &mut [u8]) -> Result<Option<(u32, usize)>> {
+        Ok(self.backend.try_pop_into_slice(out))
+    }
+
+    /// Blocking single-copy receive into `out`. Waits up to `timeout` for a
+    /// frame, then copies its payload into `out`. Returns `Ok(None)` on timeout.
+    pub fn recv_into(
+        &mut self,
+        out: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<Option<(u32, usize)>> {
+        if let Some(r) = self.backend.try_pop_into_slice(out) {
+            return Ok(Some(r));
+        }
+        if !self.wait_g2c(timeout)? {
+            return Ok(None);
+        }
+        Ok(self.backend.try_pop_into_slice(out))
     }
 
     /// Wait for a gateway→client notification using the negotiated mechanism.

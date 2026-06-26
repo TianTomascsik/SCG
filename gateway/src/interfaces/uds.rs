@@ -177,6 +177,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
             &task.label,
             &task.upstream_addr,
             task.tls_mode,
+            &task.provider_params,
             task.protocol_version.as_deref(),
             task.sock_buf_size,
             task.qos,

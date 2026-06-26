@@ -8,8 +8,9 @@ use super::{build_tls_connector, write_all_nb_proxy, ProxyStream};
 use super::params::TlsSecurityParams;
 use crate::networking::connector::{connect_with_retry, sleep_with_shutdown_check};
 use crate::networking::socket_manager::{
-    accept_with_timeout, apply_egress_qos, apply_safety_priority, bind_tcp_listener,
-    bind_udp_socket, poll_two_fds, set_nodelay, set_nonblocking_fd, tune_socket_buffers,
+    accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
+    bind_tcp_listener, bind_udp_socket, poll_two_fds, set_nodelay, set_nonblocking_fd,
+    tune_socket_buffers,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::{
@@ -22,7 +23,7 @@ use ale_pipe::{
 };
 
 use crate::interfaces::tproxy;
-use crate::management::config::{QosPolicy, TlsMode};
+use crate::management::config::{PerfKnobs, QosPolicy, TlsMode};
 use crate::management::telemetry::{format_rate, ConnectionMetrics};
 
 use foreign_types_shared::ForeignTypeRef;
@@ -105,6 +106,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let fd = client_stream.as_raw_fd();
         tune_socket_buffers(fd, ctx.sock_buf_size);
         set_nodelay(fd, true);
+        apply_tcp_latency_opts(fd, ctx.perf.notsent_lowat, ctx.perf.busy_poll_us);
         // Prioritise the client-facing (SCG → client) return path.
         ctx.apply_egress_qos(fd, peer_addr.is_ipv6(), None);
 
@@ -120,7 +122,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let tls_params = tls_params.clone();
         let qos = ctx.qos;
-        let enable_cork = ctx.perf.enable_cork;
+        let perf = ctx.perf;
 
         let pool = ctx.conn_pool.clone();
         pool.execute(move || {
@@ -144,7 +146,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 simulated_delay_ms,
                 &tls_params,
                 qos,
-                enable_cork,
+                perf,
             );
 
             if let Err(e) = result {
@@ -185,7 +187,7 @@ pub(crate) fn handle_tcp_encrypt(
     delay_ms: u64,
     params: &TlsSecurityParams,
     qos: QosPolicy,
-    enable_cork: bool,
+    perf: PerfKnobs,
 ) -> io::Result<()> {
     // Connect to upstream with exponential backoff retry
     let upstream_tcp = connect_with_retry(
@@ -198,6 +200,7 @@ pub(crate) fn handle_tcp_encrypt(
     let up_fd = upstream_tcp.as_raw_fd();
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
+    apply_tcp_latency_opts(up_fd, perf.notsent_lowat, perf.busy_poll_us);
     // Mark + prioritise the upstream (SCG → upstream) egress socket.
     let up_is_v6 = upstream_tcp
         .peer_addr()
@@ -284,6 +287,7 @@ pub(crate) fn handle_tcp_encrypt(
                 conn_metrics,
                 shutdown,
                 delay_ms,
+                perf.pipe_size,
             )?;
         }
         _ => {
@@ -293,7 +297,8 @@ pub(crate) fn handle_tcp_encrypt(
                 conn_metrics,
                 shutdown,
                 delay_ms,
-                enable_cork,
+                perf.enable_cork,
+                perf.relay_buf_size,
             )?;
         }
     }

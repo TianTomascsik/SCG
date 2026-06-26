@@ -238,6 +238,65 @@ impl ScgClient {
         }
     }
 
+    /// Try to send a batch of framed messages, amortising the per-message
+    /// wakeup. Returns the number of leading messages accepted (`< msgs.len()`
+    /// only under SHM backpressure); the caller should retry from that index.
+    ///
+    /// SHM pushes every message then signals the gateway **once** for the whole
+    /// batch. UDS writes each message individually (its stream send already
+    /// blocks until accepted) and always reports the full count on success.
+    pub fn try_send_batch(&mut self, traffic_id: u32, msgs: &[&[u8]]) -> Result<usize> {
+        match &mut self.inner {
+            Inner::Uds(c) => {
+                for (i, m) in msgs.iter().enumerate() {
+                    if let Err(e) = c.send(traffic_id, m) {
+                        return if i == 0 { Err(e) } else { Ok(i) };
+                    }
+                }
+                Ok(msgs.len())
+            }
+            Inner::Shm(c) => c.try_send_batch(traffic_id, msgs),
+        }
+    }
+
+    /// Non-blocking single-copy receive: pop the next message's payload directly
+    /// into `out`, returning `(traffic_id, copied_len)` or `Ok(None)` if nothing
+    /// is immediately available. Performs no per-message heap allocation.
+    pub fn try_recv_into(&mut self, out: &mut [u8]) -> Result<Option<(u32, usize)>> {
+        match &mut self.inner {
+            Inner::Uds(c) => match c.recv_timeout(Some(Duration::ZERO))? {
+                Some((tid, data)) => {
+                    let n = data.len().min(out.len());
+                    out[..n].copy_from_slice(&data[..n]);
+                    Ok(Some((tid, n)))
+                }
+                None => Ok(None),
+            },
+            Inner::Shm(c) => c.try_recv_into(out),
+        }
+    }
+
+    /// Blocking single-copy receive into `out`. Waits up to `timeout` for a
+    /// message, then writes its payload into `out` with no per-message heap
+    /// allocation. Returns `Ok(None)` on timeout.
+    pub fn recv_into(
+        &mut self,
+        out: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<Option<(u32, usize)>> {
+        match &mut self.inner {
+            Inner::Uds(c) => match c.recv_timeout(timeout)? {
+                Some((tid, data)) => {
+                    let n = data.len().min(out.len());
+                    out[..n].copy_from_slice(&data[..n]);
+                    Ok(Some((tid, n)))
+                }
+                None => Ok(None),
+            },
+            Inner::Shm(c) => c.recv_into(out, timeout),
+        }
+    }
+
     /// Deregister the endpoint on the gateway and tear down the data plane.
     pub fn close(mut self) -> Result<()> {
         self.deregister()

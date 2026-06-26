@@ -222,6 +222,42 @@ pub enum PerfProfile {
 /// profile when a rule does not set `spin_wait_us` explicitly.
 const LATENCY_SPIN_WAIT_US: u64 = 50;
 
+/// Default `SO_BUSY_POLL` / pre-poll spin window (microseconds) applied by the
+/// `latency` profile to the TCP data path, trading a little CPU for lower
+/// wakeup latency on the relay sockets.
+const LATENCY_BUSY_POLL_US: u32 = 50;
+
+// ── Per-profile data-path buffer sizing ─────────────────────────────────────
+//
+// The `throughput` profile keeps the historical large buffers (16 MiB sockets,
+// 16 MiB splice pipes, 4 MiB userspace-TLS relay buffers) for maximum bulk
+// bandwidth. `latency` shrinks them aggressively to bound in-flight queueing
+// (the dominant source of bufferbloat latency through the proxy); `balanced`
+// sits in between. Socket buffers are expressed as caps clamped against the
+// configured `sock_buf_size`; pipe and relay buffers are absolute sizes.
+
+/// Splice pipe capacity per profile (bytes).
+const THROUGHPUT_PIPE_SIZE: usize = 16 * 1024 * 1024;
+const BALANCED_PIPE_SIZE: usize = 2 * 1024 * 1024;
+const LATENCY_PIPE_SIZE: usize = 256 * 1024;
+
+/// Userspace-TLS relay buffer size per profile (bytes).
+const THROUGHPUT_RELAY_BUF: usize = 4 * 1024 * 1024;
+const BALANCED_RELAY_BUF: usize = 1024 * 1024;
+const LATENCY_RELAY_BUF: usize = 256 * 1024;
+
+/// Socket-buffer cap per profile (bytes). The effective `SO_SNDBUF`/`SO_RCVBUF`
+/// is `min(configured sock_buf_size, cap)`, so an explicitly small global
+/// `sock_buf_size` still wins over the profile default.
+const BALANCED_SOCK_BUF_CAP: usize = 2 * 1024 * 1024;
+const LATENCY_SOCK_BUF_CAP: usize = 256 * 1024;
+
+/// `TCP_NOTSENT_LOWAT` target per profile (bytes). Bounds the unsent bytes the
+/// kernel keeps queued before signalling writability, trimming local queueing
+/// latency. `None` leaves the kernel default (the `throughput` profile).
+const BALANCED_NOTSENT_LOWAT: usize = 256 * 1024;
+const LATENCY_NOTSENT_LOWAT: usize = 16 * 1024;
+
 /// Low-level relay knobs resolved from a [`PerfProfile`] together with a rule's
 /// explicit overrides. Cheap to copy; carried on the rule's hot path.
 #[derive(Debug, Clone, Copy)]
@@ -230,13 +266,30 @@ pub struct PerfKnobs {
     pub enable_cork: bool,
     /// Microseconds to busy-poll the SHM ring before blocking on the eventfd.
     pub spin_wait_us: u64,
+    /// Effective `SO_SNDBUF`/`SO_RCVBUF` for this rule's TCP sockets (bytes).
+    pub sock_buf_size: usize,
+    /// Splice pipe capacity for the zero-copy (routing / kTLS) path (bytes).
+    pub pipe_size: usize,
+    /// Userspace-TLS relay buffer size (bytes).
+    pub relay_buf_size: usize,
+    /// `TCP_NOTSENT_LOWAT` target, or `None` to leave the kernel default.
+    pub notsent_lowat: Option<usize>,
+    /// `SO_BUSY_POLL` / pre-poll spin window for the TCP data path (µs).
+    pub busy_poll_us: u32,
 }
 
 impl PerfKnobs {
     /// Resolve the effective knobs for a rule. A non-zero `simulated_delay_ms`
     /// forces cork off (geo-delay needs each packet flushed immediately) and an
     /// explicit non-zero `spin_wait_us` always wins over the profile default.
-    pub fn resolve(profile: PerfProfile, simulated_delay_ms: u64, spin_wait_us: u64) -> Self {
+    /// `sock_buf_size` is the configured (global) socket-buffer size, clamped
+    /// down per profile so the `latency` profile cannot bufferbloat.
+    pub fn resolve(
+        profile: PerfProfile,
+        simulated_delay_ms: u64,
+        spin_wait_us: u64,
+        sock_buf_size: usize,
+    ) -> Self {
         let enable_cork = simulated_delay_ms == 0 && profile != PerfProfile::Latency;
         let spin_wait_us = if spin_wait_us > 0 {
             spin_wait_us
@@ -245,9 +298,33 @@ impl PerfKnobs {
         } else {
             0
         };
+        let (pipe_size, relay_buf_size, sock_cap, notsent_lowat, busy_poll_us) = match profile {
+            PerfProfile::Throughput => {
+                (THROUGHPUT_PIPE_SIZE, THROUGHPUT_RELAY_BUF, usize::MAX, None, 0)
+            }
+            PerfProfile::Balanced => (
+                BALANCED_PIPE_SIZE,
+                BALANCED_RELAY_BUF,
+                BALANCED_SOCK_BUF_CAP,
+                Some(BALANCED_NOTSENT_LOWAT),
+                0,
+            ),
+            PerfProfile::Latency => (
+                LATENCY_PIPE_SIZE,
+                LATENCY_RELAY_BUF,
+                LATENCY_SOCK_BUF_CAP,
+                Some(LATENCY_NOTSENT_LOWAT),
+                LATENCY_BUSY_POLL_US,
+            ),
+        };
         PerfKnobs {
             enable_cork,
             spin_wait_us,
+            sock_buf_size: sock_buf_size.min(sock_cap),
+            pipe_size,
+            relay_buf_size,
+            notsent_lowat,
+            busy_poll_us,
         }
     }
 }
@@ -454,10 +531,16 @@ pub struct RuleConfig {
 
 impl RuleConfig {
     /// Resolve this rule's performance knobs, inheriting `global` when the rule
-    /// does not specify its own `perf_profile`.
-    pub fn perf_knobs(&self, global: PerfProfile) -> PerfKnobs {
+    /// does not specify its own `perf_profile`. `sock_buf_size` is the
+    /// gateway-level socket-buffer size, clamped down per profile.
+    pub fn perf_knobs(&self, global: PerfProfile, sock_buf_size: usize) -> PerfKnobs {
         let profile = self.perf_profile.unwrap_or(global);
-        PerfKnobs::resolve(profile, self.simulated_delay_ms, self.spin_wait_us)
+        PerfKnobs::resolve(
+            profile,
+            self.simulated_delay_ms,
+            self.spin_wait_us,
+            sock_buf_size,
+        )
     }
 
     /// Returns the effective security provider name.
@@ -986,6 +1069,27 @@ impl GatewayConfig {
                             rule.name, i
                         ));
                     }
+                }
+            }
+
+            // TLS/kTLS security-parameter validation at load time. Parse the
+            // rule's provider_params exactly as the runtime engine will, so
+            // misconfigurations — an omitted `verify` mode (fail-secure), an
+            // unpaired cert/key, or invalid PSK settings — are surfaced at config
+            // load instead of at the first connection.
+            {
+                let provider = rule.effective_security_provider();
+                if provider == "tls" || provider == "ktls" {
+                    crate::security::tls_engine::params::TlsSecurityParams::from_params(
+                        &rule.provider_params,
+                        rule.protocol_version.as_deref(),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Rule '{}' (index {}): invalid TLS parameters: {}",
+                            rule.name, i, e
+                        )
+                    })?;
                 }
             }
 
@@ -1660,6 +1764,7 @@ mod dscp_tests {
                 "direction": "encrypt",
                 "listen_addr": "127.0.0.1:8081",
                 "upstream_addr": "127.0.0.1:9000",
+                "verify": "none",
                 "dscp_tag": 64
             }]
         }))
@@ -1676,11 +1781,111 @@ mod dscp_tests {
                 "direction": "encrypt",
                 "listen_addr": "127.0.0.1:8082",
                 "upstream_addr": "127.0.0.1:9000",
+                "verify": "none",
                 "dscp_tag": 46
             }]
         }))
         .expect("deserialize config");
         assert!(cfg.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod perf_knobs_tests {
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+
+    #[test]
+    fn throughput_profile_keeps_large_buffers() {
+        let k = PerfKnobs::resolve(PerfProfile::Throughput, 0, 0, 16 * MIB);
+        assert_eq!(k.sock_buf_size, 16 * MIB); // unclamped
+        assert_eq!(k.pipe_size, 16 * MIB);
+        assert_eq!(k.relay_buf_size, 4 * MIB);
+        assert!(k.enable_cork);
+        assert_eq!(k.spin_wait_us, 0);
+        assert_eq!(k.notsent_lowat, None);
+        assert_eq!(k.busy_poll_us, 0);
+    }
+
+    #[test]
+    fn balanced_profile_uses_medium_buffers() {
+        let k = PerfKnobs::resolve(PerfProfile::Balanced, 0, 0, 16 * MIB);
+        assert_eq!(k.sock_buf_size, 2 * MIB); // clamped to balanced cap
+        assert_eq!(k.pipe_size, 2 * MIB);
+        assert_eq!(k.relay_buf_size, MIB);
+        assert!(k.enable_cork);
+        assert_eq!(k.spin_wait_us, 0);
+        assert_eq!(k.notsent_lowat, Some(256 * KIB));
+        assert_eq!(k.busy_poll_us, 0);
+    }
+
+    #[test]
+    fn latency_profile_shrinks_buffers_and_enables_polling() {
+        let k = PerfKnobs::resolve(PerfProfile::Latency, 0, 0, 16 * MIB);
+        assert_eq!(k.sock_buf_size, 256 * KIB); // clamped to latency cap
+        assert_eq!(k.pipe_size, 256 * KIB);
+        assert_eq!(k.relay_buf_size, 256 * KIB);
+        assert!(!k.enable_cork); // latency never corks
+        assert_eq!(k.spin_wait_us, 50);
+        assert_eq!(k.notsent_lowat, Some(16 * KIB));
+        assert_eq!(k.busy_poll_us, 50);
+    }
+
+    #[test]
+    fn explicit_small_sock_buf_wins_over_profile_cap() {
+        // An explicitly small global sock_buf_size is a cap that no profile may
+        // grow past.
+        let t = PerfKnobs::resolve(PerfProfile::Throughput, 0, 0, 128 * KIB);
+        assert_eq!(t.sock_buf_size, 128 * KIB);
+        let b = PerfKnobs::resolve(PerfProfile::Balanced, 0, 0, 128 * KIB);
+        assert_eq!(b.sock_buf_size, 128 * KIB);
+    }
+
+    #[test]
+    fn geo_delay_forces_cork_off() {
+        // A non-zero simulated delay flushes every packet immediately.
+        let k = PerfKnobs::resolve(PerfProfile::Throughput, 5, 0, 16 * MIB);
+        assert!(!k.enable_cork);
+    }
+
+    #[test]
+    fn explicit_spin_wait_overrides_profile_default() {
+        // Non-zero spin_wait_us always wins over the profile default (0 here).
+        let k = PerfKnobs::resolve(PerfProfile::Throughput, 0, 123, 16 * MIB);
+        assert_eq!(k.spin_wait_us, 123);
+    }
+
+    fn rule_with(extra: serde_json::Value) -> RuleConfig {
+        let mut base = serde_json::json!({
+            "name": "r",
+            "direction": "encrypt",
+            "listen_addr": "127.0.0.1:8080"
+        });
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(base).expect("deserialize rule")
+    }
+
+    #[test]
+    fn per_rule_profile_override_wins_over_global() {
+        // Global is throughput, but the rule pins latency: the rule wins.
+        let rule = rule_with(serde_json::json!({ "perf_profile": "latency" }));
+        let k = rule.perf_knobs(PerfProfile::Throughput, 16 * MIB);
+        assert_eq!(k.pipe_size, 256 * KIB);
+        assert_eq!(k.sock_buf_size, 256 * KIB);
+        assert!(!k.enable_cork);
+    }
+
+    #[test]
+    fn rule_without_override_inherits_global_profile() {
+        let rule = rule_with(serde_json::json!({}));
+        let k = rule.perf_knobs(PerfProfile::Latency, 16 * MIB);
+        assert_eq!(k.pipe_size, 256 * KIB); // inherited latency
     }
 }
 
@@ -1696,6 +1901,7 @@ mod intercept_tests {
                 "direction": "decrypt",
                 "listen_addr": "0.0.0.0:8443",
                 "upstream_addr": "127.0.0.1:80",
+                "verify": "none",
                 "intercept": {
                     "mode": "ingress_redirect",
                     "in_interface": "eth0",
@@ -1715,6 +1921,7 @@ mod intercept_tests {
                 "direction": "encrypt",
                 "listen_addr": "0.0.0.0:3128",
                 "upstream_addr": "10.0.0.1:443",
+                "verify": "none",
                 "intercept": {
                     "mode": "egress_redirect",
                     "match_dports": "4465:4467",
@@ -1735,6 +1942,7 @@ mod intercept_tests {
                 "listen_addr": "0.0.0.0:4000",
                 "upstream_addr": "auto",
                 "transparent": true,
+                "verify": "none",
                 "intercept": {
                     "mode": "tproxy",
                     "match_dports": "4465:4467",
@@ -1755,6 +1963,7 @@ mod intercept_tests {
                 "listen_addr": "0.0.0.0:4000",
                 "upstream_addr": "auto",
                 "transparent": true,
+                "verify": "none",
                 "intercept": {
                     "mode": "tproxy",
                     "match_dports": "4465",
@@ -1774,6 +1983,7 @@ mod intercept_tests {
                 "listen_addr": "0.0.0.0:4000",
                 "upstream_addr": "127.0.0.1:80",
                 "transparent": false,
+                "verify": "none",
                 "intercept": {
                     "mode": "tproxy",
                     "match_dports": "4465",
@@ -1794,6 +2004,7 @@ mod intercept_tests {
                 "direction": "encrypt",
                 "listen_addr": "0.0.0.0:3128",
                 "upstream_addr": "10.0.0.1:443",
+                "verify": "none",
                 "intercept": {
                     "mode": "egress_redirect",
                     "match_dports": "80"
@@ -1814,6 +2025,7 @@ mod intercept_tests {
                 "listen_addr": "0.0.0.0:4000",
                 "upstream_addr": "auto",
                 "transparent": true,
+                "verify": "none",
                 "intercept": {
                     "mode": "tproxy",
                     "match_dports": "4465"
@@ -1833,6 +2045,7 @@ mod intercept_tests {
                 "direction": "decrypt",
                 "listen_addr": "0.0.0.0:8443",
                 "upstream_addr": "127.0.0.1:80",
+                "verify": "none",
                 "intercept": {
                     "mode": "ingress_redirect",
                     "match_dports": ""
@@ -1852,6 +2065,7 @@ mod intercept_tests {
                 "direction": "decrypt",
                 "listen_addr": "0.0.0.0:8443",
                 "upstream_addr": "127.0.0.1:80",
+                "verify": "none",
                 "intercept": {
                     "mode": "ingress_redirect",
                     "match_dports": "abc"
@@ -1871,6 +2085,7 @@ mod intercept_tests {
                 "direction": "encrypt",
                 "listen_addr": "0.0.0.0:3128",
                 "upstream_addr": "10.0.0.1:443",
+                "verify": "none",
                 "intercept": {
                     "mode": "egress_redirect",
                     "match_dports": "80",
@@ -1894,6 +2109,7 @@ mod intercept_tests {
                 "upstream_addr": "127.0.0.1:443",
                 "app_id": "myapp",
                 "allowed_uids": [1000],
+                "verify": "none",
                 "intercept": {
                     "mode": "ingress_redirect",
                     "match_dports": "80"
@@ -1916,5 +2132,78 @@ mod intercept_tests {
         assert!(GatewayConfig::validate_port_spec("99999").is_err());
         assert!(GatewayConfig::validate_port_spec("abc").is_err());
         assert!(GatewayConfig::validate_port_spec("100:50").is_err()); // inverted range
+    }
+}
+
+#[cfg(test)]
+mod tls_validation_tests {
+    use super::*;
+
+    #[test]
+    fn default_tls_rule_without_verify_is_rejected() {
+        // A rule with no explicit security_provider defaults to "tls". Omitting
+        // `verify` must be a load-time error (fail-secure) rather than silently
+        // disabling peer verification.
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "enc",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8443",
+                "upstream_addr": "127.0.0.1:9000"
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("verify") && err.contains("invalid TLS parameters"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_tls_rule_without_verify_is_rejected() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "enc",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8443",
+                "upstream_addr": "127.0.0.1:9000",
+                "security_provider": "tls"
+            }]
+        }))
+        .expect("deserialize");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("verify"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_rule_with_explicit_verify_none_is_accepted() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "enc",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8443",
+                "upstream_addr": "127.0.0.1:9000",
+                "verify": "none"
+            }]
+        }))
+        .expect("deserialize");
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn routing_rule_skips_tls_verify_requirement() {
+        // Non-TLS providers must not be subjected to the verify requirement.
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "route",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8443",
+                "upstream_addr": "127.0.0.1:9000",
+                "security_provider": "routing"
+            }]
+        }))
+        .expect("deserialize");
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
     }
 }

@@ -60,6 +60,55 @@ pub fn set_quickack(fd: RawFd) {
     }
 }
 
+/// Set `TCP_NOTSENT_LOWAT` — bound the unsent bytes the kernel keeps queued in
+/// the socket's write buffer before reporting the socket writable. Smaller
+/// values trim local send-queue (bufferbloat) latency at a small cost to peak
+/// throughput; the `latency`/`balanced` profiles set a small value while the
+/// `throughput` profile leaves the kernel default. Best-effort (errors ignored).
+pub fn set_notsent_lowat(fd: RawFd, bytes: usize) {
+    let val = bytes as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Enable socket busy-polling (`SO_BUSY_POLL`) for `us` microseconds — the
+/// kernel busy-waits briefly for incoming packets instead of sleeping, trading
+/// CPU for lower wakeup latency. Applied by the `latency` profile. A value of 0
+/// is a no-op. Requires `CAP_NET_ADMIN` (or a permissive `net.core.busy_poll`);
+/// best-effort, so failures are silently ignored.
+pub fn set_busy_poll(fd: RawFd, us: u32) {
+    if us == 0 {
+        return;
+    }
+    let val = us as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Apply the profile's latency-shaping TCP options to a relay socket:
+/// `TCP_NOTSENT_LOWAT` (when set) and `SO_BUSY_POLL` (when non-zero). Socket
+/// buffer sizing is handled separately by [`tune_socket_buffers`].
+pub fn apply_tcp_latency_opts(fd: RawFd, notsent_lowat: Option<usize>, busy_poll_us: u32) {
+    if let Some(lowat) = notsent_lowat {
+        set_notsent_lowat(fd, lowat);
+    }
+    set_busy_poll(fd, busy_poll_us);
+}
+
 /// Enable or disable TCP_CORK on a socket.
 ///
 /// When enabled, TCP coalesces small writes into fewer, larger segments —

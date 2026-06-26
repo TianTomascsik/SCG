@@ -6,12 +6,12 @@
 //! classification / policy enforcement, with no TLS on either leg.
 
 use crate::interfaces::tproxy;
-use crate::management::config::QosPolicy;
+use crate::management::config::{PerfKnobs, QosPolicy};
 use crate::management::telemetry::{format_rate, ConnectionMetrics};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
-    accept_with_timeout, apply_egress_qos, apply_safety_priority, bind_tcp_listener, set_nodelay,
-    tune_socket_buffers,
+    accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
+    bind_tcp_listener, set_nodelay, tune_socket_buffers,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::relay_bidirectional_splice;
@@ -80,6 +80,7 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
         let fd = client_stream.as_raw_fd();
         tune_socket_buffers(fd, ctx.sock_buf_size);
         set_nodelay(fd, true);
+        apply_tcp_latency_opts(fd, ctx.perf.notsent_lowat, ctx.perf.busy_poll_us);
         // Prioritise the client-facing (SCG → client) return path.
         ctx.apply_egress_qos(fd, peer_addr.is_ipv6(), None);
 
@@ -89,6 +90,7 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
         let rule_name = ctx.rule_name.clone();
         let shutdown = ctx.shutdown.clone();
         let sock_buf_size = ctx.sock_buf_size;
+        let perf = ctx.perf;
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let qos = ctx.qos;
@@ -110,6 +112,7 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
                 &shutdown,
                 simulated_delay_ms,
                 qos,
+                perf,
             );
 
             if let Err(e) = result {
@@ -145,6 +148,7 @@ fn handle_tcp_routing(
     shutdown: &AtomicBool,
     delay_ms: u64,
     qos: QosPolicy,
+    perf: PerfKnobs,
 ) -> io::Result<()> {
     let upstream_tcp = connect_with_retry(
         upstream_addr,
@@ -156,6 +160,7 @@ fn handle_tcp_routing(
     let up_fd = upstream_tcp.as_raw_fd();
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
+    apply_tcp_latency_opts(up_fd, perf.notsent_lowat, perf.busy_poll_us);
     // Mark + prioritise the upstream (SCG → upstream) egress socket.
     let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
@@ -169,6 +174,7 @@ fn handle_tcp_routing(
         conn_metrics,
         shutdown,
         delay_ms,
+        perf.pipe_size,
     )?;
 
     Ok(())

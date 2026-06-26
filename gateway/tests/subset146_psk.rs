@@ -57,6 +57,7 @@ fn psk_rule(provider: &str, listen: &str, echo: &str, identity: &str, psk_hex: &
             "traffic_class": "safety",
             "protocol_version": "tls1.2",
             "profile": "subset146-psk",
+            "verify": "none",
             "psk_identity": "{identity}",
             "psk_hex": "{psk_hex}"
         }}"#,

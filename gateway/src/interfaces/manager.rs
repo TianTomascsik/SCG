@@ -236,7 +236,9 @@ impl InterfaceManager {
                     allowed_pids: Arc::new(rule.allowed_pids.clone()),
                     qos: rule.qos(),
                     ring_capacity: api.shm_ring_capacity,
-                    spin_wait_us: rule.perf_knobs(config.perf_profile).spin_wait_us,
+                    spin_wait_us: rule
+                        .perf_knobs(config.perf_profile, config.sock_buf_size)
+                        .spin_wait_us,
                     ring_kind: api.shm_ring_kind,
                     segment_size: api.shm_segment_size,
                     num_segments: api.shm_num_segments,

@@ -67,6 +67,7 @@ fn dtls_decrypt_rule(
             "security_provider": "dtls",
             "traffic_class": "safety",
             "protocol_version": "dtls1.2",
+            "verify": "none",
             "cert_path": "{cert}",
             "key_path": "{key}"{qos}
         }}"#,

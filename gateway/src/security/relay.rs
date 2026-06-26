@@ -18,9 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // ─── Splice constants ────────────────────────────────────────────────────────
 
-/// Splice chunk size — matches the kernel pipe capacity we request.
-/// Using 16 MiB for maximum throughput (requires pipe-max-size ≥ 16 MiB).
-const SPLICE_CHUNK: usize = 16 * 1024 * 1024; // 16 MiB
+// The pipe capacity / splice chunk size is now profile-driven (`pipe_size`),
+// supplied per connection from the resolved `PerfKnobs`.
 const SPLICE_F_MOVE: libc::c_uint = 1;
 const SPLICE_F_MORE: libc::c_uint = 4;
 const SPLICE_F_NONBLOCK: libc::c_uint = 2;
@@ -43,6 +42,7 @@ pub fn relay_bidirectional(
     shutdown: &AtomicBool,
     delay_ms: u64,
     enable_cork: bool,
+    relay_buf_size: usize,
 ) -> io::Result<()> {
     let tls_fd = tls_stream.raw_fd();
     let up_fd = upstream.as_raw_fd();
@@ -53,8 +53,8 @@ pub fn relay_bidirectional(
     set_quickack(tls_fd);
 
     // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
-    let mut buf_fwd = vec![0u8; RELAY_BUF_SIZE];
-    let mut buf_rev = vec![0u8; RELAY_BUF_SIZE];
+    let mut buf_fwd = vec![0u8; relay_buf_size];
+    let mut buf_rev = vec![0u8; relay_buf_size];
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -220,6 +220,7 @@ pub fn relay_encrypt_bidirectional(
     shutdown: &AtomicBool,
     delay_ms: u64,
     enable_cork: bool,
+    relay_buf_size: usize,
 ) -> io::Result<()> {
     let client_fd = client.as_raw_fd();
     let tls_fd = upstream.raw_fd();
@@ -230,8 +231,8 @@ pub fn relay_encrypt_bidirectional(
     set_quickack(tls_fd);
 
     // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
-    let mut buf_fwd = vec![0u8; RELAY_BUF_SIZE];
-    let mut buf_rev = vec![0u8; RELAY_BUF_SIZE];
+    let mut buf_fwd = vec![0u8; relay_buf_size];
+    let mut buf_rev = vec![0u8; relay_buf_size];
     let mut client_w = client.try_clone()?;
     let mut client_r = client;
 
@@ -302,15 +303,15 @@ pub fn relay_encrypt_bidirectional(
 // ─── Splice helpers ──────────────────────────────────────────────────────────
 
 /// Create a kernel pipe with enlarged capacity for splice operations.
-fn make_splice_pipe() -> io::Result<(RawFd, RawFd)> {
+fn make_splice_pipe(pipe_size: usize) -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as RawFd; 2];
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Grow pipe capacity to SPLICE_CHUNK for better throughput
+    // Grow pipe capacity to the profile-driven `pipe_size` (throughput vs latency).
     unsafe {
-        libc::fcntl(fds[0], libc::F_SETPIPE_SZ, SPLICE_CHUNK as libc::c_int);
+        libc::fcntl(fds[0], libc::F_SETPIPE_SZ, pipe_size as libc::c_int);
     }
     Ok((fds[0], fds[1]))
 }
@@ -340,6 +341,7 @@ fn splice_one_direction(
     pipe_write: RawFd,
     pipe_read: RawFd,
     dst_fd: RawFd,
+    chunk: usize,
 ) -> io::Result<SpliceResult> {
     // Step 1: splice src → pipe
     let n = unsafe {
@@ -348,7 +350,7 @@ fn splice_one_direction(
             std::ptr::null_mut(),
             pipe_write,
             std::ptr::null_mut(),
-            SPLICE_CHUNK,
+            chunk,
             (SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_NONBLOCK) as _,
         )
     };
@@ -421,6 +423,7 @@ pub fn relay_bidirectional_splice(
     conn_metrics: &mut ConnectionMetrics,
     shutdown: &AtomicBool,
     delay_ms: u64,
+    pipe_size: usize,
 ) -> io::Result<()> {
     set_nonblocking_fd(tls_fd);
     set_nonblocking_fd(upstream_fd);
@@ -428,8 +431,8 @@ pub fn relay_bidirectional_splice(
     set_quickack(upstream_fd);
 
     // Create two pipes — one per direction
-    let (pipe_fwd_r, pipe_fwd_w) = make_splice_pipe()?;
-    let (pipe_rev_r, pipe_rev_w) = make_splice_pipe()?;
+    let (pipe_fwd_r, pipe_fwd_w) = make_splice_pipe(pipe_size)?;
+    let (pipe_rev_r, pipe_rev_w) = make_splice_pipe(pipe_size)?;
 
     let result = (|| -> io::Result<()> {
         loop {
@@ -448,7 +451,8 @@ pub fn relay_bidirectional_splice(
             if tls_ready {
                 apply_geo_delay(delay_ms);
                 loop {
-                    match splice_one_direction(tls_fd, pipe_fwd_w, pipe_fwd_r, upstream_fd) {
+                    match splice_one_direction(tls_fd, pipe_fwd_w, pipe_fwd_r, upstream_fd, pipe_size)
+                    {
                         Ok(SpliceResult::Moved(n)) => {
                             conn_metrics.record_read(n);
                             conn_metrics.record_relay(n);
@@ -472,7 +476,8 @@ pub fn relay_bidirectional_splice(
             // Reverse: upstream fd → pipe → kTLS fd
             if up_ready {
                 loop {
-                    match splice_one_direction(upstream_fd, pipe_rev_w, pipe_rev_r, tls_fd) {
+                    match splice_one_direction(upstream_fd, pipe_rev_w, pipe_rev_r, tls_fd, pipe_size)
+                    {
                         Ok(SpliceResult::Moved(n)) => {
                             conn_metrics.record_read(n);
                             conn_metrics.record_relay(n);

@@ -249,6 +249,7 @@ fn https_frontend_terminate_to_plain_backend() {
             "upstream_proto": "tcp",
             "security_provider": "tls",
             "traffic_class": "safety",
+            "verify": "none",
             "cert_path": "{cert}",
             "key_path": "{key}"
         }}"#,

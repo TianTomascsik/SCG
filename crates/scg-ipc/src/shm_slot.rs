@@ -372,6 +372,47 @@ impl SlotConsumer {
         Some(traffic_id)
     }
 
+    /// Try to dequeue one frame's payload directly into a caller-owned slice,
+    /// returning `(traffic_id, copied_len)`.
+    ///
+    /// This is the single-copy, allocation-free sibling of
+    /// [`try_pop_into`](Self::try_pop_into) for callers that already own a
+    /// destination buffer (e.g. a strided batch buffer): the payload is copied
+    /// straight from the slot into `out` with no intermediate `Vec`. The copy
+    /// is clamped to `out.len()`, so an over-large frame is truncated to what
+    /// the caller can hold; the returned length is the number of bytes actually
+    /// written. The same untrusted-producer clamp as `try_pop_into` applies.
+    pub fn try_pop_into_slice(&self, out: &mut [u8]) -> Option<(u32, usize)> {
+        let hdr = self.header();
+        let pos = hdr.read_pos.load(Ordering::Relaxed);
+        let idx = (pos & self.mask) as usize;
+        let seq = self.seq_at(idx).load(Ordering::Acquire);
+        // diff == 0 → slot READY; diff < 0 → producer hasn't published it.
+        if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
+            return None;
+        }
+
+        let seg = unsafe { self.data.add(idx * self.segment_size) };
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        unsafe {
+            std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
+        }
+        let (len, traffic_id) = decode_header(&header);
+        // Clamp a hostile/garbled length to the slot's payload capacity, then to
+        // what the caller's buffer can hold.
+        let len = (len as usize).min(self.max_payload());
+        let n = len.min(out.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(seg.add(FRAME_HEADER_LEN), out.as_mut_ptr(), n);
+        }
+
+        // Release the slot for reuse `capacity` laps ahead, then advance.
+        self.seq_at(idx)
+            .store(pos.wrapping_add(self.capacity as u64), Ordering::Release);
+        hdr.read_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
+        Some((traffic_id, n))
+    }
+
     /// Peek the next READY frame's full on-wire bytes (`[len|traffic_id|payload]`)
     /// without dequeuing, for zero-copy forwarding straight to the upstream.
     ///
@@ -735,6 +776,28 @@ mod tests {
             assert_eq!(consumer.peek_frame().unwrap(), &expect[..]);
             consumer.advance();
             assert!(consumer.peek_frame().is_none());
+        }
+    }
+
+    #[test]
+    fn try_pop_into_slice_matches_try_pop() {
+        let (_c, _d, producer, consumer) = make(4, segment_size_for(64));
+        // Empty ring → None.
+        let mut out = [0u8; 64];
+        assert!(consumer.try_pop_into_slice(&mut out).is_none());
+
+        for i in 0..5_000u32 {
+            let len = 1 + (i as usize % 50);
+            let payload = vec![(i & 0xff) as u8; len];
+            assert!(matches!(
+                producer.try_push(i, &payload).unwrap(),
+                PushOutcome::Pushed { .. }
+            ));
+            let (tid, n) = consumer.try_pop_into_slice(&mut out).expect("frame ready");
+            assert_eq!(tid, i);
+            assert_eq!(n, len);
+            assert_eq!(&out[..n], &payload[..]);
+            assert!(consumer.try_pop_into_slice(&mut out).is_none());
         }
     }
 

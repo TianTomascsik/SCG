@@ -274,6 +274,7 @@ pub fn start_single_rule(
     };
 
     // Build the RuleContext (moved into the thread)
+    let perf = rule.perf_knobs(config.perf_profile, config.sock_buf_size);
     let ctx = RuleContext {
         rule_name: rule.name.clone(),
         listen_addr: rule.listen_addr.clone(),
@@ -283,7 +284,7 @@ pub fn start_single_rule(
         tls_mode: effective_tls_mode,
         security_provider: security_provider.clone(),
         transparent: rule.transparent,
-        sock_buf_size: config.sock_buf_size,
+        sock_buf_size: perf.sock_buf_size,
         metrics: rule_metrics,
         shutdown: Arc::new(AtomicBool::new(false)), // placeholder, replaced below
         provider_params: rule.provider_params.clone(),
@@ -294,7 +295,7 @@ pub fn start_single_rule(
         simulated_delay_ms: rule.simulated_delay_ms,
         protocol_version: rule.protocol_version.clone(),
         app_protocol: app_protocol.to_string(),
-        perf: rule.perf_knobs(config.perf_profile),
+        perf,
         conn_pool,
     };
 

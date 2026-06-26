@@ -328,6 +328,14 @@ fn map_one(
         "security_provider".to_string(),
         Value::String(provider.security_provider.to_string()),
     );
+    // Fail-secure: emit an explicit peer-verification mode for crypto providers
+    // so the generated rule never relies on the (now-rejected) implicit
+    // "no verification" default. Abstract lite TLS/DTLS profiles map to
+    // certificate verification of the peer ("server"); deployments that need
+    // mutual authentication express it through a richer crypto profile.
+    if matches!(provider.security_provider, "tls" | "dtls") {
+        rule.insert("verify".to_string(), Value::String("server".to_string()));
+    }
     if let Some(ap) = provider.app_protocol {
         rule.insert("app_protocol".to_string(), Value::String(ap.to_string()));
     }

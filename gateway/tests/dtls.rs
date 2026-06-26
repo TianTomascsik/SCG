@@ -104,7 +104,7 @@ fn dtls12_round_trip() {
     let listen = format!("127.0.0.1:{}", free_port());
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls12", "encrypt", &listen, &echo.addr, "dtls1.2", ""),
+        &dtls_rule("dtls12", "encrypt", &listen, &echo.addr, "dtls1.2", r#","verify":"none""#),
     );
 
     run(&config, || {
@@ -123,7 +123,7 @@ fn dtls10_round_trip() {
     let listen = format!("127.0.0.1:{}", free_port());
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls10", "encrypt", &listen, &echo.addr, "dtls1.0", ""),
+        &dtls_rule("dtls10", "encrypt", &listen, &echo.addr, "dtls1.0", r#","verify":"none""#),
     );
 
     run(&config, || {
@@ -258,7 +258,7 @@ fn dtls_decrypt_round_trip() {
     let backend = PlainUdpEchoServer::start();
     let listen = format!("127.0.0.1:{}", free_port());
     let extra = format!(
-        r#","cert_path":"{}","key_path":"{}""#,
+        r#","verify":"none","cert_path":"{}","key_path":"{}""#,
         pki.server_cert.display(),
         pki.server_key.display()
     );

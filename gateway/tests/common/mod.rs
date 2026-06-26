@@ -222,6 +222,7 @@ pub fn build_config(echo_addr: &str, uid: u32, tmp: &Path) -> GatewayConfig {
                     "upstream_addr": "{echo}",
                     "upstream_proto": "tcp",
                     "security_provider": "tls",
+                    "verify": "none",
                     "traffic_class": "safety",
                     "app_id": "app-test",
                     "allowed_uids": [{uid}]
@@ -234,6 +235,7 @@ pub fn build_config(echo_addr: &str, uid: u32, tmp: &Path) -> GatewayConfig {
                     "upstream_addr": "{echo}",
                     "upstream_proto": "tcp",
                     "security_provider": "tls",
+                    "verify": "none",
                     "traffic_class": "safety",
                     "app_id": "app-test",
                     "allowed_uids": [{uid}]

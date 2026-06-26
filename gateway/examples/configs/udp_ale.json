@@ -24,6 +24,7 @@
       "security_provider": "tls",
       "traffic_class": "safety",
       "app_protocol": "ale",
+      "verify": "none",
       "cert_path": "/etc/scg/pki/collector.crt",
       "key_path": "/etc/scg/pki/collector.key"
     }

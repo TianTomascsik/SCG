@@ -69,6 +69,7 @@ fn tcp_encrypt_relay_round_trip() {
                 "upstream_addr": "{echo}",
                 "upstream_proto": "tcp",
                 "security_provider": "tls",
+                "verify": "none",
                 "traffic_class": "safety"
             }}]
         }}"#,
@@ -137,6 +138,7 @@ fn udp_and_tproxy_rules_validate() {
                     "upstream_addr": "127.0.0.1:8443",
                     "upstream_proto": "tcp",
                     "security_provider": "tls",
+                    "verify": "none",
                     "app_protocol": "ale"
                 }},
                 {{
@@ -147,6 +149,7 @@ fn udp_and_tproxy_rules_validate() {
                     "upstream_addr": "auto",
                     "upstream_proto": "tcp",
                     "security_provider": "tls",
+                    "verify": "none",
                     "transparent": true
                 }}
             ]

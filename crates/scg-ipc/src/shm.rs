@@ -349,6 +349,43 @@ impl RingConsumer {
         Some(traffic_id)
     }
 
+    /// Try to dequeue one frame's payload directly into a caller-owned slice,
+    /// returning `(traffic_id, copied_len)`.
+    ///
+    /// Single-copy, allocation-free sibling of [`try_pop_into`](Self::try_pop_into)
+    /// for callers that already own a destination buffer: the payload is copied
+    /// straight from the ring into `out` with no intermediate `Vec`. The copy is
+    /// clamped to `out.len()` (an over-large frame is truncated to what the
+    /// caller can hold) but the whole frame is always consumed from the ring.
+    /// The same untrusted-producer bounds checks apply.
+    pub fn try_pop_into_slice(&self, out: &mut [u8]) -> Option<(u32, usize)> {
+        let ix = self.indices();
+        let read = ix.read_idx.load(Ordering::Relaxed);
+        let write = ix.write_idx.load(Ordering::Acquire);
+        let avail_raw = write.wrapping_sub(read);
+        let avail = std::cmp::min(avail_raw as usize, self.cap);
+        if avail < FRAME_HEADER_LEN {
+            return None;
+        }
+
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        let off = (read % self.cap as u64) as usize;
+        let next_off = self.read_wrapping(off, &mut header);
+        let (len, traffic_id) = decode_header(&header);
+        let len = len as usize;
+        if len > self.cap - FRAME_HEADER_LEN || avail < FRAME_HEADER_LEN + len {
+            return None;
+        }
+
+        let n = len.min(out.len());
+        unsafe {
+            self.read_wrapping_ptr(next_off, out.as_mut_ptr(), n);
+        }
+        ix.read_idx
+            .store(read.wrapping_add((FRAME_HEADER_LEN + len) as u64), Ordering::Release);
+        Some((traffic_id, n))
+    }
+
     fn read_wrapping(&self, off: usize, dst: &mut [u8]) -> usize {
         let n = dst.len();
         if n == 0 {
@@ -544,6 +581,33 @@ mod tests {
             assert_eq!(&popbuf[..], &payload[..]);
         }
         assert!(consumer.try_pop_into(&mut popbuf).is_none());
+    }
+
+    #[test]
+    fn try_pop_into_slice_matches_try_pop() {
+        let cap = 64usize;
+        let control = buf(SHM_CONTROL_SIZE);
+        let data = buf(cap);
+        unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+        let consumer = unsafe { RingConsumer::new(&ctl.c2g, data.as_ptr(), cap) };
+
+        // Empty ring yields None.
+        let mut out = [0u8; 64];
+        assert!(consumer.try_pop_into_slice(&mut out).is_none());
+
+        // Single-copy pop into a reused slice across many wrapping frames.
+        for i in 0..1000u32 {
+            let len = 1 + (i as usize % 24);
+            let payload = vec![(i & 0xff) as u8; len];
+            assert!(producer.try_push(i, &payload).unwrap());
+            let (tid, n) = consumer.try_pop_into_slice(&mut out).unwrap();
+            assert_eq!(tid, i);
+            assert_eq!(n, len);
+            assert_eq!(&out[..n], &payload[..]);
+        }
+        assert!(consumer.try_pop_into_slice(&mut out).is_none());
     }
 
     #[test]

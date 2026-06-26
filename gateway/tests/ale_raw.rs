@@ -93,6 +93,7 @@ fn chain_config(
                     "upstream_addr": "{dec_listen}",
                     "upstream_proto": "tcp",
                     "security_provider": "tls",
+                    "verify": "none",
                     "traffic_class": "safety"{app_field}
                 }},
                 {{
@@ -104,6 +105,7 @@ fn chain_config(
                     "upstream_proto": "udp",
                     "security_provider": "tls",
                     "traffic_class": "safety",
+                    "verify": "none",
                     "cert_path": "{cert}",
                     "key_path": "{key}"{app_field}
                 }}

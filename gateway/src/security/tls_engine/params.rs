@@ -141,8 +141,12 @@ impl TlsSecurityParams {
             None => TlsProfile::Default,
         };
 
-        // Verify mode: explicit key wins, otherwise derive a sensible default
-        // from the profile.
+        // Verify mode: an explicit `verify` always wins. Profiles that imply a
+        // safe posture (PKI ⇒ mutual, integrity-only ⇒ server) keep their
+        // default, but the `default` and `subset146-psk` profiles have no safe
+        // implicit default — silently falling back to `none` would disable peer
+        // verification and enable MITM. Require an explicit choice instead
+        // (fail-secure).
         let verify = match get_str("verify") {
             Some(s) => match s.as_str() {
                 "none" => VerifyMode::None,
@@ -158,7 +162,13 @@ impl TlsSecurityParams {
             None => match profile {
                 TlsProfile::Subset146Pki => VerifyMode::Mutual,
                 TlsProfile::IntegrityOnly => VerifyMode::Server,
-                TlsProfile::Subset146Psk | TlsProfile::Default => VerifyMode::None,
+                TlsProfile::Subset146Psk | TlsProfile::Default => {
+                    return Err(
+                        "verify mode must be set explicitly (expected: none, server, mutual); \
+                         omitting it would silently disable peer verification"
+                            .to_string(),
+                    )
+                }
             },
         };
 
@@ -369,11 +379,27 @@ mod tests {
     }
 
     #[test]
-    fn default_when_empty() {
-        let p = TlsSecurityParams::from_params(&HashMap::new(), None).unwrap();
+    fn default_profile_requires_explicit_verify() {
+        // Fail-secure: the `default` profile must not silently default to
+        // verify = none. An empty params map is rejected.
+        assert!(TlsSecurityParams::from_params(&HashMap::new(), None).is_err());
+    }
+
+    #[test]
+    fn default_profile_with_explicit_none() {
+        let m = params_from(&[("verify", json!("none"))]);
+        let p = TlsSecurityParams::from_params(&m, None).unwrap();
         assert_eq!(p.profile, TlsProfile::Default);
         assert_eq!(p.verify, VerifyMode::None);
         assert!(p.is_ktls_offloadable());
+    }
+
+    #[test]
+    fn default_profile_with_explicit_server() {
+        let m = params_from(&[("verify", json!("server"))]);
+        let p = TlsSecurityParams::from_params(&m, None).unwrap();
+        assert_eq!(p.verify, VerifyMode::Server);
+        assert!(!p.is_ktls_offloadable());
     }
 
     #[test]
@@ -390,11 +416,15 @@ mod tests {
 
     #[test]
     fn psk_requires_identity_and_key() {
-        let m = params_from(&[("profile", json!("subset146-psk"))]);
+        let m = params_from(&[
+            ("profile", json!("subset146-psk")),
+            ("verify", json!("none")),
+        ]);
         assert!(TlsSecurityParams::from_params(&m, Some("tls1.2")).is_err());
 
         let m = params_from(&[
             ("profile", json!("subset146-psk")),
+            ("verify", json!("none")),
             ("psk_identity", json!("client1")),
             ("psk_hex", json!("00112233445566778899aabbccddeeff")),
         ]);
@@ -404,9 +434,21 @@ mod tests {
     }
 
     #[test]
+    fn psk_requires_explicit_verify() {
+        // subset146-psk has no safe implicit verify default either.
+        let m = params_from(&[
+            ("profile", json!("subset146-psk")),
+            ("psk_identity", json!("client1")),
+            ("psk_hex", json!("00112233445566778899aabbccddeeff")),
+        ]);
+        assert!(TlsSecurityParams::from_params(&m, Some("tls1.2")).is_err());
+    }
+
+    #[test]
     fn psk_rejects_tls13() {
         let m = params_from(&[
             ("profile", json!("subset146-psk")),
+            ("verify", json!("none")),
             ("psk_identity", json!("c")),
             ("psk_hex", json!("aabb")),
         ]);
@@ -415,13 +457,17 @@ mod tests {
 
     #[test]
     fn unpaired_cert_key_rejected() {
-        let m = params_from(&[("cert_path", json!("/x.pem"))]);
+        let m = params_from(&[("verify", json!("none")), ("cert_path", json!("/x.pem"))]);
         assert!(TlsSecurityParams::from_params(&m, None).is_err());
     }
 
     #[test]
     fn psk_hex_only_with_psk_profile() {
-        let m = params_from(&[("psk_hex", json!("aabb")), ("psk_identity", json!("c"))]);
+        let m = params_from(&[
+            ("verify", json!("none")),
+            ("psk_hex", json!("aabb")),
+            ("psk_identity", json!("c")),
+        ]);
         assert!(TlsSecurityParams::from_params(&m, None).is_err());
     }
 
@@ -449,7 +495,10 @@ mod tests {
         let p = TlsSecurityParams::default();
         assert_eq!(p.sni_name("backend.example:443"), "backend.example");
         assert_eq!(p.sni_name("[2001:db8::1]:443"), "2001:db8::1");
-        let m = params_from(&[("server_name", json!("frontend.local"))]);
+        let m = params_from(&[
+            ("verify", json!("none")),
+            ("server_name", json!("frontend.local")),
+        ]);
         let p = TlsSecurityParams::from_params(&m, None).unwrap();
         assert_eq!(p.sni_name("backend:443"), "frontend.local");
     }

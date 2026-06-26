@@ -125,6 +125,7 @@ pub fn connect_tls_upstream(
     label: &str,
     upstream_addr: &str,
     tls_mode: TlsMode,
+    provider_params: &HashMap<String, serde_json::Value>,
     protocol_version: Option<&str>,
     sock_buf_size: usize,
     qos: QosPolicy,
@@ -144,9 +145,12 @@ pub fn connect_tls_upstream(
     let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
 
-    // Local interfaces use the default (verify-none) TLS profile; only the
-    // protocol version is configurable here.
-    let params = TlsSecurityParams::from_params(&std::collections::HashMap::new(), protocol_version)
+    // Honour the rule's configured TLS security parameters (verify mode,
+    // cert/key/CA, profile) for the upstream connection, exactly like the
+    // decrypt-side acceptor. Falling back to an empty map here would silently
+    // ignore the operator's `verify` setting and connect without peer
+    // verification.
+    let params = TlsSecurityParams::from_params(provider_params, protocol_version)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let sni = params.sni_name(upstream_addr);
 
