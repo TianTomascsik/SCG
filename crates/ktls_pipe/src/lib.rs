@@ -405,6 +405,22 @@ pub fn ktls_privilege_hint() -> &'static str {
     }
 }
 
+/// Whether the running kernel exposes the TLS upper-layer protocol (the `tls`
+/// ULP), i.e. kTLS offload is available on this host.
+///
+/// Probes `/proc/sys/net/ipv4/tcp_available_ulp` once and caches the result —
+/// the set of registered ULPs does not change at runtime. Returns `false` when
+/// the file is absent or does not list `tls` (e.g. the `tls` module is not
+/// loaded), which callers use to transparently stay on userspace TLS.
+pub fn kernel_supports_ktls() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        fs::read_to_string("/proc/sys/net/ipv4/tcp_available_ulp")
+            .map(|s| s.split_whitespace().any(|ulp| ulp == "tls"))
+            .unwrap_or(false)
+    })
+}
+
 // =========================================================================================
 //                              Socket & pipe helpers
 // =========================================================================================

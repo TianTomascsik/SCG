@@ -50,6 +50,16 @@ pub struct GatewayConfig {
     /// own `perf_profile`. Default: `balanced` (the historical behaviour).
     #[serde(default)]
     pub perf_profile: PerfProfile,
+
+    /// Prefer kernel TLS (kTLS) over userspace OpenSSL on the encrypted fast
+    /// path. When `true` (the default), a rule configured for userspace `tls`
+    /// whose crypto parameters are kTLS-offloadable (default profile,
+    /// server-authenticated AES-GCM, no PSK) is transparently upgraded to the
+    /// zero-copy kTLS engine on hosts that expose the `tls` ULP. Hosts without
+    /// kTLS support, and rules that require userspace features (peer
+    /// verification, PSK, custom ciphers), stay on userspace TLS automatically.
+    #[serde(default = "default_prefer_ktls")]
+    pub prefer_ktls: bool,
 }
 
 /// Management API (gRPC) configuration.
@@ -196,6 +206,35 @@ fn default_create_rate_per_min() -> u32 {
 
 fn default_sock_buf_size() -> usize {
     16 * 1024 * 1024 // 16 MiB
+}
+
+fn default_prefer_ktls() -> bool {
+    true
+}
+
+/// Resolve the effective crypto provider name, applying the kTLS preference.
+///
+/// Two complementary, mutually-exclusive adjustments are made to the
+/// `configured` provider so the gateway always runs the best safe engine:
+///
+/// * a `ktls` rule whose parameters are **not** offloadable (a non-default
+///   profile, peer verification, or PSK) is downgraded to userspace `tls`,
+/// * a userspace `tls` rule whose parameters **are** offloadable is upgraded to
+///   `ktls` when `prefer_ktls` is set and the kernel exposes the `tls` ULP
+///   (`kernel_ktls`), making the zero-copy fast path the default.
+///
+/// Any other provider (`dtls`, `routing`, custom) is returned unchanged.
+pub fn resolve_crypto_provider(
+    configured: &str,
+    offloadable: bool,
+    prefer_ktls: bool,
+    kernel_ktls: bool,
+) -> &str {
+    match configured {
+        "ktls" if !offloadable => "tls",
+        "tls" if prefer_ktls && offloadable && kernel_ktls => "ktls",
+        other => other,
+    }
 }
 
 // ─── Performance profile ─────────────────────────────────────────────────────
@@ -1886,6 +1925,47 @@ mod perf_knobs_tests {
         let rule = rule_with(serde_json::json!({}));
         let k = rule.perf_knobs(PerfProfile::Latency, 16 * MIB);
         assert_eq!(k.pipe_size, 256 * KIB); // inherited latency
+    }
+}
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    use super::resolve_crypto_provider;
+
+    #[test]
+    fn offloadable_tls_upgrades_to_ktls_when_kernel_supports_it() {
+        assert_eq!(resolve_crypto_provider("tls", true, true, true), "ktls");
+    }
+
+    #[test]
+    fn tls_stays_userspace_without_kernel_support() {
+        assert_eq!(resolve_crypto_provider("tls", true, true, false), "tls");
+    }
+
+    #[test]
+    fn tls_stays_userspace_when_preference_disabled() {
+        assert_eq!(resolve_crypto_provider("tls", true, false, true), "tls");
+    }
+
+    #[test]
+    fn non_offloadable_tls_is_never_upgraded() {
+        assert_eq!(resolve_crypto_provider("tls", false, true, true), "tls");
+    }
+
+    #[test]
+    fn non_offloadable_ktls_downgrades_to_userspace_tls() {
+        assert_eq!(resolve_crypto_provider("ktls", false, true, true), "tls");
+    }
+
+    #[test]
+    fn offloadable_ktls_stays_ktls() {
+        assert_eq!(resolve_crypto_provider("ktls", true, false, false), "ktls");
+    }
+
+    #[test]
+    fn other_providers_pass_through_unchanged() {
+        assert_eq!(resolve_crypto_provider("dtls", false, true, true), "dtls");
+        assert_eq!(resolve_crypto_provider("routing", true, true, true), "routing");
     }
 }
 

@@ -102,6 +102,11 @@ pub struct TlsSecurityParams {
     pub cipher_list: Option<String>,
     /// Advanced override for the TLS 1.3 ciphersuites.
     pub ciphersuites: Option<String>,
+    /// Whether TLS session resumption (TLS 1.3 tickets / TLS 1.2 session cache)
+    /// is enabled for this rule. Resumption amortises the handshake cost across
+    /// reconnects; leaving it `false` forces a full handshake on every
+    /// connection. Default: `false` (opt-in).
+    pub resumption: bool,
 }
 
 impl Default for TlsSecurityParams {
@@ -118,6 +123,7 @@ impl Default for TlsSecurityParams {
             psk_key: None,
             cipher_list: None,
             ciphersuites: None,
+            resumption: false,
         }
     }
 }
@@ -184,6 +190,17 @@ impl TlsSecurityParams {
         let cipher_list = get_str("cipher_list");
         let ciphersuites = get_str("ciphersuites");
 
+        // Session resumption defaults off (opt-in); accept a JSON bool or a
+        // "true"/"false" string so it can be supplied via the generic
+        // provider-params map.
+        let resumption = match params.get("resumption") {
+            Some(v) => v
+                .as_bool()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<bool>().ok()))
+                .ok_or_else(|| "resumption must be a boolean (true/false)".to_string())?,
+            None => false,
+        };
+
         let parsed = TlsSecurityParams {
             version: protocol_version.map(str::to_string),
             profile,
@@ -196,6 +213,7 @@ impl TlsSecurityParams {
             psk_key,
             cipher_list,
             ciphersuites,
+            resumption,
         };
         parsed.validate()?;
         Ok(parsed)
@@ -400,6 +418,32 @@ mod tests {
         let p = TlsSecurityParams::from_params(&m, None).unwrap();
         assert_eq!(p.verify, VerifyMode::Server);
         assert!(!p.is_ktls_offloadable());
+    }
+
+    #[test]
+    fn resumption_defaults_off() {
+        let m = params_from(&[("verify", json!("none"))]);
+        let p = TlsSecurityParams::from_params(&m, None).unwrap();
+        assert!(!p.resumption);
+        assert!(!TlsSecurityParams::default().resumption);
+    }
+
+    #[test]
+    fn resumption_accepts_bool_and_string() {
+        let m = params_from(&[("verify", json!("none")), ("resumption", json!(true))]);
+        assert!(TlsSecurityParams::from_params(&m, None).unwrap().resumption);
+
+        let m = params_from(&[("verify", json!("none")), ("resumption", json!(false))]);
+        assert!(!TlsSecurityParams::from_params(&m, None).unwrap().resumption);
+
+        let m = params_from(&[("verify", json!("none")), ("resumption", json!("true"))]);
+        assert!(TlsSecurityParams::from_params(&m, None).unwrap().resumption);
+    }
+
+    #[test]
+    fn resumption_rejects_non_boolean() {
+        let m = params_from(&[("verify", json!("none")), ("resumption", json!("maybe"))]);
+        assert!(TlsSecurityParams::from_params(&m, None).is_err());
     }
 
     #[test]

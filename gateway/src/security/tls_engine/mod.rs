@@ -8,7 +8,8 @@ use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 
 use ktls_pipe::KtlsSession;
 use openssl::ssl::{
-    SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslStream, SslVerifyMode, SslVersion,
+    SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslSessionCacheMode,
+    SslStream, SslVerifyMode, SslVersion,
 };
 
 use params::{TlsProfile, TlsSecurityParams, VerifyMode};
@@ -92,7 +93,10 @@ impl io::Write for ProxyStream {
 }
 
 // ─── TLS builders ────────────────────────────────────────────────────────────
-
+/// Stable session-id context so a resuming peer is recognised across
+/// connections served by the same gateway process (required for server-side
+/// TLS 1.2 session reuse and harmless for TLS 1.3 tickets).
+const SESSION_ID_CONTEXT: &[u8] = b"scg-gateway";
 /// Build a userspace TLS `SslAcceptor` from resolved security parameters.
 ///
 /// Honours the rule's profile (cipher policy), peer verification (`verify`),
@@ -117,6 +121,7 @@ pub fn build_tls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, Str
     apply_acceptor_verify(&mut builder, params)?;
     apply_psk_server(&mut builder, params)?;
     pin_version(&mut builder, is13)?;
+    apply_resumption(&mut builder, params, true)?;
 
     Ok(builder.build())
 }
@@ -141,6 +146,7 @@ pub fn build_tls_connector(params: &TlsSecurityParams) -> Result<SslConnector, S
     apply_connector_verify(&mut builder, params)?;
     apply_psk_client(&mut builder, params)?;
     pin_version(&mut builder, is13)?;
+    apply_resumption(&mut builder, params, false)?;
 
     Ok(builder.build())
 }
@@ -302,6 +308,36 @@ fn pin_version(builder: &mut SslContextBuilder, is13: bool) -> Result<(), String
     builder
         .set_max_proto_version(Some(v))
         .map_err(|e| format!("set max version: {}", e))?;
+    Ok(())
+}
+
+/// Configure TLS session resumption per the rule's `resumption` toggle.
+///
+/// When enabled (the default) a reconnecting peer can skip the full handshake:
+/// the server side advertises tickets and keeps a session cache keyed by a
+/// stable session-id context, and the client side caches the sessions/tickets
+/// the upstream issues. When disabled, tickets and the session cache are turned
+/// off so every connection performs a fresh handshake.
+fn apply_resumption(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+    is_server: bool,
+) -> Result<(), String> {
+    if params.resumption {
+        if is_server {
+            builder
+                .set_session_id_context(SESSION_ID_CONTEXT)
+                .map_err(|e| format!("set session id context: {}", e))?;
+            builder.set_session_cache_mode(SslSessionCacheMode::SERVER);
+        } else {
+            builder.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+        }
+    } else {
+        builder.set_options(SslOptions::NO_TICKET);
+        // TLS 1.3 issues tickets independently of the cache; silence them too.
+        builder.set_num_tickets(0).ok();
+        builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+    }
     Ok(())
 }
 

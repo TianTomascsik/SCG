@@ -14,7 +14,7 @@ use crate::management::config::{
 };
 use crate::management::telemetry::RuleMetrics;
 use crate::security::conn_pool::ConnectionPool;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use registry::ProviderRegistry;
 
 use std::collections::HashMap;
@@ -205,7 +205,7 @@ pub fn start_single_rule(
     let rule_name = rule.name.clone();
     let direction = rule.direction;
     let priority = rule.priority;
-    let mut security_provider = rule.effective_security_provider().to_string();
+    let configured_provider = rule.effective_security_provider().to_string();
     let app_protocol = rule.effective_app_protocol();
 
     if let Some(app_id) = &rule.app_id {
@@ -215,24 +215,39 @@ pub fn start_single_rule(
         );
     }
 
-    // kTLS capability gate: kernel TLS only offloads the default AES-GCM,
-    // server-authenticated path. Profiles, peer verification or PSK cannot be
-    // offloaded, so transparently fall back to the userspace `tls` engine.
-    // (integrity-only on kTLS is rejected earlier at config-load time.)
-    if security_provider == "ktls" {
-        if let Ok(p) = crate::security::tls_engine::params::TlsSecurityParams::from_params(
+    // Resolve the effective crypto engine, applying the kTLS preference. kTLS
+    // only offloads the default AES-GCM, server-authenticated path, so a
+    // non-offloadable `ktls` rule (custom profile, peer verification or PSK)
+    // falls back to userspace `tls`; conversely an offloadable userspace `tls`
+    // rule is upgraded to the zero-copy kTLS engine when `prefer_ktls` is set
+    // and the kernel exposes the `tls` ULP. (integrity-only on kTLS is rejected
+    // earlier at config-load time.)
+    let offloadable = matches!(configured_provider.as_str(), "tls" | "ktls")
+        && crate::security::tls_engine::params::TlsSecurityParams::from_params(
             &rule.provider_params,
             rule.protocol_version.as_deref(),
-        ) {
-            if !p.is_ktls_offloadable() {
-                warn!(
-                    "[{}] kTLS cannot offload profile='{}'/verify settings; \
-                     falling back to userspace TLS",
-                    rule_name,
-                    p.profile.as_str()
-                );
-                security_provider = "tls".to_string();
-            }
+        )
+        .map(|p| p.is_ktls_offloadable())
+        .unwrap_or(false);
+    let security_provider = crate::management::config::resolve_crypto_provider(
+        &configured_provider,
+        offloadable,
+        config.prefer_ktls,
+        ktls_pipe::kernel_supports_ktls(),
+    )
+    .to_string();
+    if security_provider != configured_provider {
+        if security_provider == "ktls" {
+            info!(
+                "[{}] preferring kTLS over userspace TLS (kernel `tls` ULP available)",
+                rule_name
+            );
+        } else {
+            warn!(
+                "[{}] kTLS cannot offload this rule's crypto parameters; \
+                 falling back to userspace TLS",
+                rule_name
+            );
         }
     }
 
