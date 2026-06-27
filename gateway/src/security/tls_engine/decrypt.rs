@@ -217,11 +217,17 @@ pub(crate) fn handle_tcp_decrypt(
             let ssl_stream = acceptor
                 .accept(stream)
                 .map_err(|e| io::Error::other(format!("TLS accept: {}", e)))?;
+            // Ground-truth session resumption: `SSL_session_reused` reports
+            // whether this handshake reused a cached session (abbreviated) rather
+            // than running a full key exchange. Logged so the benchmark harness
+            // can count resumed vs full handshakes instead of inferring from timing.
+            let resumed = ssl_stream.ssl().session_reused();
             info!(
-                "[{}] TLS accept from {} ({:.2} ms)",
+                "[{}] TLS accept from {} ({:.2} ms, resumed={})",
                 rule_name,
                 peer_addr,
                 hs_start.elapsed().as_secs_f64() * 1000.0,
+                resumed,
             );
             ProxyStream::Tls(ssl_stream)
         }
@@ -245,13 +251,18 @@ pub(crate) fn handle_tcp_decrypt(
 
             let ulp = get_tcp_ulp(&stream).unwrap_or_default();
             let ktls_active = ulp.starts_with("tls");
+            // Ground-truth session resumption (see the userspace arm above): the
+            // kTLS handshake still runs through OpenSSL, so `SSL_session_reused`
+            // is valid on the session's SSL handle after `accept()`.
+            let resumed = session.ssl_ref().session_reused();
             info!(
-                "[{}] kTLS accept from {} ({:.2} ms, ULP={}, active={})",
+                "[{}] kTLS accept from {} ({:.2} ms, ULP={}, active={}, resumed={})",
                 rule_name,
                 peer_addr,
                 hs_start.elapsed().as_secs_f64() * 1000.0,
                 ulp,
                 ktls_active,
+                resumed,
             );
             if !ktls_active {
                 warn!(
