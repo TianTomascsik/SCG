@@ -247,12 +247,21 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
     } else {
         libc::AF_INET6
     };
+    // SAFETY: `libc::socket` takes only by-value integer arguments (`domain`,
+    // type, protocol) and allocates a fresh kernel resource; there are no
+    // pointers or borrowed state involved. The returned fd is checked for the
+    // `< 0` error case immediately below before any further use.
     let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
     let one: libc::c_int = 1;
+    // SAFETY: `fd` is the valid socket descriptor returned by `libc::socket`
+    // above (verified `>= 0`). For both calls the option-value pointer is
+    // `&one`, a live `libc::c_int` that outlives the calls, and the length
+    // passed is exactly `size_of::<c_int>()`, matching the pointee — so the
+    // kernel reads a correctly-sized, fully-initialised option value.
     unsafe {
         libc::setsockopt(
             fd,
@@ -280,6 +289,12 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
                 },
                 sin_zero: [0; 8],
             };
+            // SAFETY: `fd` is the valid socket descriptor from `libc::socket`
+            // above. `sa` is a fully-initialised `sockaddr_in` (all fields set)
+            // that lives for the duration of the call; it is passed as a
+            // `*const sockaddr` with length exactly `size_of::<sockaddr_in>()`,
+            // so the kernel reads a correctly-typed, in-bounds address struct.
+            // The return value is checked via `bind_result` below.
             unsafe {
                 libc::bind(
                     fd,
@@ -298,6 +313,12 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
                 },
                 sin6_scope_id: v6.scope_id(),
             };
+            // SAFETY: `fd` is the valid socket descriptor from `libc::socket`
+            // above. `sa` is a fully-initialised `sockaddr_in6` (all fields set)
+            // that lives for the duration of the call; it is passed as a
+            // `*const sockaddr` with length exactly `size_of::<sockaddr_in6>()`,
+            // so the kernel reads a correctly-typed, in-bounds address struct.
+            // The return value is checked via `bind_result` below.
             unsafe {
                 libc::bind(
                     fd,
@@ -310,12 +331,21 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
 
     if bind_result < 0 {
         let e = io::Error::last_os_error();
+        // SAFETY: `fd` is the valid descriptor opened by `libc::socket` above
+        // and has not yet been wrapped in any owning type, so this function
+        // still exclusively owns it. Closing it exactly once here on the bind
+        // failure path releases the kernel resource; `fd` is not used again
+        // afterwards (we return immediately), preventing any double-close.
         unsafe {
             libc::close(fd);
         }
         return Err(e);
     }
 
+    // SAFETY: `fd` is a valid, open SOCK_DGRAM descriptor that was just
+    // successfully created and bound, and ownership of it has not been
+    // transferred anywhere else. `from_raw_fd` takes sole ownership, so the
+    // resulting `UdpSocket` is the unique owner responsible for closing `fd`.
     Ok(unsafe { UdpSocket::from_raw_fd(fd) })
 }
 
@@ -407,6 +437,11 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
             });
         }
 
+        // SAFETY: `pollfds` is a live `Vec<libc::pollfd>` whose every element is
+        // fully initialised above; `as_mut_ptr()`/`len()` describe exactly that
+        // contiguous, writable buffer, and the length passed matches the number
+        // of elements, so `poll` only reads/writes in-bounds entries for the
+        // duration of this call (the Vec outlives it). The result is checked below.
         let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 1000) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -438,7 +473,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                         conn_metrics.record_read(n);
 
                         // Get or create DTLS session for this peer
-                        if !sessions.contains_key(&peer_addr) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(peer_addr) {
                             let target_addr: SocketAddr = match target.parse() {
                                 Ok(a) => a,
                                 Err(e) => {
@@ -493,7 +528,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                                     );
                                     // Switch to non-blocking for poll() loop
                                     ssl_stream.get_ref().sock.set_nonblocking(true).ok();
-                                    sessions.insert(peer_addr, ssl_stream);
+                                    e.insert(ssl_stream);
                                 }
                                 Err(e) => {
                                     error!(
@@ -807,6 +842,12 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                     revents: 0,
                                 },
                             ];
+                            // SAFETY: `fds` is a live, fully-initialised
+                            // `[libc::pollfd; 2]` array; `as_mut_ptr()` points to
+                            // its first element and the passed count `2` matches
+                            // the array length exactly, so `poll` only reads and
+                            // writes the two in-bounds entries for the duration of
+                            // the call (the array outlives it). `ret` is checked below.
                             let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
                             if ret < 0 {
                                 let err = io::Error::last_os_error();
@@ -907,6 +948,12 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                     revents: 0,
                                 },
                             ];
+                            // SAFETY: `fds` is a live, fully-initialised
+                            // `[libc::pollfd; 2]` array; `as_mut_ptr()` points to
+                            // its first element and the passed count `2` matches
+                            // the array length exactly, so `poll` only reads and
+                            // writes the two in-bounds entries for the duration of
+                            // the call (the array outlives it). `ret` is checked below.
                             let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
                             if ret < 0 {
                                 let err = io::Error::last_os_error();

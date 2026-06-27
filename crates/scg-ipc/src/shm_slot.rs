@@ -261,8 +261,14 @@ impl SlotProducer {
         let was_empty = hdr.read_pos.load(Ordering::Acquire) == pos;
 
         // Write [len][traffic_id][payload] into the slot's data segment.
+        // SAFETY: `idx < capacity` (masked) and `data` maps `capacity * segment_size`
+        // writable bytes, so this offset stays within the segment array.
         let seg = unsafe { self.data.add(idx * self.segment_size) };
         let header = encode_header(data.len() as u32, traffic_id);
+        // SAFETY: `seg` starts a `segment_size`-byte slot owned by this producer
+        // (slot is free: `diff == 0`); `FRAME_HEADER_LEN + data.len() <= segment_size`
+        // because `data.len() <= max_payload()`, so both copies stay in-slot, and the
+        // source/destination regions do not overlap (distinct mapping vs. local/arg).
         unsafe {
             std::ptr::copy_nonoverlapping(header.as_ptr(), seg, FRAME_HEADER_LEN);
             std::ptr::copy_nonoverlapping(data.as_ptr(), seg.add(FRAME_HEADER_LEN), data.len());
@@ -349,8 +355,13 @@ impl SlotConsumer {
             return None;
         }
 
+        // SAFETY: `idx < capacity` (masked) and `data` maps `capacity * segment_size`
+        // readable bytes, so this offset stays within the segment array.
         let seg = unsafe { self.data.add(idx * self.segment_size) };
         let mut header = [0u8; FRAME_HEADER_LEN];
+        // SAFETY: the slot is READY (`diff == 0`) and owned by this consumer until
+        // released below, so its first `FRAME_HEADER_LEN` bytes are stable; `header`
+        // is a distinct local array of exactly that length, so the regions cannot overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
         }
@@ -360,6 +371,10 @@ impl SlotConsumer {
 
         dst.clear();
         dst.reserve(len);
+        // SAFETY: `len <= max_payload()` so `FRAME_HEADER_LEN + len <= segment_size`,
+        // keeping the read inside this owned slot; `dst.reserve(len)` guarantees `len`
+        // bytes of capacity at `dst.as_mut_ptr()`, and `set_len(len)` only exposes the
+        // bytes just written; source and destination buffers are disjoint allocations.
         unsafe {
             std::ptr::copy_nonoverlapping(seg.add(FRAME_HEADER_LEN), dst.as_mut_ptr(), len);
             dst.set_len(len);
@@ -392,8 +407,13 @@ impl SlotConsumer {
             return None;
         }
 
+        // SAFETY: `idx < capacity` (masked) and `data` maps `capacity * segment_size`
+        // readable bytes, so this offset stays within the segment array.
         let seg = unsafe { self.data.add(idx * self.segment_size) };
         let mut header = [0u8; FRAME_HEADER_LEN];
+        // SAFETY: the slot is READY and owned by this consumer until released below,
+        // so its first `FRAME_HEADER_LEN` bytes are stable; `header` is a distinct
+        // local array of exactly that length, so the regions cannot overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
         }
@@ -402,6 +422,9 @@ impl SlotConsumer {
         // what the caller's buffer can hold.
         let len = (len as usize).min(self.max_payload());
         let n = len.min(out.len());
+        // SAFETY: `n <= max_payload()` so `FRAME_HEADER_LEN + n <= segment_size`, keeping
+        // the read inside this owned slot; `n <= out.len()` so the write stays within the
+        // caller's slice; the slice and the shared segment are disjoint regions.
         unsafe {
             std::ptr::copy_nonoverlapping(seg.add(FRAME_HEADER_LEN), out.as_mut_ptr(), n);
         }
@@ -430,8 +453,13 @@ impl SlotConsumer {
         if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
             return None;
         }
+        // SAFETY: `idx < capacity` (masked) and `data` maps `capacity * segment_size`
+        // readable bytes, so this offset stays within the segment array.
         let seg = unsafe { self.data.add(idx * self.segment_size) };
         let mut header = [0u8; FRAME_HEADER_LEN];
+        // SAFETY: the slot is READY and owned by this consumer (not yet advanced), so
+        // its first `FRAME_HEADER_LEN` bytes are stable; `header` is a distinct local
+        // array of exactly that length, so the regions cannot overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
         }
@@ -644,6 +672,8 @@ mod tests {
     impl Aligned {
         fn new(len: usize) -> Aligned {
             let layout = std::alloc::Layout::from_size_align(len.max(1), 64).unwrap();
+            // SAFETY: `layout` has a non-zero size (`len.max(1)`), satisfying the
+            // `alloc_zeroed` contract; the returned pointer is null-checked below.
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             assert!(!ptr.is_null());
             Aligned { ptr, layout, len }
@@ -651,6 +681,8 @@ mod tests {
     }
     impl Drop for Aligned {
         fn drop(&mut self) {
+            // SAFETY: `self.ptr` was returned by `alloc_zeroed` with `self.layout`
+            // in `new` and has not been freed before; this runs once at drop.
             unsafe { std::alloc::dealloc(self.ptr, self.layout) };
         }
     }
@@ -661,14 +693,24 @@ mod tests {
     ) -> (Aligned, Aligned, SlotProducer, SlotConsumer) {
         let control = Aligned::new(slot_control_size(capacity));
         let data = Aligned::new(ring_data_bytes(capacity, segment_size));
+        // SAFETY: `control.ptr` is a fresh, exclusively-owned, 64-byte-aligned
+        // allocation of `slot_control_size(capacity)` bytes, not yet shared.
         unsafe {
             init_slot_control(control.ptr, capacity, segment_size, 0).unwrap();
         }
         // Use only the c2g ring for single-ring tests.
         let hdr = control.ptr as *const SlotRingHeader;
+        // SAFETY: the seq array begins at `SLOT_HEADER_SIZE` within the control
+        // allocation, which is large enough to hold the header plus the seq array.
         let seq = unsafe { control.ptr.add(SLOT_HEADER_SIZE) } as *const AtomicU64;
+        // SAFETY: `hdr`/`seq` point into the live, initialised control allocation and
+        // `data.ptr` maps `capacity * segment_size` writable bytes, all outliving the
+        // returned handle; this test is the sole producer.
         let producer =
             unsafe { SlotProducer::new(hdr, seq, data.ptr, capacity, segment_size) };
+        // SAFETY: `hdr`/`seq` point into the live, initialised control allocation and
+        // `data.ptr` maps `capacity * segment_size` readable bytes, all outliving the
+        // returned handle; this test is the sole consumer.
         let consumer = unsafe {
             SlotConsumer::new(hdr, seq, data.ptr as *const u8, capacity, segment_size)
         };
@@ -831,9 +873,14 @@ mod tests {
         let control = Aligned::new(slot_control_size(capacity));
         let data_c2g = Aligned::new(ring_data_bytes(capacity, segment_size));
         let data_g2c = Aligned::new(ring_data_bytes(capacity, segment_size));
+        // SAFETY: `control.ptr` is a fresh, exclusively-owned, 64-byte-aligned
+        // allocation of `slot_control_size(capacity)` bytes, not yet shared.
         unsafe {
             init_slot_control(control.ptr, capacity, segment_size, 0).unwrap();
         }
+        // SAFETY: `control`, `data_c2g` and `data_g2c` are live allocations of the
+        // exact lengths passed (control page and two `capacity * segment_size` data
+        // regions) that outlive the returned ring handles.
         let (gw_rx, gw_tx) = unsafe {
             gateway_slot_rings(
                 control.ptr,
@@ -847,6 +894,9 @@ mod tests {
             )
             .unwrap()
         };
+        // SAFETY: `control`, `data_c2g` and `data_g2c` are the same live allocations of
+        // the exact lengths passed, shared with the gateway handles above under the
+        // SPSC discipline, and outlive the returned ring handles.
         let (cl_tx, cl_rx) = unsafe {
             client_slot_rings(
                 control.ptr,
@@ -874,11 +924,15 @@ mod tests {
         // Non-power-of-two capacity.
         let control = Aligned::new(4096);
         assert_eq!(
+            // SAFETY: `control.ptr` is a fresh 4096-byte exclusively-owned allocation;
+            // the call rejects the bad geometry before touching the mapping.
             unsafe { init_slot_control(control.ptr, 3, segment_size_for(16), 0) },
             Err(ShmError::BadGeometry)
         );
         // segment_size not a cache-line multiple.
         assert_eq!(
+            // SAFETY: same fresh 4096-byte allocation; the call rejects the bad
+            // geometry before touching the mapping.
             unsafe { init_slot_control(control.ptr, 4, 100, 0) },
             Err(ShmError::BadGeometry)
         );

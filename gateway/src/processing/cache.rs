@@ -104,6 +104,12 @@ impl TrafficCache {
     pub fn len(&self) -> usize {
         self.entries.read().unwrap().len()
     }
+
+    /// Whether the cache currently holds no entries.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().unwrap().is_empty()
+    }
 }
 
 #[cfg(test)]

@@ -102,6 +102,10 @@ pub struct KtlsSession {
 
 impl KtlsSession {
     pub fn new(ssl: Ssl, fd: libc::c_int) -> Result<Self, ErrorStack> {
+        // SAFETY: `ssl.as_ptr()` returns the valid, non-null `SSL*` owned by the
+        // `Ssl` we are about to take ownership of; `fd` is the caller-supplied
+        // descriptor that OpenSSL will associate with this connection. The
+        // return value is checked below.
         let ret = unsafe { SSL_set_fd(ssl.as_ptr(), fd) };
         if ret == 1 {
             Ok(Self { ssl })
@@ -111,6 +115,9 @@ impl KtlsSession {
     }
 
     pub fn accept(&mut self) -> Result<(), ErrorStack> {
+        // SAFETY: `self.ssl.as_ptr()` is the valid, non-null `SSL*` owned by
+        // `self` and kept alive for the duration of this call; the return value
+        // is checked below.
         let ret = unsafe { openssl_sys::SSL_accept(self.ssl.as_ptr()) };
         if ret == 1 {
             Ok(())
@@ -120,6 +127,9 @@ impl KtlsSession {
     }
 
     pub fn connect(&mut self) -> Result<(), ErrorStack> {
+        // SAFETY: `self.ssl.as_ptr()` is the valid, non-null `SSL*` owned by
+        // `self` and kept alive for the duration of this call; the return value
+        // is checked below.
         let ret = unsafe { openssl_sys::SSL_connect(self.ssl.as_ptr()) };
         if ret == 1 {
             Ok(())
@@ -137,6 +147,8 @@ impl KtlsSession {
     }
 
     pub fn shutdown(&self) {
+        // SAFETY: `self.ssl.as_ptr()` is the valid, non-null `SSL*` owned by
+        // `self` and kept alive for the duration of this call.
         unsafe {
             openssl_sys::SSL_shutdown(self.ssl.as_ptr());
         }
@@ -149,6 +161,11 @@ impl Read for KtlsSession {
             return Ok(0);
         }
         let len = usize::min(buf.len(), libc::c_int::MAX as usize);
+        // SAFETY: `self.ssl.as_ptr()` is a valid, non-null `SSL*` owned by
+        // `self`; `buf.as_mut_ptr()` points to `buf.len()` writable bytes and
+        // `len` is clamped to `c_int::MAX` so it never exceeds the buffer or
+        // overflows the `c_int` length argument. The return value is checked
+        // below.
         let ret = unsafe {
             openssl_sys::SSL_read(
                 self.ssl.as_ptr(),
@@ -160,6 +177,9 @@ impl Read for KtlsSession {
             return Ok(ret as usize);
         }
 
+        // SAFETY: `self.ssl.as_ptr()` is a valid, non-null `SSL*` owned by
+        // `self`; `ret` is the result just returned by `SSL_read` on the same
+        // session, which is exactly what `SSL_get_error` expects.
         let err = unsafe { openssl_sys::SSL_get_error(self.ssl.as_ptr(), ret) };
         match err {
             openssl_sys::SSL_ERROR_WANT_READ | openssl_sys::SSL_ERROR_WANT_WRITE => {
@@ -184,6 +204,10 @@ impl Write for KtlsSession {
             return Ok(0);
         }
         let len = usize::min(buf.len(), libc::c_int::MAX as usize);
+        // SAFETY: `self.ssl.as_ptr()` is a valid, non-null `SSL*` owned by
+        // `self`; `buf.as_ptr()` points to `buf.len()` readable bytes and `len`
+        // is clamped to `c_int::MAX` so it never exceeds the buffer or overflows
+        // the `c_int` length argument. The return value is checked below.
         let ret = unsafe {
             openssl_sys::SSL_write(
                 self.ssl.as_ptr(),
@@ -195,6 +219,9 @@ impl Write for KtlsSession {
             return Ok(ret as usize);
         }
 
+        // SAFETY: `self.ssl.as_ptr()` is a valid, non-null `SSL*` owned by
+        // `self`; `ret` is the result just returned by `SSL_write` on the same
+        // session, which is exactly what `SSL_get_error` expects.
         let err = unsafe { openssl_sys::SSL_get_error(self.ssl.as_ptr(), ret) };
         match err {
             openssl_sys::SSL_ERROR_WANT_READ | openssl_sys::SSL_ERROR_WANT_WRITE => {
@@ -332,6 +359,9 @@ pub fn build_server_acceptor(
     builder.set_private_key(pkey)?;
     builder.set_certificate(cert)?;
     builder.check_private_key()?;
+    // SAFETY: `builder.as_ptr()` returns the valid, non-null `SSL_CTX*` owned by
+    // the live `builder` on the stack, so it outlives this call and is not
+    // concurrently mutated; this satisfies `enable_ktls_ctx`'s safety contract.
     unsafe {
         enable_ktls_ctx(builder.as_ptr());
     }
@@ -345,6 +375,9 @@ pub fn build_client_connector(
 ) -> Result<SslConnector, openssl::error::ErrorStack> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_verify(SslVerifyMode::NONE);
+    // SAFETY: `builder.as_ptr()` returns the valid, non-null `SSL_CTX*` owned by
+    // the live `builder` on the stack, so it outlives this call and is not
+    // concurrently mutated; this satisfies `enable_ktls_ctx`'s safety contract.
     unsafe {
         enable_ktls_ctx(builder.as_ptr());
     }
@@ -380,6 +413,10 @@ pub fn get_tcp_ulp(stream: &TcpStream) -> io::Result<String> {
     let fd = stream.as_raw_fd();
     let mut buf = [0u8; 16];
     let mut len = buf.len() as libc::socklen_t;
+    // SAFETY: `fd` is the raw descriptor of the live, borrowed `stream`;
+    // `buf.as_mut_ptr()`/`len` describe a 16-byte writable buffer and `len` is
+    // initialised to its capacity, so the kernel writes at most that many bytes
+    // and updates `len` in place. The return value is checked below.
     let ret = unsafe {
         libc::getsockopt(
             fd,
@@ -414,6 +451,8 @@ pub fn get_tls_stat_total() -> io::Result<u64> {
 }
 
 pub fn ktls_privilege_hint() -> &'static str {
+    // SAFETY: `geteuid` takes no arguments, never fails, and only reads the
+    // calling process's effective user id, so the call is always sound.
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
         " Hint: run as root or grant CAP_NET_ADMIN (setcap cap_net_admin+ep <bin>)."
@@ -444,6 +483,10 @@ pub fn kernel_supports_ktls() -> bool {
 
 /// Set send/receive buffer sizes on a TCP socket to `SOCK_BUF_SIZE`.
 fn tune_socket_buffers(fd: RawFd) {
+    // SAFETY: `fd` is a raw socket descriptor supplied by the caller; `&val`
+    // points to a live `c_int` whose size is passed explicitly via
+    // `size_of::<c_int>()`, matching the `SO_SNDBUF`/`SO_RCVBUF` option type.
+    // Best-effort tuning, so the return values are intentionally ignored.
     unsafe {
         let val = SOCK_BUF_SIZE;
         libc::setsockopt(
@@ -466,6 +509,10 @@ fn tune_socket_buffers(fd: RawFd) {
 /// Set TCP_NODELAY on a raw fd.
 fn set_nodelay(fd: RawFd, on: bool) {
     let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a raw socket descriptor supplied by the caller; `&val`
+    // points to a live `c_int` whose size is passed explicitly via
+    // `size_of::<c_int>()`, matching the `TCP_NODELAY` option type. Best-effort,
+    // so the return value is intentionally ignored.
     unsafe {
         libc::setsockopt(
             fd,
@@ -481,6 +528,10 @@ fn set_nodelay(fd: RawFd, on: bool) {
 /// full MSS-sized segments. Disabling flushes the cork buffer.
 fn set_tcp_cork(fd: RawFd, on: bool) {
     let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a raw socket descriptor supplied by the caller; `&val`
+    // points to a live `c_int` whose size is passed explicitly via
+    // `size_of::<c_int>()`, matching the `TCP_CORK` option type. Best-effort,
+    // so the return value is intentionally ignored.
     unsafe {
         libc::setsockopt(
             fd,
@@ -495,11 +546,17 @@ fn set_tcp_cork(fd: RawFd, on: bool) {
 /// Create a `pipe2(O_CLOEXEC)` pair, returns `(read_fd, write_fd)`.
 fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds.as_mut_ptr()` points to a writable array of exactly 2 `RawFd`
+    // (`c_int`), which is what `pipe2` expects to fill; `O_CLOEXEC` is a valid
+    // flag. The return value is checked below before the fds are used.
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
     // Grow pipe capacity to 1 MiB for better splice throughput.
+    // SAFETY: `fds[0]` is the valid read-end descriptor just created by the
+    // checked `pipe2` above; `F_SETPIPE_SZ` takes the pipe size as its `c_int`
+    // argument. Best-effort tuning, so the return value is intentionally ignored.
     unsafe {
         libc::fcntl(fds[0], libc::F_SETPIPE_SZ, SPLICE_CHUNK as libc::c_int);
     }
@@ -509,6 +566,9 @@ fn make_pipe() -> io::Result<(RawFd, RawFd)> {
 /// Close a raw fd if it is >= 0.
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
+        // SAFETY: `fd` is non-negative (checked above) and is a descriptor owned
+        // by the caller that is being relinquished here; closing it exactly once
+        // is sound.
         unsafe {
             libc::close(fd);
         }
@@ -538,9 +598,17 @@ fn write_splice(
         let mut vmspliced = 0usize;
         while vmspliced < chunk {
             let iov_remaining = libc::iovec {
+                // SAFETY: `vmspliced < chunk <= remaining.len()` (loop guard), so
+                // the offset stays within the same `remaining` allocation, which
+                // is the in-bounds requirement of `<*const u8>::add`.
                 iov_base: unsafe { remaining.as_ptr().add(vmspliced) } as *mut libc::c_void,
                 iov_len: chunk - vmspliced,
             };
+            // SAFETY: `pipe_write_fd` is a valid pipe write-end descriptor;
+            // `&iov_remaining` points to one live `iovec` whose base/len describe
+            // a readable in-bounds sub-slice of `remaining`, and the count `1`
+            // matches. `remaining` (borrowed from `data`) outlives the call, and
+            // the return value is checked below.
             let ret = unsafe {
                 libc::vmsplice(
                     pipe_write_fd,
@@ -562,6 +630,11 @@ fn write_splice(
         // 2) splice: move data from pipe to the kTLS TCP socket.
         let mut spliced = 0usize;
         while spliced < vmspliced {
+            // SAFETY: `pipe_read_fd` and `sock_fd` are valid descriptors owned by
+            // the caller; the null offset pointers are explicitly permitted by
+            // `splice` (kernel advances the file offsets), and the length is the
+            // number of bytes previously placed in the pipe. The return value is
+            // checked below.
             let ret = unsafe {
                 libc::splice(
                     pipe_read_fd,
@@ -602,6 +675,9 @@ fn write_splice(
 /// This avoids any kernel→userspace copy on the receive side: the kernel decrypts
 /// the TLS records and discards the plaintext directly.
 fn splice_sink_loop(sock_fd: RawFd, stop: &AtomicBool) -> u64 {
+    // SAFETY: the C string literal `c"/dev/null"` is a valid, NUL-terminated
+    // path pointer that lives for the whole call, and `O_WRONLY` is a valid
+    // open flag. The returned descriptor is checked below before use.
     let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
     if devnull < 0 {
         eprintln!(
@@ -613,6 +689,10 @@ fn splice_sink_loop(sock_fd: RawFd, stop: &AtomicBool) -> u64 {
 
     let mut total: u64 = 0;
     loop {
+        // SAFETY: `sock_fd` is the caller-owned socket descriptor and `devnull`
+        // is the valid descriptor opened and checked above; the null offset
+        // pointers are explicitly permitted by `splice`. The return value is
+        // checked below.
         let ret = unsafe {
             libc::splice(
                 sock_fd,
@@ -646,6 +726,8 @@ fn splice_sink_loop(sock_fd: RawFd, stop: &AtomicBool) -> u64 {
         }
     }
 
+    // SAFETY: `devnull` is the valid descriptor opened above and owned by this
+    // function; it is no longer used after this point, so closing it once is sound.
     unsafe {
         libc::close(devnull);
     }
@@ -657,6 +739,10 @@ fn recv_sink_loop(sock_fd: RawFd, stop: &AtomicBool) -> u64 {
     let mut buf = vec![0u8; SINK_BUF_SIZE];
     let mut total: u64 = 0;
     loop {
+        // SAFETY: `sock_fd` is the caller-owned socket descriptor;
+        // `buf.as_mut_ptr()`/`buf.len()` describe the fully-allocated, writable
+        // `SINK_BUF_SIZE` buffer, so the kernel writes at most `buf.len()` bytes.
+        // The return value is checked below.
         let ret =
             unsafe { libc::recv(sock_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if ret > 0 {
@@ -834,6 +920,11 @@ fn writer_thread_loop(
             } else {
                 libc::MSG_NOSIGNAL
             };
+            // SAFETY: `sock_fd` is the caller-owned socket descriptor;
+            // `buf[sent..].as_ptr()` points to `remaining == buf.len() - sent`
+            // readable bytes (the unsent tail of `buf`, with `sent < buf.len()`
+            // per the loop guard); `flags` are valid `MSG_*` bits. The return
+            // value is checked below.
             let ret = unsafe {
                 libc::send(
                     sock_fd,
@@ -878,6 +969,11 @@ fn send_blocking_sys(sock_fd: RawFd, data: &[u8]) -> io::Result<()> {
         } else {
             libc::MSG_NOSIGNAL
         };
+        // SAFETY: `sock_fd` is the caller-owned socket descriptor;
+        // `data[sent..].as_ptr()` points to `remaining == data.len() - sent`
+        // readable bytes (the unsent tail of `data`, with `sent < data.len()`
+        // per the loop guard); `flags` are valid `MSG_*` bits. The return value
+        // is checked below.
         let ret = unsafe {
             libc::send(
                 sock_fd,
@@ -996,6 +1092,9 @@ impl KtlsPipeLane {
                 }
             };
             ssl.set_accept_state();
+            // SAFETY: `ssl.as_ptr()` is the valid, non-null `SSL*` owned by the
+            // live `ssl` on the stack, so it outlives this call and is not
+            // concurrently mutated; this satisfies `enable_ktls_ssl`'s contract.
             unsafe {
                 enable_ktls_ssl(ssl.as_ptr());
             }
@@ -1011,6 +1110,10 @@ impl KtlsPipeLane {
                 eprintln!("kTLS sink: TLS accept failed: {}", e);
                 return 0;
             }
+            // SAFETY: `session.ssl_ref().as_ptr()` is the valid, non-null `SSL*`
+            // owned by the live `session`; the handshake has completed and the
+            // session is not used concurrently, so re-asserting the kTLS option
+            // here satisfies `enable_ktls_ssl`'s contract.
             unsafe {
                 enable_ktls_ssl(session.ssl_ref().as_ptr());
             }
@@ -1038,6 +1141,9 @@ impl KtlsPipeLane {
         let connector = build_client_connector(None)?;
         let mut ssl = connector.configure()?.into_ssl("localhost")?;
         ssl.set_connect_state();
+        // SAFETY: `ssl.as_ptr()` is the valid, non-null `SSL*` owned by the live
+        // `ssl` on the stack, so it outlives this call and is not concurrently
+        // mutated; this satisfies `enable_ktls_ssl`'s contract.
         unsafe {
             enable_ktls_ssl(ssl.as_ptr());
         }
@@ -1047,6 +1153,10 @@ impl KtlsPipeLane {
         session.connect()?;
         let handshake_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
 
+        // SAFETY: `session.ssl_ref().as_ptr()` is the valid, non-null `SSL*`
+        // owned by the live `session`; the handshake has completed and the
+        // session is not used concurrently, so re-asserting the kTLS option here
+        // satisfies `enable_ktls_ssl`'s contract.
         unsafe {
             enable_ktls_ssl(session.ssl_ref().as_ptr());
         }
@@ -1186,6 +1296,9 @@ impl KtlsPipeLane {
         let connector = build_client_connector(None)?;
         let mut ssl = connector.configure()?.into_ssl("benchmark")?;
         ssl.set_connect_state();
+        // SAFETY: `ssl.as_ptr()` is the valid, non-null `SSL*` owned by the live
+        // `ssl` on the stack, so it outlives this call and is not concurrently
+        // mutated; this satisfies `enable_ktls_ssl`'s contract.
         unsafe {
             enable_ktls_ssl(ssl.as_ptr());
         }
@@ -1195,6 +1308,10 @@ impl KtlsPipeLane {
         session.connect()?;
         let handshake_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
 
+        // SAFETY: `session.ssl_ref().as_ptr()` is the valid, non-null `SSL*`
+        // owned by the live `session`; the handshake has completed and the
+        // session is not used concurrently, so re-asserting the kTLS option here
+        // satisfies `enable_ktls_ssl`'s contract.
         unsafe {
             enable_ktls_ssl(session.ssl_ref().as_ptr());
         }

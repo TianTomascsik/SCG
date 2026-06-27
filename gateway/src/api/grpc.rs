@@ -6,6 +6,12 @@
 //! uid/gid/pid; an optional TCP bind is available for remote admin but cannot
 //! create endpoints (no peer credentials).
 
+// `tonic::Status` is a large error type (~per clippy's 128-byte threshold), but
+// the generated `ManagementApi` service trait fixes every method signature as
+// `Result<_, Status>` — the error cannot be boxed for trait methods. Allow the
+// lint for this module rather than fighting the framework's required signatures.
+#![allow(clippy::result_large_err)]
+
 use crate::interfaces::manager::{CallerCred, InterfaceManager};
 use crate::management::config::{ApiConfig, Direction, TrafficClass};
 

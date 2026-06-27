@@ -37,10 +37,17 @@ impl EventFd {
     /// Create a new non-blocking, close-on-exec eventfd initialised to zero.
     pub fn new() -> io::Result<EventFd> {
         // EFD_CLOEXEC = 0o2000000, EFD_NONBLOCK = 0o4000.
+        // SAFETY: `eventfd(2)` takes a plain integer count and a flags bitmask
+        // (both passed by value) and has no pointer arguments; it cannot
+        // violate memory safety. The returned fd is validated (`< 0`) below.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `fd` is a fresh, valid descriptor just returned by a
+        // successful `eventfd(2)` (the `fd < 0` error path returned above) and
+        // is not owned by anything else, so transferring sole ownership to the
+        // new `OwnedFd` upholds its single-owner invariant.
         Ok(EventFd { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
     }
 
@@ -58,6 +65,10 @@ impl EventFd {
     pub fn signal(&self) -> io::Result<()> {
         let val: u64 = 1;
         loop {
+            // SAFETY: `self.fd` is a valid open eventfd owned by `self`; the
+            // pointer/len pair points to a fully-initialised local `u64` (`val`)
+            // that lives for the duration of the call and matches the 8-byte
+            // length passed. The return value is checked below.
             let ret = unsafe {
                 libc::write(self.fd.as_raw_fd(), &val as *const u64 as *const c_void, 8)
             };
@@ -81,6 +92,11 @@ impl EventFd {
     pub fn drain(&self) -> io::Result<u64> {
         let mut val: u64 = 0;
         loop {
+            // SAFETY: `self.fd` is a valid open eventfd owned by `self`; the
+            // pointer/len pair points to a mutable, fully-initialised local
+            // `u64` (`val`) that lives for the duration of the call and is large
+            // enough for the 8 bytes the kernel writes. The return value is
+            // checked below.
             let ret = unsafe {
                 libc::read(self.fd.as_raw_fd(), &mut val as *mut u64 as *mut c_void, 8)
             };
@@ -124,6 +140,11 @@ pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Option<std::time::Du
     });
     let ts_ptr = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
 
+    // SAFETY: `word.as_ptr()` is a valid, properly-aligned pointer to a live
+    // `AtomicU32` borrowed for the duration of this call, which is exactly the
+    // u32 the FUTEX_WAIT operation reads. `ts_ptr` is either null or points to
+    // the local `ts` `timespec`, which outlives the syscall. The trailing
+    // arguments match the `FUTEX_WAIT` ABI and the return value is checked below.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -152,6 +173,11 @@ pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Option<std::time::Du
 
 /// Wake up to `count` waiters blocked on the futex `word`.
 pub fn futex_wake(word: &AtomicU32, count: u32) -> io::Result<u32> {
+    // SAFETY: `word.as_ptr()` is a valid, properly-aligned pointer to a live
+    // `AtomicU32` borrowed for the duration of this call, which is exactly the
+    // u32 the FUTEX_WAKE operation addresses. FUTEX_WAKE ignores the timeout and
+    // uaddr2 slots, so the null pointers passed there are sound; the remaining
+    // arguments match the syscall ABI and the return value is checked below.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_futex,

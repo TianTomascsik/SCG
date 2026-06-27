@@ -7,6 +7,11 @@
 //! manager authorises the caller from config, spawns a dedicated endpoint
 //! thread, and returns the socket path plus a single-use capability token.
 
+// These methods return `Result<_, tonic::Status>` to mirror the management-API
+// surface they back; `Status` is large but is mandated by the tonic service
+// trait (see `api::grpc`), so the error cannot be boxed. Allow the lint here.
+#![allow(clippy::result_large_err)]
+
 use crate::interfaces::endpoint::upstream_tls_mode;
 use crate::interfaces::shm::{run_shm_endpoint, ShmEndpointTask};
 use crate::interfaces::uds::{run_uds_endpoint, UdsEndpointTask};
@@ -409,6 +414,8 @@ impl InterfaceManager {
             .map_err(|e| Status::internal(format!("spawn endpoint thread: {e}")))?;
 
         // Register, replacing any previous endpoint bound to the same owner key.
+        // Returns an error (and tears down this endpoint) if the per-uid quota was
+        // raced past the pre-check.
         self.register_or_replace(
             id,
             owner_key.clone(),
@@ -421,7 +428,7 @@ impl InterfaceManager {
                 join: Some(join),
             },
             &label,
-        );
+        )?;
 
         info!(
             "[{label}] created UDS endpoint id={id} at {} for uid={}",
@@ -449,6 +456,12 @@ impl InterfaceManager {
         direction: Direction,
         ring_capacity: usize,
     ) -> Result<ShmCreated, Status> {
+        // Upper bound on a caller-requested SHM ring capacity (bytes). The value
+        // arrives unauthenticated-in-size over the management API and sizes an
+        // mmap'd ring, so an unbounded value is a memory-exhaustion DoS. The
+        // admin-configured template default is trusted and not subject to this cap.
+        const MAX_SHM_RING_CAPACITY: usize = 256 * 1024 * 1024;
+
         let key = template_key(app_id, class, direction, Proto::Shm);
         let template = self.templates.get(&key).ok_or_else(|| {
             Status::not_found(format!(
@@ -479,6 +492,17 @@ impl InterfaceManager {
         // Both rings use the same capacity: the request value if given, else the
         // template default. The endpoint thread rounds it up to a page.
         let cap = if ring_capacity > 0 {
+            if ring_capacity > MAX_SHM_RING_CAPACITY {
+                Self::audit_deny(
+                    "create_shm",
+                    caller,
+                    app_id,
+                    "ring_capacity exceeds maximum",
+                );
+                return Err(Status::invalid_argument(format!(
+                    "ring_capacity {ring_capacity} exceeds maximum {MAX_SHM_RING_CAPACITY}"
+                )));
+            }
             ring_capacity
         } else {
             template.ring_capacity
@@ -538,7 +562,7 @@ impl InterfaceManager {
                 join: Some(join),
             },
             &label,
-        );
+        )?;
 
         // The endpoint thread rounds the capacity up to a page; report the same
         // value to the client so its ring geometry matches the control page.
@@ -617,9 +641,43 @@ impl InterfaceManager {
 
     /// Register a live endpoint under `id`, detaching any previous endpoint that
     /// was bound to the same owner key (create-or-replace semantics).
-    fn register_or_replace(&self, id: u32, owner_key: String, ep: LiveEndpoint, label: &str) {
+    fn register_or_replace(
+        &self,
+        id: u32,
+        owner_key: String,
+        mut ep: LiveEndpoint,
+        label: &str,
+    ) -> Result<(), Status> {
         let replaced = {
             let mut live = self.live.lock().unwrap();
+            // Atomic quota enforcement: re-check the per-uid live-endpoint quota
+            // under the SAME lock that performs the insert. The pre-check in
+            // `check_admission` releases the lock before insertion, so two
+            // concurrent creates from one uid could otherwise both pass it and
+            // exceed the quota (TOCTOU). A replacement (same owner_key in flight)
+            // does not increase the count and is always allowed.
+            if self.max_endpoints_per_uid > 0 && !live.by_owner.contains_key(&owner_key) {
+                let owned = live
+                    .by_id
+                    .values()
+                    .filter(|e| e.owner_uid == ep.owner_uid)
+                    .count();
+                if owned as u32 >= self.max_endpoints_per_uid {
+                    drop(live);
+                    // Tear down the endpoint we optimistically built (detach
+                    // without joining, mirroring `detach_endpoint`).
+                    ep.shutdown.store(true, Ordering::SeqCst);
+                    ep.join.take();
+                    warn!(
+                        "[{label}] endpoint quota ({}) reached for uid={} — rejecting raced create",
+                        self.max_endpoints_per_uid, ep.owner_uid
+                    );
+                    return Err(Status::resource_exhausted(format!(
+                        "endpoint quota reached ({} live)",
+                        self.max_endpoints_per_uid
+                    )));
+                }
+            }
             let replaced = live.by_owner.insert(owner_key, id);
             live.by_id.insert(id, ep);
             replaced
@@ -628,6 +686,7 @@ impl InterfaceManager {
             self.detach_endpoint(old_id);
             info!("[{label}] replaced previous endpoint id={old_id} for the same owner");
         }
+        Ok(())
     }
 
     /// Resolve a per-uid runtime directory for endpoint sockets.
@@ -636,6 +695,9 @@ impl InterfaceManager {
     /// and chowns it to the caller; otherwise it falls back to the caller's XDG
     /// runtime directory `/run/user/<uid>/scg`.
     fn resolve_runtime_dir(&self, uid: u32) -> io::Result<PathBuf> {
+        // SAFETY: `geteuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed (it cannot fail);
+        // calling it is sound from any thread at any time.
         let euid = unsafe { libc::geteuid() };
         let base = PathBuf::from(&self.runtime_dir);
 
@@ -684,6 +746,10 @@ fn traffic_class_to_proto(class: TrafficClass) -> i32 {
 /// the SHM endpoint thread applies to its ring capacities).
 fn round_up_page(n: usize) -> usize {
     let page = {
+        // SAFETY: `sysconf` is passed the well-known constant `_SC_PAGESIZE`; it
+        // takes only this integer name (no pointers/buffers), touches no caller
+        // memory, and its `c_long` return value is validated below (`v <= 0`
+        // falls back to 4096) before any use.
         let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if v <= 0 {
             4096usize
@@ -797,6 +863,9 @@ mod tests {
     #[test]
     fn create_uds_decrypt_returns_token_and_path() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_uds_rule(uid, &tmp);
         let caller = CallerCred { uid, gid: uid, pid: 1 };
@@ -830,6 +899,9 @@ mod tests {
     #[test]
     fn create_uds_success_returns_token_and_path() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_uds_rule(uid, &tmp);
         let caller = CallerCred { uid, gid: uid, pid: 1 };
@@ -901,6 +973,9 @@ mod tests {
     #[test]
     fn create_shm_decrypt_returns_token_and_path() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_shm_rule(uid, &tmp);
         let caller = CallerCred { uid, gid: uid, pid: 1 };
@@ -932,6 +1007,9 @@ mod tests {
     #[test]
     fn create_shm_success_returns_token_path_and_geometry() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_shm_rule(uid, &tmp);
         let caller = CallerCred { uid, gid: uid, pid: 1 };
@@ -942,7 +1020,7 @@ mod tests {
         assert_eq!(created.token.len(), 32, "token must be 256-bit");
         assert_eq!(created.endpoint_id, 1);
         assert_eq!(created.notify, SHM_NOTIFY_EVENTFD as i32);
-        assert!(created.cap_c2g >= 4096 && created.cap_c2g % 4096 == 0);
+        assert!(created.cap_c2g >= 4096 && created.cap_c2g.is_multiple_of(4096));
         assert_eq!(created.cap_c2g, created.cap_g2c);
         assert!(
             created.control_socket_path.contains(&uid.to_string()),
@@ -1013,6 +1091,9 @@ mod tests {
     #[test]
     fn create_rate_limit_denies_burst() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         // Quota disabled; allow a single create per minute.
         let mgr = manager_with_limits(uid, &tmp, 0, 1);
@@ -1032,6 +1113,9 @@ mod tests {
     #[test]
     fn create_quota_denies_extra_endpoints() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         // One live endpoint allowed; rate limit disabled.
         let mgr = manager_with_limits(uid, &tmp, 1, 0);
@@ -1054,6 +1138,9 @@ mod tests {
     #[test]
     fn replace_cycles_do_not_leak_endpoints_or_fds() {
         let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and is always defined to succeed; calling it is
+        // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         // No quota, no rate limit: hammer create-or-replace on one slot.
         let mgr = manager_with_limits(uid, &tmp, 0, 0);

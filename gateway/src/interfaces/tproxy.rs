@@ -33,6 +33,9 @@ const IP_RECVORIGDSTADDR: libc::c_int = 20;
 /// Requires `CAP_NET_ADMIN` capability.
 pub fn set_ip_transparent(fd: RawFd) -> io::Result<()> {
     let one: libc::c_int = 1;
+    // SAFETY: `fd` is a socket descriptor supplied by the caller; `&one` points to a
+    // fully-initialised `c_int` whose size is passed as the option length, so the
+    // pointer/len pair are consistent. The return value is checked below.
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -54,9 +57,14 @@ pub fn set_ip_transparent(fd: RawFd) -> io::Result<()> {
 ///
 /// Works on accepted TCP sockets — call on the fd returned by `accept()`.
 pub fn get_original_dst(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: `libc::sockaddr_in` is a plain-old-data C struct for which an
+    // all-zero bit pattern is a valid initialised value.
     let mut addr: libc::sockaddr_in = unsafe { mem::zeroed() };
     let mut len: libc::socklen_t = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
+    // SAFETY: `fd` is a socket descriptor supplied by the caller; `&mut addr` points
+    // to a fully-allocated `sockaddr_in` and `len` holds its size, so the kernel
+    // writes at most `len` bytes into a valid buffer. The return value is checked below.
     let ret = unsafe {
         libc::getsockopt(
             fd,
@@ -80,6 +88,9 @@ pub fn get_original_dst(fd: RawFd) -> io::Result<SocketAddr> {
 /// the original destination address in ancillary data.
 pub fn enable_recvorigdstaddr(fd: RawFd) -> io::Result<()> {
     let one: libc::c_int = 1;
+    // SAFETY: `fd` is a socket descriptor supplied by the caller; `&one` points to a
+    // fully-initialised `c_int` whose size is passed as the option length, so the
+    // pointer/len pair are consistent. The return value is checked below.
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -108,6 +119,8 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     // Create raw socket to set options before bind
+    // SAFETY: `libc::socket` takes only integer arguments and never dereferences a
+    // pointer; the returned fd is validated (`fd < 0`) before any further use.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -115,6 +128,9 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
 
     // SO_REUSEADDR
     let one: libc::c_int = 1;
+    // SAFETY: `fd` is the valid socket created above; `&one` points to a
+    // fully-initialised `c_int` whose size is passed as the option length, so the
+    // pointer/len pair are consistent.
     unsafe {
         libc::setsockopt(
             fd,
@@ -127,6 +143,8 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
 
     // IP_TRANSPARENT — must be set before bind
     if let Err(e) = set_ip_transparent(fd) {
+        // SAFETY: `fd` is the valid open socket created above and is not used again
+        // on this error path, so closing it exactly once is sound.
         unsafe {
             libc::close(fd);
         }
@@ -139,6 +157,8 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
     // Bind
     let sa = match sock_addr {
         SocketAddr::V4(v4) => {
+            // SAFETY: `libc::sockaddr_in` is a plain-old-data C struct for which an
+            // all-zero bit pattern is a valid initialised value; the fields are then set.
             let mut sin: libc::sockaddr_in = unsafe { mem::zeroed() };
             sin.sin_family = libc::AF_INET as libc::sa_family_t;
             sin.sin_port = v4.port().to_be();
@@ -146,6 +166,8 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
             sin
         }
         _ => {
+            // SAFETY: `fd` is the valid open socket created above and is not used again
+            // on this error path, so closing it exactly once is sound.
             unsafe {
                 libc::close(fd);
             }
@@ -156,6 +178,9 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
         }
     };
 
+    // SAFETY: `fd` is the valid socket created above; `&sa` points to a
+    // fully-initialised `sockaddr_in` and its size is passed as the address length,
+    // so the kernel reads exactly a valid `sockaddr`. The return value is checked below.
     let ret = unsafe {
         libc::bind(
             fd,
@@ -165,6 +190,8 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
     };
     if ret != 0 {
         let err = io::Error::last_os_error();
+        // SAFETY: `fd` is the valid open socket created above and is not used again
+        // on this error path, so closing it exactly once is sound.
         unsafe {
             libc::close(fd);
         }
@@ -172,9 +199,13 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
     }
 
     // Listen
+    // SAFETY: `fd` is the valid, bound socket created above; `libc::listen` takes only
+    // integer arguments and never dereferences a pointer. The return value is checked below.
     let ret = unsafe { libc::listen(fd, 128) };
     if ret != 0 {
         let err = io::Error::last_os_error();
+        // SAFETY: `fd` is the valid open socket created above and is not used again
+        // on this error path, so closing it exactly once is sound.
         unsafe {
             libc::close(fd);
         }
@@ -183,6 +214,9 @@ pub fn create_transparent_tcp_listener(addr: &str) -> io::Result<TcpListener> {
 
     // Convert to std TcpListener
     use std::os::unix::io::FromRawFd;
+    // SAFETY: `fd` is a valid open socket created above and not used afterwards, so
+    // ownership can be transferred to `TcpListener`, which becomes its sole owner and
+    // will close it on drop.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
     Ok(listener)
 }
@@ -193,12 +227,17 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
+    // SAFETY: `libc::socket` takes only integer arguments and never dereferences a
+    // pointer; the returned fd is validated (`fd < 0`) before any further use.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
     let one: libc::c_int = 1;
+    // SAFETY: `fd` is the valid socket created above; `&one` points to a
+    // fully-initialised `c_int` whose size is passed as the option length, so the
+    // pointer/len pair are consistent.
     unsafe {
         libc::setsockopt(
             fd,
@@ -210,6 +249,8 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
     }
 
     if let Err(e) = set_ip_transparent(fd) {
+        // SAFETY: `fd` is the valid open socket created above and is not used again
+        // on this error path, so closing it exactly once is sound.
         unsafe {
             libc::close(fd);
         }
@@ -220,17 +261,20 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
     }
 
     if let Err(e) = enable_recvorigdstaddr(fd) {
+        // SAFETY: `fd` is the valid open socket created above and is not used again
+        // on this error path, so closing it exactly once is sound.
         unsafe {
             libc::close(fd);
         }
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("IP_RECVORIGDSTADDR failed: {}", e),
         ));
     }
 
     let sa = match sock_addr {
         SocketAddr::V4(v4) => {
+            // SAFETY: `libc::sockaddr_in` is a plain-old-data C struct for which an
+            // all-zero bit pattern is a valid initialised value; the fields are then set.
             let mut sin: libc::sockaddr_in = unsafe { mem::zeroed() };
             sin.sin_family = libc::AF_INET as libc::sa_family_t;
             sin.sin_port = v4.port().to_be();
@@ -238,6 +282,8 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
             sin
         }
         _ => {
+            // SAFETY: `fd` is the valid open socket created above and is not used again
+            // on this error path, so closing it exactly once is sound.
             unsafe {
                 libc::close(fd);
             }
@@ -248,6 +294,9 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
         }
     };
 
+    // SAFETY: `fd` is the valid socket created above; `&sa` points to a
+    // fully-initialised `sockaddr_in` and its size is passed as the address length,
+    // so the kernel reads exactly a valid `sockaddr`. The return value is checked below.
     let ret = unsafe {
         libc::bind(
             fd,
@@ -257,6 +306,8 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
     };
     if ret != 0 {
         let err = io::Error::last_os_error();
+        // SAFETY: `fd` is the valid open socket created above and is not used again
+        // on this error path, so closing it exactly once is sound.
         unsafe {
             libc::close(fd);
         }
@@ -264,6 +315,9 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
     }
 
     use std::os::unix::io::FromRawFd;
+    // SAFETY: `fd` is a valid open socket created above and not used afterwards, so
+    // ownership can be transferred to `UdpSocket`, which becomes its sole owner and
+    // will close it on drop.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
     Ok(socket)
 }

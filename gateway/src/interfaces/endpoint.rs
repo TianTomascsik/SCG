@@ -151,17 +151,17 @@ pub fn connect_tls_upstream(
     // ignore the operator's `verify` setting and connect without peer
     // verification.
     let params = TlsSecurityParams::from_params(provider_params, protocol_version)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     let sni = params.sni_name(upstream_addr);
 
     let hs_start = Instant::now();
     let proxy = match tls_mode {
         TlsMode::Tls => {
             let connector = build_tls_connector(&params)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS connector: {e}")))?;
+                .map_err(|e| io::Error::other(format!("TLS connector: {e}")))?;
             let ssl_stream = connector
                 .connect(&sni, upstream_tcp)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {e}")))?;
+                .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
             info!(
                 "[{label}] upstream TLS handshake OK ({:.2} ms)",
                 hs_start.elapsed().as_secs_f64() * 1000.0
@@ -170,13 +170,13 @@ pub fn connect_tls_upstream(
         }
         TlsMode::Ktls => {
             let connector = ktls_client_connector(params.version.as_deref()).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("kTLS connector: {e}"))
+                io::Error::other(format!("kTLS connector: {e}"))
             })?;
             let mut ssl = connector
                 .configure()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS configure: {e}")))?
+                .map_err(|e| io::Error::other(format!("kTLS configure: {e}")))?
                 .into_ssl(&sni)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS SSL: {e}")))?;
+                .map_err(|e| io::Error::other(format!("kTLS SSL: {e}")))?;
             ssl.set_connect_state();
             // SAFETY: enabling kTLS on the SSL object before the handshake is the
             // documented OpenSSL flow; the pointer is valid for the call.
@@ -184,10 +184,10 @@ pub fn connect_tls_upstream(
                 enable_ktls_ssl(ssl.as_ptr());
             }
             let mut session = KtlsSession::new(ssl, up_fd as libc::c_int)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS session: {e}")))?;
+                .map_err(|e| io::Error::other(format!("kTLS session: {e}")))?;
             session
                 .connect()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS handshake: {e}")))?;
+                .map_err(|e| io::Error::other(format!("kTLS handshake: {e}")))?;
             let ulp = get_tcp_ulp(&upstream_tcp).unwrap_or_default();
             if ulp.starts_with("tls") {
                 debug!(
@@ -248,15 +248,15 @@ pub fn accept_tls_upstream(
     let acceptor: Option<SslAcceptor> = match tls_mode {
         TlsMode::Tls => {
             let params = TlsSecurityParams::from_params(provider_params, protocol_version)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS params: {e}")))?;
+                .map_err(|e| io::Error::other(format!("TLS params: {e}")))?;
             Some(
                 build_tls_acceptor(&params)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS acceptor: {e}")))?,
+                    .map_err(|e| io::Error::other(format!("TLS acceptor: {e}")))?,
             )
         }
         TlsMode::Ktls => Some(
             ktls_server_acceptor(protocol_version)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS acceptor: {e}")))?,
+                .map_err(|e| io::Error::other(format!("kTLS acceptor: {e}")))?,
         ),
         TlsMode::Dtls => {
             return Err(io::Error::new(
@@ -295,7 +295,7 @@ pub fn accept_tls_upstream(
             let acceptor = acceptor.as_ref().expect("TLS acceptor built above");
             let ssl_stream = acceptor
                 .accept(stream)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS accept: {e}")))?;
+                .map_err(|e| io::Error::other(format!("TLS accept: {e}")))?;
             info!(
                 "[{label}] downstream TLS accept from {peer_addr} ({:.2} ms)",
                 hs_start.elapsed().as_secs_f64() * 1000.0
@@ -305,7 +305,7 @@ pub fn accept_tls_upstream(
         TlsMode::Ktls => {
             let acceptor = acceptor.as_ref().expect("kTLS acceptor built above");
             let mut ssl = Ssl::new(acceptor.context())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS SSL: {e}")))?;
+                .map_err(|e| io::Error::other(format!("kTLS SSL: {e}")))?;
             ssl.set_accept_state();
             // SAFETY: enabling kTLS on the SSL object before the handshake is the
             // documented OpenSSL flow; the pointer is valid for the call.
@@ -313,10 +313,10 @@ pub fn accept_tls_upstream(
                 enable_ktls_ssl(ssl.as_ptr());
             }
             let mut session = KtlsSession::new(ssl, fd as libc::c_int)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS session: {e}")))?;
+                .map_err(|e| io::Error::other(format!("kTLS session: {e}")))?;
             session
                 .accept()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS accept: {e}")))?;
+                .map_err(|e| io::Error::other(format!("kTLS accept: {e}")))?;
             let ulp = get_tcp_ulp(&stream).unwrap_or_default();
             if ulp.starts_with("tls") {
                 debug!(

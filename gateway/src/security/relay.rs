@@ -79,6 +79,11 @@ impl AdaptiveBufferTuner {
                 tune_socket_buffers(fd, desired);
             }
             for &fd in pipe_fds {
+                // SAFETY: `fd` is a live pipe descriptor passed in by the caller and kept
+                // open for the duration of the relay; `F_SETPIPE_SZ` takes a single `c_int`
+                // argument (`desired`) and performs no memory access, so this fcntl call has
+                // no preconditions beyond `fd` being valid. The return value is intentionally
+                // ignored as a best-effort resize.
                 unsafe {
                     libc::fcntl(fd, libc::F_SETPIPE_SZ, desired as libc::c_int);
                 }
@@ -268,11 +273,10 @@ pub fn relay_tls_to_udp(
                 }
             }
             // Flush batched frames to TLS in a single write
-            if !batch_buf.is_empty() {
-                if write_all_nb_proxy(tls_stream, &batch_buf).is_err() {
+            if !batch_buf.is_empty()
+                && write_all_nb_proxy(tls_stream, &batch_buf).is_err() {
                     return Ok(());
                 }
-            }
         }
     }
 
@@ -382,11 +386,19 @@ pub fn relay_encrypt_bidirectional(
 /// Create a kernel pipe with enlarged capacity for splice operations.
 fn make_splice_pipe(pipe_size: usize) -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a stack-allocated `[RawFd; 2]`; `fds.as_mut_ptr()` points to a
+    // fully-initialised array of exactly the 2 `c_int`s that `pipe2` writes, and the array
+    // outlives the call. `O_CLOEXEC` is a valid flag. The negative return is checked below
+    // before either descriptor is used.
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
     // Grow pipe capacity to the profile-driven `pipe_size` (throughput vs latency).
+    // SAFETY: `fds[0]` is the read end of the pipe just successfully created by `pipe2`
+    // above and is still open; `F_SETPIPE_SZ` takes a single `c_int` (`pipe_size`) and
+    // accesses no memory, so the only precondition is a valid descriptor, which holds here.
+    // The return value is ignored as a best-effort capacity hint.
     unsafe {
         libc::fcntl(fds[0], libc::F_SETPIPE_SZ, pipe_size as libc::c_int);
     }
@@ -395,6 +407,9 @@ fn make_splice_pipe(pipe_size: usize) -> io::Result<(RawFd, RawFd)> {
 
 /// Close a pipe (both ends).
 fn close_pipe(read_fd: RawFd, write_fd: RawFd) {
+    // SAFETY: `read_fd` and `write_fd` are the two ends of a pipe owned by the caller and
+    // are each closed exactly once here at end-of-relay; no further use of them occurs after
+    // this point, so there is no double-close or use-after-close. `close` accesses no memory.
     unsafe {
         libc::close(read_fd);
         libc::close(write_fd);
@@ -421,6 +436,11 @@ fn splice_one_direction(
     chunk: usize,
 ) -> io::Result<SpliceResult> {
     // Step 1: splice src → pipe
+    // SAFETY: `src_fd` and `pipe_write` are valid open descriptors owned by the caller for
+    // the duration of this call; both offset pointers are deliberately `NULL`, which `splice`
+    // accepts to mean "use/advance the file offset", so no memory is dereferenced; `chunk`
+    // bounds the transfer and the flags are a valid `SPLICE_F_*` bitmask. The negative/zero
+    // return is checked immediately below before `n` is used.
     let n = unsafe {
         libc::splice(
             src_fd,
@@ -446,6 +466,12 @@ fn splice_one_direction(
     // Step 2: splice pipe → dst (drain all bytes from the pipe)
     let mut written = 0usize;
     while written < total {
+        // SAFETY: `pipe_read` and `dst_fd` are valid open descriptors owned by the caller for
+        // the duration of this call; both offset pointers are `NULL` (valid for `splice`), so
+        // no memory is dereferenced; `total - written` is a non-negative count bounded by the
+        // bytes already buffered in the pipe (`written < total` is the loop guard) and
+        // `SPLICE_F_MOVE` is a valid flag. The negative/zero return is checked below before
+        // `w` is added to `written`.
         let w = unsafe {
             libc::splice(
                 pipe_read,
@@ -465,6 +491,11 @@ fn splice_one_direction(
                     events: libc::POLLOUT,
                     revents: 0,
                 };
+                // SAFETY: `&mut pfd` points to a single fully-initialised `libc::pollfd`
+                // living on this stack frame for the whole call, and the count `1` matches
+                // exactly that one element, so `poll` reads/writes only within `pfd`. `100`
+                // is a valid timeout in milliseconds. The result is intentionally ignored
+                // (best-effort wait before retrying the splice).
                 unsafe {
                     libc::poll(&mut pfd, 1, 100);
                 }
@@ -548,6 +579,10 @@ pub fn relay_bidirectional_splice(
                         }
                         Ok(SpliceResult::WouldBlock) => break, // No more data, go back to poll
                         Ok(SpliceResult::Eof) => {
+                            // SAFETY: `upstream_fd` is a valid open socket descriptor passed
+                            // in by the caller and still open at this point; `shutdown` takes
+                            // the fd and the `SHUT_WR` constant and accesses no memory. The
+                            // return value is intentionally ignored on this teardown path.
                             unsafe {
                                 libc::shutdown(upstream_fd, libc::SHUT_WR);
                             }
@@ -578,6 +613,10 @@ pub fn relay_bidirectional_splice(
                         }
                         Ok(SpliceResult::WouldBlock) => break,
                         Ok(SpliceResult::Eof) => {
+                            // SAFETY: `tls_fd` is a valid open socket descriptor passed in by
+                            // the caller and still open at this point; `shutdown` takes the fd
+                            // and the `SHUT_WR` constant and accesses no memory. The return
+                            // value is intentionally ignored on this teardown path.
                             unsafe {
                                 libc::shutdown(tls_fd, libc::SHUT_WR);
                             }
@@ -592,6 +631,10 @@ pub fn relay_bidirectional_splice(
             }
         }
 
+        // SAFETY: `tls_fd` and `upstream_fd` are valid open socket descriptors passed in by
+        // the caller and still open at this normal-exit point; `shutdown` takes each fd and
+        // the `SHUT_WR` constant and accesses no memory. Both return values are intentionally
+        // ignored on this teardown path.
         unsafe {
             libc::shutdown(tls_fd, libc::SHUT_WR);
             libc::shutdown(upstream_fd, libc::SHUT_WR);

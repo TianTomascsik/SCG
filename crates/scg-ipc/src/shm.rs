@@ -183,6 +183,10 @@ pub struct RingConsumer {
 // and the SPSC discipline guarantees the producer and consumer never touch the
 // same bytes concurrently.
 unsafe impl Send for RingProducer {}
+// SAFETY: as above — the consumer handle owns only raw pointers into mappings
+// shared via the Acquire/Release atomics in `RingIndices`, and the SPSC
+// discipline keeps producer and consumer off the same bytes, so moving the
+// handle to another thread is sound.
 unsafe impl Send for RingConsumer {}
 
 impl RingProducer {
@@ -236,6 +240,12 @@ impl RingProducer {
             return off;
         }
         let first = std::cmp::min(n, self.cap - off);
+        // SAFETY: `off < self.cap` and `first = min(n, cap - off)`, so the first
+        // copy writes `first` bytes within `[off, cap)` of the `cap`-byte writable
+        // `self.data` mapping; the second copy writes the remaining `n - first`
+        // bytes from the start of `self.data`, and the caller guarantees `total`
+        // (header + payload) <= `cap`, so neither copy exceeds the mapping. The
+        // source slice `src` is `n` bytes and the two regions are disjoint.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), self.data.add(off), first);
             if n > first {
@@ -340,6 +350,11 @@ impl RingConsumer {
         // Resize without zero-filling the bytes we are about to overwrite.
         dst.clear();
         dst.reserve(len);
+        // SAFETY: `dst.reserve(len)` guarantees `dst` has capacity for at least
+        // `len` bytes, so `dst.as_mut_ptr()` points to `len` writable bytes as
+        // required by `read_wrapping_ptr`; `read_wrapping_ptr` fully initialises
+        // those `len` bytes (a frame of `len <= cap - header` was validated
+        // above), so the subsequent `set_len(len)` only exposes initialised data.
         unsafe {
             self.read_wrapping_ptr(next_off, dst.as_mut_ptr(), len);
             dst.set_len(len);
@@ -378,6 +393,10 @@ impl RingConsumer {
         }
 
         let n = len.min(out.len());
+        // SAFETY: `n = min(len, out.len())`, so `out.as_mut_ptr()` points to at
+        // least `n` writable bytes of the caller's slice, satisfying
+        // `read_wrapping_ptr`'s contract; the read is clamped to what `out` can
+        // hold while the validated frame length keeps the source within the ring.
         unsafe {
             self.read_wrapping_ptr(next_off, out.as_mut_ptr(), n);
         }
@@ -392,6 +411,12 @@ impl RingConsumer {
             return off;
         }
         let first = std::cmp::min(n, self.cap - off);
+        // SAFETY: `off < self.cap` and `first = min(n, cap - off)`, so the first
+        // copy reads `first` bytes within `[off, cap)` of the `cap`-byte readable
+        // `self.data` mapping; the second copy reads the remaining `n - first`
+        // bytes from the start of `self.data`. Callers only request `n <= cap`
+        // bytes (header is fixed-size, payload bounded above), so neither read
+        // exceeds the mapping, and `dst` is an `n`-byte slice disjoint from it.
         unsafe {
             std::ptr::copy_nonoverlapping(self.data.add(off), dst.as_mut_ptr(), first);
             if n > first {
@@ -480,6 +505,10 @@ mod tests {
     impl Aligned {
         fn new(len: usize) -> Aligned {
             let layout = std::alloc::Layout::from_size_align(len.max(1), 64).unwrap();
+            // SAFETY: `layout` has a non-zero size (`len.max(1)`), satisfying the
+            // requirement of `alloc_zeroed`; the returned pointer is checked for
+            // null below and the matching `layout` is stored for the eventual
+            // `dealloc` in `Drop`.
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             assert!(!ptr.is_null());
             Aligned { ptr, layout, len }
@@ -497,6 +526,9 @@ mod tests {
 
     impl Drop for Aligned {
         fn drop(&mut self) {
+            // SAFETY: `self.ptr` was returned by `alloc_zeroed` with exactly
+            // `self.layout` in `Aligned::new` and has not been freed before; this
+            // `Drop` runs once, so the pointer/layout pair is valid to `dealloc`.
             unsafe { std::alloc::dealloc(self.ptr, self.layout) };
         }
     }
@@ -517,11 +549,21 @@ mod tests {
         let cap = 256usize;
         let control = buf(SHM_CONTROL_SIZE);
         let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned `SHM_CONTROL_SIZE`-byte writable
+        // allocation, not yet accessed, satisfying `init`'s contract.
         unsafe {
             ShmControl::init(control.as_mut_ptr(), cap, cap, 0);
         }
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE) that outlives `ctl` for the rest of the test.
         let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // writable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // readable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole consumer of the ring.
         let consumer = unsafe { RingConsumer::new(&ctl.c2g, data.as_ptr(), cap) };
 
         assert!(consumer.try_pop().is_none());
@@ -542,9 +584,19 @@ mod tests {
         let cap = 64usize;
         let control = buf(SHM_CONTROL_SIZE);
         let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned `SHM_CONTROL_SIZE`-byte writable
+        // allocation, not yet accessed, satisfying `init`'s contract.
         unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE) that outlives `ctl` for the rest of the test.
         let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // writable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // readable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole consumer of the ring.
         let consumer = unsafe { RingConsumer::new(&ctl.c2g, data.as_ptr(), cap) };
 
         // Push/pop many times so the absolute indices wrap past `cap` repeatedly.
@@ -562,9 +614,19 @@ mod tests {
         let cap = 64usize;
         let control = buf(SHM_CONTROL_SIZE);
         let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned `SHM_CONTROL_SIZE`-byte writable
+        // allocation, not yet accessed, satisfying `init`'s contract.
         unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE) that outlives `ctl` for the rest of the test.
         let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // writable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // readable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole consumer of the ring.
         let consumer = unsafe { RingConsumer::new(&ctl.c2g, data.as_ptr(), cap) };
 
         // Empty ring yields None.
@@ -588,9 +650,19 @@ mod tests {
         let cap = 64usize;
         let control = buf(SHM_CONTROL_SIZE);
         let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned `SHM_CONTROL_SIZE`-byte writable
+        // allocation, not yet accessed, satisfying `init`'s contract.
         unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE) that outlives `ctl` for the rest of the test.
         let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // writable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // readable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole consumer of the ring.
         let consumer = unsafe { RingConsumer::new(&ctl.c2g, data.as_ptr(), cap) };
 
         // Empty ring yields None.
@@ -615,8 +687,15 @@ mod tests {
         let cap = 32usize;
         let control = buf(SHM_CONTROL_SIZE);
         let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned `SHM_CONTROL_SIZE`-byte writable
+        // allocation, not yet accessed, satisfying `init`'s contract.
         unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE) that outlives `ctl` for the rest of the test.
         let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // writable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
 
         // 8-byte header + 16 payload = 24 fits; a second won't.
@@ -629,8 +708,15 @@ mod tests {
         let cap = 32usize;
         let control = buf(SHM_CONTROL_SIZE);
         let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned `SHM_CONTROL_SIZE`-byte writable
+        // allocation, not yet accessed, satisfying `init`'s contract.
         unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE) that outlives `ctl` for the rest of the test.
         let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping and `data` is a
+        // writable `cap`-byte allocation; both outlive the handle and this test is
+        // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
         assert_eq!(producer.try_push(1, &[0u8; 64]).unwrap_err(), ShmError::FrameTooLarge);
     }
@@ -639,6 +725,8 @@ mod tests {
     fn attach_rejects_bad_magic() {
         let control = buf(SHM_CONTROL_SIZE);
         // Never initialised → magic is zero.
+        // SAFETY: `control` is a live mapping of `control.len()` readable bytes
+        // (>= SHM_CONTROL_SIZE); `attach` only reads the magic/version words here.
         let err = unsafe { ShmControl::attach(control.as_ptr(), control.len()) }.unwrap_err();
         assert_eq!(err, ShmError::BadMagic);
     }

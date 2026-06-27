@@ -216,7 +216,7 @@ pub(crate) fn handle_tcp_decrypt(
         TlsMode::Tls => {
             let ssl_stream = acceptor
                 .accept(stream)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS accept: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("TLS accept: {}", e)))?;
             info!(
                 "[{}] TLS accept from {} ({:.2} ms)",
                 rule_name,
@@ -227,18 +227,21 @@ pub(crate) fn handle_tcp_decrypt(
         }
         TlsMode::Ktls => {
             let mut ssl = Ssl::new(acceptor.context()).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("kTLS SSL new: {}", e))
+                io::Error::other(format!("kTLS SSL new: {}", e))
             })?;
             ssl.set_accept_state();
+            // SAFETY: `ssl.as_ptr()` yields the raw `SSL*` of the locally owned,
+            // freshly created `ssl` (still alive and not moved for this call);
+            // `enable_ktls_ssl` only sets options on that live OpenSSL handle.
             unsafe {
                 enable_ktls_ssl(ssl.as_ptr());
             }
             let mut session = KtlsSession::new(ssl, fd as libc::c_int).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("kTLS session: {}", e))
+                io::Error::other(format!("kTLS session: {}", e))
             })?;
             session
                 .accept()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS accept: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("kTLS accept: {}", e)))?;
 
             let ulp = get_tcp_ulp(&stream).unwrap_or_default();
             let ktls_active = ulp.starts_with("tls");
@@ -269,13 +272,13 @@ pub(crate) fn handle_tcp_decrypt(
     // ── Connect to upstream (plain) ──────────────────────────────────────────
     match upstream_proto {
         Proto::Uds | Proto::Shm => {
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "upstream protocol {} is not valid on the TLS decrypt path",
                     upstream_proto
                 ),
-            ));
+            ))
         }
         Proto::Tcp => {
             let upstream = connect_with_retry(
@@ -420,7 +423,7 @@ pub(crate) fn handle_tcp_decrypt(
 
                 if !au1_ok {
                     error!("[{}] ALE handshake failed: no AU1 received", rule_name);
-                    return Err(io::Error::new(io::ErrorKind::Other, "ALE handshake failed"));
+                    return Err(io::Error::other("ALE handshake failed"));
                 }
 
                 // Send AU2 response
@@ -431,7 +434,7 @@ pub(crate) fn handle_tcp_decrypt(
                 ale_writer
                     .write_alepkt(&mut tls_stream, ALE_PKT_AU2, &au2_data)
                     .map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("ALE AU2 send: {}", e))
+                        io::Error::other(format!("ALE AU2 send: {}", e))
                     })?;
 
                 info!("[{}] ALE handshake complete (responder)", rule_name);

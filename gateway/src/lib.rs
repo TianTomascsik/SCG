@@ -419,6 +419,10 @@ pub fn run(
             // Give threads 5 seconds to finish gracefully
             std::thread::sleep(std::time::Duration::from_secs(5));
             eprintln!("[gateway] Shutdown timeout reached, forcing exit");
+            // SAFETY: `_exit(2)` is an FFI call that takes no pointers and only
+            // terminates the process immediately. It is sound to call here from
+            // the watchdog thread; bypassing atexit handlers/destructors is the
+            // intended behaviour for the forced-shutdown timeout path.
             unsafe {
                 libc::_exit(1);
             }
@@ -449,6 +453,12 @@ pub fn run(
 fn ctrlc_handler(shutdown: Arc<AtomicBool>) {
     // Install signal handlers for graceful shutdown.
     // Uses sigaction (not signal) for reliable behavior across invocations.
+    // SAFETY: `libc::sigaction` is an all-zero-valid POSIX struct, so `zeroed()`
+    // is a valid initial value; `signal_handler` is a correctly-typed `extern "C"`
+    // function whose body only calls async-signal-safe operations. `sigemptyset`
+    // and `sigaction` receive valid, fully-initialised pointers to `sa`/`sa_mask`
+    // that live for the duration of each call, and we pass a null `oldact` pointer
+    // (permitted: the previous disposition is discarded).
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = signal_handler as *const () as usize;
@@ -466,17 +476,41 @@ fn ctrlc_handler(shutdown: Arc<AtomicBool>) {
 static SHUTDOWN_FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
+    // A signal handler may only call async-signal-safe functions. `eprintln!`
+    // is NOT one (it takes the stdio lock and may allocate) and can deadlock if
+    // the signal interrupts a thread already holding that lock or the allocator.
+    // `OnceLock::get`, `AtomicBool` ops, `write(2)`, and `_exit(2)` are all
+    // async-signal-safe, so the handler uses only those.
     if let Some(flag) = SHUTDOWN_FLAG.get() {
         if flag.load(Ordering::SeqCst) {
-            // Second signal -- force exit immediately
-            eprintln!("\n[gateway] Forced shutdown (second signal)");
+            // Second signal -- force exit immediately.
+            write_stderr(b"\n[gateway] Forced shutdown (second signal)\n");
+            // SAFETY: `_exit(2)` is async-signal-safe and terminates the process
+            // immediately without running atexit handlers or destructors (which
+            // would not be signal-safe).
             unsafe {
                 libc::_exit(1);
             }
         }
         flag.store(true, Ordering::SeqCst);
     }
-    eprintln!("\n[gateway] Shutdown signal received, stopping... (send again to force quit)");
+    write_stderr(b"\n[gateway] Shutdown signal received, stopping... (send again to force quit)\n");
+}
+
+/// Write a fixed byte string to stderr using only the async-signal-safe
+/// `write(2)` syscall, so it is safe to call from a signal handler. Best-effort:
+/// the result (including short writes / `EINTR`) is intentionally ignored.
+fn write_stderr(msg: &[u8]) {
+    // SAFETY: `write(2)` is async-signal-safe. `msg` is a valid readable slice
+    // of exactly `msg.len()` bytes; we pass its pointer and length unchanged and
+    // ignore the return value (diagnostics are best-effort on the shutdown path).
+    unsafe {
+        let _ = libc::write(
+            libc::STDERR_FILENO,
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+        );
+    }
 }
 
 fn print_usage(prog: &str, registry: &ProviderRegistry) {

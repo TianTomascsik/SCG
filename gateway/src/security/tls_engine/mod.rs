@@ -61,7 +61,7 @@ impl ProxyStream {
     /// Check how many bytes are buffered in the SSL layer (0 for kTLS).
     pub fn ssl_pending(&self) -> usize {
         match self {
-            ProxyStream::Tls(s) => s.ssl().pending() as usize,
+            ProxyStream::Tls(s) => s.ssl().pending(),
             ProxyStream::Ktls { .. } => 0,
         }
     }
@@ -132,6 +132,9 @@ fn build_acceptor(
         apply_identity(&mut builder, params)?;
     }
     if enable_kernel_tls {
+        // SAFETY: `builder.as_ptr()` returns the live `SSL_CTX*` owned by `builder`,
+        // which outlives this call; `enable_ktls_ctx` only sets the kTLS option on
+        // that context and does not retain the pointer beyond the call.
         unsafe {
             enable_ktls_ctx(builder.as_ptr());
         }
@@ -175,6 +178,9 @@ fn build_connector(
         apply_identity(&mut builder, params)?;
     }
     if enable_kernel_tls {
+        // SAFETY: `builder.as_ptr()` returns the live `SSL_CTX*` owned by `builder`,
+        // which outlives this call; `enable_ktls_ctx` only sets the kTLS option on
+        // that context and does not retain the pointer beyond the call.
         unsafe {
             enable_ktls_ctx(builder.as_ptr());
         }
@@ -401,6 +407,10 @@ fn poll_proxy_write_ready(stream: &ProxyStream, timeout_ms: i32) -> io::Result<(
         events: libc::POLLOUT,
         revents: 0,
     };
+    // SAFETY: `&mut pfd` points to a single fully-initialised `libc::pollfd`, so the
+    // pointer/count pair (`&mut pfd`, `1`) is valid for `poll`; `pfd.fd` is the live
+    // descriptor borrowed from `stream` for the duration of the call, and the return
+    // value is checked below.
     let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if ret < 0 {
         let err = io::Error::last_os_error();

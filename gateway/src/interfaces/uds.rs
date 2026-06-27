@@ -93,6 +93,7 @@ pub fn run_uds_endpoint(task: UdsEndpointTask) {
     // privileged, hand the socket to the owning uid so only that user (and
     // root) can connect; the containing per-uid directory (0700) is the
     // primary gate, this is defense in depth.
+    // SAFETY: `geteuid()` is a POSIX syscall that takes no arguments, dereferences no pointers, and always succeeds returning the caller's effective uid; it has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if euid == 0 {
         if let Err(e) = os::chown(&task.socket_path, task.owner_uid, task.owner_uid) {

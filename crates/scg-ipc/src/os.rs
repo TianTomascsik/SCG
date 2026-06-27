@@ -57,6 +57,10 @@ pub struct PeerCred {
 pub fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     let mut filled = 0usize;
     while filled < buf.len() {
+        // SAFETY: the pointer/length pair describes the still-unfilled tail of
+        // `buf` (`buf[filled..]`), a live, writable `[u8]` valid for `buf.len()
+        // - filled` bytes; `getrandom` only writes within that bounded region
+        // and the return value is checked below.
         let ret = unsafe {
             libc::getrandom(
                 buf[filled..].as_mut_ptr() as *mut c_void,
@@ -92,6 +96,9 @@ fn fill_random_urandom(buf: &mut [u8]) -> io::Result<()> {
 pub fn memfd_create(name: &str) -> io::Result<RawFd> {
     let cname =
         CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memfd name contains NUL"))?;
+    // SAFETY: `cname.as_ptr()` is a valid NUL-terminated C string that outlives
+    // the call (`cname` is still owned here); the flag bits are a valid
+    // `memfd_create` mask and the returned descriptor is checked below.
     let fd = unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -101,6 +108,9 @@ pub fn memfd_create(name: &str) -> io::Result<RawFd> {
 
 /// Resize a file (typically a memfd) to exactly `len` bytes.
 pub fn ftruncate(fd: RawFd, len: u64) -> io::Result<()> {
+    // SAFETY: `fd` is a raw descriptor supplied by the caller and `len` is
+    // passed by value as a plain `off_t`; `ftruncate` takes no pointers and the
+    // return value is checked below.
     let ret = unsafe { libc::ftruncate(fd, len as libc::off_t) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -110,6 +120,9 @@ pub fn ftruncate(fd: RawFd, len: u64) -> io::Result<()> {
 
 /// Apply the given seal bitmask to a (memfd) descriptor.
 pub fn add_seals(fd: RawFd, seals: c_int) -> io::Result<()> {
+    // SAFETY: `fd` is a raw descriptor supplied by the caller; `F_ADD_SEALS`
+    // takes a single `c_int` variadic argument (`seals`), passed by value with
+    // no pointers involved, and the return value is checked below.
     let ret = unsafe { libc::fcntl(fd, F_ADD_SEALS, seals) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -119,6 +132,9 @@ pub fn add_seals(fd: RawFd, seals: c_int) -> io::Result<()> {
 
 /// Read the seal bitmask currently applied to a descriptor.
 pub fn get_seals(fd: RawFd) -> io::Result<c_int> {
+    // SAFETY: `fd` is a raw descriptor supplied by the caller; `F_GET_SEALS`
+    // takes no further arguments and the returned bitmask/error is checked
+    // below.
     let ret = unsafe { libc::fcntl(fd, F_GET_SEALS) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -176,6 +192,9 @@ impl Mapping {
 impl Drop for Mapping {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // SAFETY: `self.ptr`/`self.len` are exactly the base and length
+            // returned by the `mmap` in `mmap_shared` (non-null, checked above);
+            // the mapping is owned by `self` and unmapped exactly once on drop.
             unsafe {
                 libc::munmap(self.ptr as *mut c_void, self.len);
             }
@@ -188,6 +207,10 @@ pub fn mmap_shared(fd: RawFd, len: usize, prot: MapProt) -> io::Result<Mapping> 
     if len == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "mmap length must be non-zero"));
     }
+    // SAFETY: a null hint lets the kernel choose the address; `len` is non-zero
+    // (checked above); `prot.bits()` is a valid protection mask and `fd` is the
+    // descriptor to map. The returned address is validated against `MAP_FAILED`
+    // below before being wrapped in an owning `Mapping`.
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, prot.bits(), libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
@@ -199,6 +222,10 @@ pub fn mmap_shared(fd: RawFd, len: usize, prot: MapProt) -> io::Result<Mapping> 
 pub fn get_peer_cred(fd: RawFd) -> io::Result<PeerCred> {
     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `fd` is a connected socket descriptor supplied by the caller; the
+    // option buffer points to the live, fully-initialised `cred` and `len`
+    // holds its exact size (`size_of::<ucred>()`), so the kernel writes only
+    // within `cred`. The return value is checked below.
     let ret = unsafe {
         libc::getsockopt(
             fd,
@@ -217,6 +244,9 @@ pub fn get_peer_cred(fd: RawFd) -> io::Result<PeerCred> {
 /// Open a `pidfd` for the given process so the peer's liveness/identity can be
 /// pinned for the lifetime of the connection (defends against PID reuse).
 pub fn pidfd_open(pid: i32) -> io::Result<RawFd> {
+    // SAFETY: `SYS_pidfd_open` takes the target `pid` and a flags word, both
+    // passed by value with no pointers; the returned descriptor/error is
+    // checked below.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -226,10 +256,16 @@ pub fn pidfd_open(pid: i32) -> io::Result<RawFd> {
 
 /// Set the close-on-exec flag on a descriptor.
 pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a raw descriptor supplied by the caller; `F_GETFD` takes
+    // no further arguments and the returned flags/error are checked below.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: `fd` is the same caller-supplied descriptor; `F_SETFD` takes a
+    // single `c_int` variadic argument (the existing flags OR'd with
+    // `FD_CLOEXEC`), passed by value with no pointers, and the return value is
+    // checked below.
     let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -239,6 +275,9 @@ pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
 
 /// Close a raw descriptor, ignoring `EINTR`.
 pub fn close(fd: RawFd) {
+    // SAFETY: `fd` is a raw descriptor supplied by the caller and passed by
+    // value; `close` takes no pointers. Any error (including `EINTR`) is
+    // deliberately ignored per this function's contract.
     unsafe {
         libc::close(fd);
     }
@@ -250,6 +289,9 @@ pub fn close(fd: RawFd) {
 /// umask cannot loosen the requested permission bits.
 pub fn mkdir_mode(path: &Path, mode: u32) -> io::Result<()> {
     let cpath = path_to_cstring(path)?;
+    // SAFETY: `cpath.as_ptr()` is a valid NUL-terminated C string that outlives
+    // the call (`cpath` is still owned here); `mode` is passed by value as a
+    // plain `mode_t` and the return value is checked below.
     let ret = unsafe { libc::mkdir(cpath.as_ptr(), mode as libc::mode_t) };
     if ret < 0 {
         let err = io::Error::last_os_error();
@@ -263,6 +305,9 @@ pub fn mkdir_mode(path: &Path, mode: u32) -> io::Result<()> {
 /// Change the permission bits of a path.
 pub fn chmod(path: &Path, mode: u32) -> io::Result<()> {
     let cpath = path_to_cstring(path)?;
+    // SAFETY: `cpath.as_ptr()` is a valid NUL-terminated C string that outlives
+    // the call (`cpath` is still owned here); `mode` is passed by value as a
+    // plain `mode_t` and the return value is checked below.
     let ret = unsafe { libc::chmod(cpath.as_ptr(), mode as libc::mode_t) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -273,6 +318,9 @@ pub fn chmod(path: &Path, mode: u32) -> io::Result<()> {
 /// Change the owning uid/gid of a path. Pass `u32::MAX` to leave one unchanged.
 pub fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     let cpath = path_to_cstring(path)?;
+    // SAFETY: `cpath.as_ptr()` is a valid NUL-terminated C string that outlives
+    // the call (`cpath` is still owned here); `uid`/`gid` are passed by value as
+    // plain `uid_t`/`gid_t` and the return value is checked below.
     let ret = unsafe { libc::chown(cpath.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -302,9 +350,14 @@ pub fn send_with_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> io::Result<u
     };
 
     let fds_bytes = std::mem::size_of_val(fds);
+    // SAFETY: `CMSG_SPACE` is a pure size computation over the scalar
+    // `fds_bytes` argument; it dereferences no pointers.
     let cmsg_space = unsafe { libc::CMSG_SPACE(fds_bytes as u32) } as usize;
     let mut cmsg_buf = vec![0u8; cmsg_space.max(1)];
 
+    // SAFETY: `libc::msghdr` is a plain C struct of integers and pointers for
+    // which the all-zero bit pattern is a valid initial state (null pointers /
+    // zero lengths); every field used below is explicitly assigned afterwards.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -312,6 +365,13 @@ pub fn send_with_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> io::Result<u
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
         msg.msg_controllen = cmsg_space as _;
 
+        // SAFETY: `msg.msg_control`/`msg_controllen` were just set to point at
+        // `cmsg_buf`, which was sized via `CMSG_SPACE(fds_bytes)`, so
+        // `CMSG_FIRSTHDR` returns a non-null pointer into that buffer; the
+        // `cmsghdr` fields written lie within it, and the `copy_nonoverlapping`
+        // moves exactly `fds_bytes` from `fds` into the `CMSG_DATA` region,
+        // which `CMSG_SPACE`/`CMSG_LEN` reserved. Source and destination do not
+        // overlap.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -326,6 +386,10 @@ pub fn send_with_fds(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> io::Result<u
     }
 
     loop {
+        // SAFETY: `sock` is a connected socket descriptor supplied by the
+        // caller; `&msg` is a fully-initialised `msghdr` whose iovec and
+        // (optional) control buffer remain alive and valid for this call, and
+        // the return value is checked below.
         let ret = unsafe { libc::sendmsg(sock, &msg, 0) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -356,9 +420,14 @@ pub fn recv_with_fds(sock: RawFd, payload: &mut [u8]) -> io::Result<ReceivedFds>
         iov_len: payload.len(),
     };
 
+    // SAFETY: `CMSG_SPACE` is a pure size computation over its scalar argument;
+    // it dereferences no pointers.
     let cmsg_space = unsafe { libc::CMSG_SPACE((MAX_PASSED_FDS * std::mem::size_of::<RawFd>()) as u32) } as usize;
     let mut cmsg_buf = vec![0u8; cmsg_space];
 
+    // SAFETY: `libc::msghdr` is a plain C struct of integers and pointers for
+    // which the all-zero bit pattern is a valid initial state; every field used
+    // below is explicitly assigned afterwards.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -366,6 +435,11 @@ pub fn recv_with_fds(sock: RawFd, payload: &mut [u8]) -> io::Result<ReceivedFds>
     msg.msg_controllen = cmsg_space as _;
 
     let bytes = loop {
+        // SAFETY: `sock` is a connected socket descriptor supplied by the
+        // caller; `&mut msg` is a fully-initialised `msghdr` whose iovec
+        // (`payload`) and control buffer (`cmsg_buf`) stay alive and writable
+        // for this call, so the kernel writes only within them. The return
+        // value is checked below.
         let ret = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -378,6 +452,13 @@ pub fn recv_with_fds(sock: RawFd, payload: &mut [u8]) -> io::Result<ReceivedFds>
     };
 
     let mut fds = Vec::new();
+    // SAFETY: `recvmsg` populated `msg` with control data inside `cmsg_buf`
+    // (still alive here), so the `CMSG_FIRSTHDR`/`CMSG_NXTHDR` walk yields
+    // pointers that are either null (loop terminates) or point at valid
+    // `cmsghdr`s within that buffer. For each `SCM_RIGHTS` message we read
+    // `cmsg_len` to derive `n` descriptors and copy exactly
+    // `size_of::<RawFd>()` bytes per fd out of the kernel-written `CMSG_DATA`
+    // region into a local `RawFd`; source and destination do not overlap.
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
@@ -405,5 +486,7 @@ pub fn recv_with_fds(sock: RawFd, payload: &mut [u8]) -> io::Result<ReceivedFds>
 /// Size of the `cmsghdr` portion preceding `SCM_RIGHTS` payload bytes, i.e.
 /// `CMSG_LEN(0)`.
 fn unsafe_cmsg_len_header() -> usize {
+    // SAFETY: `CMSG_LEN` is a pure size computation over the scalar argument `0`;
+    // it dereferences no pointers.
     unsafe { libc::CMSG_LEN(0) as usize }
 }

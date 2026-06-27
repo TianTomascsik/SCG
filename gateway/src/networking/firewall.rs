@@ -139,6 +139,9 @@ impl FirewallManager {
         if has_egress {
             Self::ensure_jump("iptables", "nat", "OUTPUT", CHAIN_ENCRYPT)?;
             // Loop avoidance: gateway's own uid returns immediately.
+            // SAFETY: `geteuid` is a parameterless POSIX syscall that always succeeds,
+            // returns the caller's effective UID by value, takes no pointers, and never
+            // sets errno; it has no preconditions and cannot cause undefined behaviour.
             let uid = unsafe { libc::geteuid() };
             run_nft("iptables", &[
                 "-t", "nat", "-A", CHAIN_ENCRYPT,
@@ -456,9 +459,10 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let cmdline = format!("{} {}", cmd, args.join(" "));
         return Err(format!(
             "'{}' failed (exit {}): {}",
-            format!("{} {}", cmd, args.join(" ")),
+            cmdline,
             output.status.code().unwrap_or(-1),
             stderr.trim()
         ));
@@ -512,6 +516,9 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
         }
         if has_egress {
             cmds.push(ipt(&["-t", "nat", "-A", "OUTPUT", "-j", CHAIN_ENCRYPT]));
+            // SAFETY: `geteuid` is a parameterless POSIX syscall that always succeeds,
+            // returns the caller's effective UID by value, takes no pointers, and never
+            // sets errno; it has no preconditions and cannot cause undefined behaviour.
             let uid = unsafe { libc::geteuid() };
             cmds.push(ipt(&[
                 "-t", "nat", "-A", CHAIN_ENCRYPT,

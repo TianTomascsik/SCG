@@ -195,6 +195,10 @@ fn build_client_connector() -> Result<SslConnector, openssl::error::ErrorStack> 
 
 /// Set send/receive buffer sizes on a TCP socket to `SOCK_BUF_SIZE`.
 fn tune_socket_buffers(fd: RawFd) {
+    // SAFETY: `fd` is a valid open socket descriptor (the caller passes the raw fd of a
+    // live `TcpStream` whose ownership keeps it open for this call). For both setsockopt
+    // calls the `optval`/`optlen` pair point to a fully-initialised `libc::c_int` (`val`)
+    // whose size is exactly `size_of::<c_int>()`, as required for SO_SNDBUF/SO_RCVBUF.
     unsafe {
         let val = SOCK_BUF_SIZE;
         libc::setsockopt(
@@ -217,6 +221,10 @@ fn tune_socket_buffers(fd: RawFd) {
 /// Set TCP_NODELAY on a raw fd.
 fn set_nodelay(fd: RawFd, on: bool) {
     let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a valid open socket descriptor (the caller passes the raw fd of a
+    // live `TcpStream` kept open for this call). The `optval`/`optlen` pair point to the
+    // fully-initialised `libc::c_int` `val` whose size is exactly `size_of::<c_int>()`,
+    // as required for the boolean TCP_NODELAY option.
     unsafe {
         libc::setsockopt(
             fd,
@@ -232,6 +240,10 @@ fn set_nodelay(fd: RawFd, on: bool) {
 /// full MSS-sized segments. Disabling flushes the cork buffer.
 fn set_tcp_cork(fd: RawFd, on: bool) {
     let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a valid open socket descriptor (the caller passes the raw fd of a
+    // live `TcpStream` kept open for this call). The `optval`/`optlen` pair point to the
+    // fully-initialised `libc::c_int` `val` whose size is exactly `size_of::<c_int>()`,
+    // as required for the boolean TCP_CORK option.
     unsafe {
         libc::setsockopt(
             fd,

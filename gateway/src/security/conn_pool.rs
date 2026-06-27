@@ -140,9 +140,7 @@ impl ConnectionPool {
             Err(e) => {
                 warn!("connection pool: failed to spawn overflow thread: {}", e);
                 // Last resort: queue it anyway — it will run when a worker is freed
-                match self.sender.send(Box::new(|| {})) {
-                    _ => {}
-                }
+                let _ = self.sender.send(Box::new(|| {}));
                 false
             }
         }

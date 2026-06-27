@@ -117,9 +117,9 @@ impl CsvLogger {
         fs::create_dir_all(log_dir)?;
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_micros();
-        let safe_id = run_id.replace('/', "_").replace(' ', "_");
+            .map(|d| d.as_micros())
+            .unwrap_or(0);
+        let safe_id = run_id.replace(['/', ' '], "_");
         let filename = format!("{}_{}_{}__{}.csv", benchmark, variant, safe_id, ts);
         let path = format!("{}/{}", log_dir, filename);
         let file = File::create(&path)?;
@@ -140,8 +140,8 @@ impl CsvLogger {
     pub fn log_result(&mut self, row: &CsvRow) -> io::Result<()> {
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_micros();
+            .map(|d| d.as_micros())
+            .unwrap_or(0);
 
         fn lat_fields(lat: Option<&LatencyStats>) -> String {
             match lat {

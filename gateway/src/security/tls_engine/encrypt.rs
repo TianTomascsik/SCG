@@ -240,10 +240,10 @@ pub(crate) fn handle_tcp_encrypt(
     let mut upstream: ProxyStream = match tls_mode {
         TlsMode::Tls => {
             let connector = tls_connector.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "TLS connector was not initialised")
+                io::Error::other("TLS connector was not initialised")
             })?;
             let ssl_stream = connector.connect(&sni, upstream_tcp).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {}", e))
+                io::Error::other(format!("TLS handshake: {}", e))
             })?;
             info!(
                 "[{}] TLS handshake OK ({:.2} ms)",
@@ -254,24 +254,27 @@ pub(crate) fn handle_tcp_encrypt(
         }
         TlsMode::Ktls => {
             let connector = tls_connector.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "kTLS connector was not initialised")
+                io::Error::other("kTLS connector was not initialised")
             })?;
             let mut ssl = connector
                 .configure()
                 .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("kTLS configure: {}", e))
+                    io::Error::other(format!("kTLS configure: {}", e))
                 })?
                 .into_ssl(&sni)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS SSL: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("kTLS SSL: {}", e)))?;
             ssl.set_connect_state();
+            // SAFETY: `ssl.as_ptr()` returns a valid, non-null pointer to the live `SSL`
+            // object owned by `ssl`, which outlives this call; `enable_ktls_ssl` only
+            // configures kTLS on that handle and the handle is not aliased elsewhere here.
             unsafe {
                 enable_ktls_ssl(ssl.as_ptr());
             }
             let mut session = KtlsSession::new(ssl, up_fd as libc::c_int).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("kTLS session: {}", e))
+                io::Error::other(format!("kTLS session: {}", e))
             })?;
             session.connect().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("kTLS handshake: {}", e))
+                io::Error::other(format!("kTLS handshake: {}", e))
             })?;
 
             let ulp = get_tcp_ulp(&upstream_tcp).unwrap_or_default();
@@ -411,6 +414,10 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                 events: libc::POLLIN,
                 revents: 0,
             }];
+            // SAFETY: `fds` is a fully-initialised array of exactly one `libc::pollfd`;
+            // `fds.as_mut_ptr()` is valid and writable for the `1` element passed as the
+            // count, and `udp_fd_raw` is a live descriptor owned by `socket`. The return
+            // value is checked below before `fds[0].revents` is read.
             let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 1000) };
             if ret <= 0 {
                 continue;
@@ -432,7 +439,16 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                     return;
                 }
 
-                let upstream_target: SocketAddr = ctx.upstream_addr.parse().unwrap();
+                let upstream_target: SocketAddr = match ctx.upstream_addr.parse() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        error!(
+                            "[{}] invalid upstream address '{}': {} \u{2014} stopping rule",
+                            ctx.rule_name, ctx.upstream_addr, e
+                        );
+                        return;
+                    }
+                };
                 let upstream_tcp =
                     match TcpStream::connect_timeout(&upstream_target, Duration::from_secs(5)) {
                         Ok(s) => s,
@@ -538,6 +554,10 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                             }
                         };
                         ssl.set_connect_state();
+                        // SAFETY: `ssl.as_ptr()` returns a valid, non-null pointer to the
+                        // live `SSL` object owned by `ssl`, which outlives this call;
+                        // `enable_ktls_ssl` only configures kTLS on that handle and the
+                        // handle is not aliased elsewhere here.
                         unsafe {
                             enable_ktls_ssl(ssl.as_ptr());
                         }
@@ -622,6 +642,10 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                         events: libc::POLLIN,
                         revents: 0,
                     }];
+                    // SAFETY: `fds` is a fully-initialised array of exactly one
+                    // `libc::pollfd`; `fds.as_mut_ptr()` is valid and writable for the `1`
+                    // element passed as the count, and `tls_fd` is a live descriptor owned
+                    // by the established TLS stream. The return value is checked below.
                     let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) };
                     if ret <= 0 {
                         if ctx.shutdown.load(Ordering::Relaxed) {

@@ -137,6 +137,9 @@ pub struct PipelineComponents {
     pub policy_manager: Arc<RwLock<PolicyManager>>,
 }
 
+/// Per-rule shutdown flags, keyed by rule name, shared for hot-reload.
+pub type RuleShutdownMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
 /// Start all proxy rules. Returns join handles for the listener threads
 /// and a map of rule names -> shutdown flags for per-rule hot-reload.
 pub fn start_rules(
@@ -144,10 +147,7 @@ pub fn start_rules(
     shutdown: Arc<AtomicBool>,
     registry: Arc<ProviderRegistry>,
     pipeline: Arc<PipelineComponents>,
-) -> (
-    Vec<thread::JoinHandle<()>>,
-    Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-) {
+) -> (Vec<thread::JoinHandle<()>>, RuleShutdownMap) {
     let mut handles = Vec::new();
     let rule_shutdowns: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -321,6 +321,11 @@ pub fn start_single_rule(
         .name(format!("rule-{}", rule_name))
         .spawn(move || {
             if priority != 0 {
+                // SAFETY: `setpriority` is a thin FFI wrapper taking only scalar
+                // (non-pointer) arguments; `PRIO_PROCESS` with `who == 0` selects
+                // the calling thread, and `priority` is a plain `c_int`, so there
+                // are no memory-safety preconditions to uphold and the call cannot
+                // cause undefined behaviour regardless of its return value.
                 unsafe {
                     libc::setpriority(libc::PRIO_PROCESS, 0, priority);
                 }

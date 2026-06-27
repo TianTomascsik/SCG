@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 
 pub fn tune_socket_buffers(fd: RawFd, buf_size: usize) {
     let val = buf_size as libc::c_int;
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes. Best-effort: the
+    // return value is intentionally ignored.
     unsafe {
         libc::setsockopt(
             fd,
@@ -33,6 +37,9 @@ pub fn tune_socket_buffers(fd: RawFd, buf_size: usize) {
 
 pub fn set_nodelay(fd: RawFd, on: bool) {
     let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes.
     unsafe {
         libc::setsockopt(
             fd,
@@ -49,6 +56,9 @@ pub fn set_nodelay(fd: RawFd, on: bool) {
 /// connection start still improves the initial burst.
 pub fn set_quickack(fd: RawFd) {
     let val: libc::c_int = 1;
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes.
     unsafe {
         libc::setsockopt(
             fd,
@@ -67,6 +77,9 @@ pub fn set_quickack(fd: RawFd) {
 /// `throughput` profile leaves the kernel default. Best-effort (errors ignored).
 pub fn set_notsent_lowat(fd: RawFd, bytes: usize) {
     let val = bytes as libc::c_int;
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes. Best-effort.
     unsafe {
         libc::setsockopt(
             fd,
@@ -88,6 +101,9 @@ pub fn set_busy_poll(fd: RawFd, us: u32) {
         return;
     }
     let val = us as libc::c_int;
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes. Best-effort.
     unsafe {
         libc::setsockopt(
             fd,
@@ -117,6 +133,9 @@ pub fn apply_tcp_latency_opts(fd: RawFd, notsent_lowat: Option<usize>, busy_poll
 #[inline]
 pub fn set_tcp_cork(fd: RawFd, on: bool) {
     let val: libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes.
     unsafe {
         libc::setsockopt(
             fd,
@@ -171,6 +190,9 @@ pub fn set_dscp(fd: RawFd, dscp: u8, is_v6: bool) {
     } else {
         (libc::IPPROTO_IP, libc::IP_TOS)
     };
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&tos` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes. Best-effort.
     unsafe {
         libc::setsockopt(
             fd,
@@ -188,6 +210,9 @@ pub fn set_dscp(fd: RawFd, dscp: u8, is_v6: bool) {
 /// traffic ahead of normal traffic in the host's send queue. Best-effort.
 pub fn set_so_priority(fd: RawFd, prio: i32) {
     let val = prio as libc::c_int;
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&val` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes. Best-effort.
     unsafe {
         libc::setsockopt(
             fd,
@@ -207,6 +232,10 @@ pub fn set_so_priority(fd: RawFd, prio: i32) {
 /// per-connection / per-peer data-path thread.
 pub fn apply_safety_priority(class: TrafficClass) {
     if class == TrafficClass::Safety {
+        // SAFETY: `setpriority` is a thin libc syscall wrapper taking scalar
+        // arguments (no pointers/buffers), so it cannot violate memory safety;
+        // it adjusts the calling thread's nice value. Best-effort: the return
+        // value is intentionally ignored (lowering nice needs CAP_SYS_NICE).
         unsafe {
             libc::setpriority(libc::PRIO_PROCESS, 0, SAFETY_THREAD_NICE);
         }
@@ -243,6 +272,9 @@ pub fn enable_recvtos(fd: RawFd, is_v6: bool) {
     } else {
         (libc::IPPROTO_IP, libc::IP_RECVTOS)
     };
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&on` points to a live,
+    // fully-initialised `c_int` whose byte length is passed as the option length, so
+    // the kernel reads exactly `size_of::<c_int>()` valid bytes. Best-effort.
     unsafe {
         libc::setsockopt(
             fd,
@@ -267,17 +299,25 @@ pub fn recvmsg_with_dscp(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option
     };
     // Control buffer sized for a single TOS/TCLASS ancillary message.
     let mut cmsg_buf = [0u8; 64];
+    // SAFETY: `libc::msghdr` is a plain-old-data C struct for which an all-zero bit
+    // pattern is a valid value; every field is explicitly overwritten below before use.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_buf.len() as _;
 
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&mut msg` is a live,
+    // fully-initialised `msghdr` whose `iov`/`control` buffers (`buf`, `cmsg_buf`)
+    // outlive the call, and the return value is checked for error below.
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: `recvmsg` succeeded, so `msg` is a fully-initialised `msghdr` and its
+    // `cmsg_buf` control buffer is still alive in this scope, satisfying the contract
+    // of `extract_dscp_cmsg`.
     let dscp = unsafe { extract_dscp_cmsg(&msg) };
     Ok((n as usize, dscp))
 }
@@ -312,8 +352,13 @@ fn recvmsg_from_with_dscp_flags(
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
     };
+    // SAFETY: `sockaddr_storage` is a plain-old-data C struct sized to hold any
+    // address family; an all-zero bit pattern is a valid value and the kernel fills
+    // it during `recvmsg` (with `msg_namelen` set to its capacity below).
     let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut cmsg_buf = [0u8; 64];
+    // SAFETY: `libc::msghdr` is a plain-old-data C struct for which an all-zero bit
+    // pattern is a valid value; every field is explicitly overwritten below before use.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut name as *mut _ as *mut libc::c_void;
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -322,11 +367,17 @@ fn recvmsg_from_with_dscp_flags(
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_buf.len() as _;
 
+    // SAFETY: `fd` is a caller-supplied socket descriptor; `&mut msg` is a live,
+    // fully-initialised `msghdr` whose `name`/`iov`/`control` buffers (`name`, `buf`,
+    // `cmsg_buf`) outlive the call, and the return value is checked for error below.
     let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: `recvmsg` succeeded, so `msg` is a fully-initialised `msghdr` and its
+    // `cmsg_buf` control buffer is still alive in this scope, satisfying the contract
+    // of `extract_dscp_cmsg`.
     let dscp = unsafe { extract_dscp_cmsg(&msg) };
     let src = sockaddr_storage_to_socketaddr(&name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unrecognised source address"))?;
@@ -369,6 +420,9 @@ unsafe fn extract_dscp_cmsg(msg: &libc::msghdr) -> Option<u8> {
 fn sockaddr_storage_to_socketaddr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
+            // SAFETY: `ss_family` is `AF_INET`, so the kernel filled `storage` with a
+            // `sockaddr_in`; `sockaddr_storage` is large enough and suitably aligned
+            // for `sockaddr_in`, and the reference borrows the live `storage`.
             let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             Some(SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -377,6 +431,9 @@ fn sockaddr_storage_to_socketaddr(storage: &libc::sockaddr_storage) -> Option<So
             )))
         }
         libc::AF_INET6 => {
+            // SAFETY: `ss_family` is `AF_INET6`, so the kernel filled `storage` with a
+            // `sockaddr_in6`; `sockaddr_storage` is large enough and suitably aligned
+            // for `sockaddr_in6`, and the reference borrows the live `storage`.
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             Some(SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -408,6 +465,9 @@ pub fn apply_egress_qos(fd: RawFd, dscp: Option<u8>, prio: i32, is_v6: bool) {
 
 /// Set a file descriptor to non-blocking mode via fcntl.
 pub fn set_nonblocking_fd(fd: RawFd) {
+    // SAFETY: `fcntl` is a libc syscall taking scalar arguments only (no buffers),
+    // so it cannot violate memory safety; `fd` is a caller-supplied descriptor and
+    // `F_GETFL`/`F_SETFL` merely read and rewrite the descriptor's status flags.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -424,7 +484,12 @@ pub fn accept_with_timeout(
         events: libc::POLLIN,
         revents: 0,
     };
-    let ret = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) };
+    // Clamp rather than truncate: a timeout exceeding i32::MAX milliseconds would
+    // wrap to a negative value and make `poll` block indefinitely.
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `pfd` is a valid, fully-initialised `pollfd` for one descriptor; we
+    // pass `nfds = 1` matching the single-element buffer and a valid timeout.
+    let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
         Some(listener.accept())
     } else {
@@ -561,6 +626,9 @@ fn poll_two_fds_once(fd_a: RawFd, fd_b: RawFd, timeout_ms: i32) -> io::Result<(b
         },
     ];
 
+    // SAFETY: `fds` is a live, fully-initialised two-element `pollfd` array; we pass
+    // `nfds = 2` matching its length and a valid timeout, so `poll` reads/writes only
+    // those two entries. The return value is checked below.
     let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
     if ret < 0 {
         let err = io::Error::last_os_error();
@@ -589,6 +657,9 @@ fn poll_write_ready(fd: RawFd, timeout_ms: i32) -> io::Result<()> {
         events: libc::POLLOUT,
         revents: 0,
     };
+    // SAFETY: `pfd` is a live, fully-initialised `pollfd` for one descriptor; we pass
+    // `nfds = 1` matching the single-element buffer and a valid timeout, so `poll`
+    // reads/writes only that entry. The return value is checked below.
     let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if ret < 0 {
         let err = io::Error::last_os_error();
@@ -627,6 +698,10 @@ mod tests {
     fn getsockopt_int(fd: RawFd, level: libc::c_int, optname: libc::c_int) -> libc::c_int {
         let mut val: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is a valid open socket descriptor; `&mut val`/`&mut len` point to
+        // a live `c_int` and `socklen_t`, with `len` initialised to the buffer's byte
+        // size so the kernel writes at most `size_of::<c_int>()` valid bytes. The
+        // return value is asserted to be 0 below.
         let ret = unsafe {
             libc::getsockopt(
                 fd,

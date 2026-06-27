@@ -78,7 +78,13 @@ impl TlsProfile {
 }
 
 /// Resolved, validated security parameters for a TLS/DTLS rule.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand (not derived) so that PSK secret material is
+/// never printed: a derived `Debug` would emit `psk_key`/`psk_identity`
+/// verbatim if this struct is ever logged with `{:?}`. See the manual `Debug`
+/// impl below, which mirrors the `***`-masking convention used by
+/// `scg_ipc::CapabilityToken`.
+#[derive(Clone)]
 pub struct TlsSecurityParams {
     /// Protocol version string (`tls1.2`/`tls1.3`/`dtls1.0`/`dtls1.2`), if any.
     pub version: Option<String>,
@@ -107,6 +113,28 @@ pub struct TlsSecurityParams {
     /// reconnects; leaving it `false` forces a full handshake on every
     /// connection. Default: `false` (opt-in).
     pub resumption: bool,
+}
+
+impl std::fmt::Debug for TlsSecurityParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // PSK material is redacted; presence (`Some`/`None`) is preserved so the
+        // output remains useful for diagnosing configuration without leaking
+        // secrets into logs.
+        f.debug_struct("TlsSecurityParams")
+            .field("version", &self.version)
+            .field("profile", &self.profile)
+            .field("verify", &self.verify)
+            .field("cert_path", &self.cert_path)
+            .field("key_path", &self.key_path)
+            .field("ca_path", &self.ca_path)
+            .field("server_name", &self.server_name)
+            .field("psk_identity", &self.psk_identity.as_ref().map(|_| "[REDACTED]"))
+            .field("psk_key", &self.psk_key.as_ref().map(|_| "[REDACTED]"))
+            .field("cipher_list", &self.cipher_list)
+            .field("ciphersuites", &self.ciphersuites)
+            .field("resumption", &self.resumption)
+            .finish()
+    }
 }
 
 impl Default for TlsSecurityParams {
@@ -241,12 +269,11 @@ impl TlsSecurityParams {
                     );
                 }
             }
-            TlsProfile::Subset146Pki => {
+            TlsProfile::Subset146Pki
                 // PKI mandates mutual authentication.
-                if self.verify != VerifyMode::Mutual {
+                if self.verify != VerifyMode::Mutual => {
                     return Err("subset146-pki profile requires verify = mutual".to_string());
                 }
-            }
             _ => {}
         }
 
@@ -385,6 +412,37 @@ pub fn openssl_supports_null_cipher() -> bool {
     builder
         .set_cipher_list("ECDHE-RSA-NULL-SHA:NULL-SHA256:NULL-SHA:@SECLEVEL=0")
         .is_ok()
+}
+
+#[cfg(test)]
+mod secret_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_psk_material() {
+        let p = TlsSecurityParams {
+            psk_identity: Some("super-secret-identity".to_string()),
+            psk_key: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            ..TlsSecurityParams::default()
+        };
+        let s = format!("{p:?}");
+        assert!(
+            !s.contains("super-secret-identity"),
+            "psk_identity leaked into Debug output: {s}"
+        );
+        // 0xde == 222 decimal — the byte rendering a derived Debug would emit.
+        assert!(!s.contains("222"), "psk_key bytes leaked into Debug output: {s}");
+        assert!(s.contains("REDACTED"), "expected redaction marker: {s}");
+        // Presence is still conveyed.
+        assert!(s.contains("psk_key: Some"), "presence should be visible: {s}");
+    }
+
+    #[test]
+    fn debug_shows_none_for_absent_psk() {
+        let s = format!("{:?}", TlsSecurityParams::default());
+        assert!(s.contains("psk_key: None"), "{s}");
+        assert!(!s.contains("REDACTED"), "{s}");
+    }
 }
 
 #[cfg(test)]

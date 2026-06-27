@@ -61,7 +61,10 @@ impl SharedConfig {
 
     /// Read the current configuration (snapshot).
     pub fn read(&self) -> GatewayConfig {
-        self.inner.read().unwrap().clone()
+        // Recover the guard even if a previous holder panicked (poison): the
+        // config snapshot itself is still consistent, and we must not turn a
+        // poisoned lock into a hard panic on the read path.
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Check if the config file has been modified since last load.
@@ -70,7 +73,7 @@ impl SharedConfig {
             Ok(t) => t,
             Err(_) => return false,
         };
-        let last = *self.last_modified.read().unwrap();
+        let last = *self.last_modified.read().unwrap_or_else(|e| e.into_inner());
         current_mtime > last
     }
 
@@ -93,11 +96,11 @@ impl SharedConfig {
 
         // Update stored mtime
         if let Ok(mtime) = fs::metadata(&self.config_path).and_then(|m| m.modified()) {
-            *self.last_modified.write().unwrap() = mtime;
+            *self.last_modified.write().unwrap_or_else(|e| e.into_inner()) = mtime;
         }
 
         // Swap config atomically
-        *self.inner.write().unwrap() = new_config;
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = new_config;
 
         Ok(diff)
     }
@@ -117,6 +120,12 @@ where
     // Register SIGHUP handler
     static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
+    // SAFETY: `libc::signal` is an FFI call; `libc::SIGHUP` is a valid signal
+    // number and `sighup_handler` is a real `extern "C"` function with the
+    // required `fn(c_int)` ABI, cast to the `sighandler_t` the call expects. The
+    // handler has `'static` lifetime (a top-level `fn`) so it stays valid for the
+    // whole process, and it only touches the `'static` `SIGHUP_RECEIVED` atomic,
+    // so installing it introduces no dangling pointer or data race.
     unsafe {
         libc::signal(
             libc::SIGHUP,

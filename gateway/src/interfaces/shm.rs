@@ -140,6 +140,8 @@ pub fn run_shm_endpoint(task: ShmEndpointTask) {
     };
 
     // Tighten ownership/permissions on the control socket file.
+    // SAFETY: `geteuid()` takes no arguments, never fails, and only reads the
+    // calling process's effective uid; it has no preconditions and no memory effects.
     let euid = unsafe { libc::geteuid() };
     if euid == 0 {
         if let Err(e) = os::chown(&task.control_socket_path, task.owner_uid, task.owner_uid) {
@@ -550,6 +552,11 @@ impl ShmSegment {
             // SAFETY: the three mappings live in the returned struct for as long
             // as the rings; the control mapping is fresh and exclusive here.
             let backend = match task.ring_kind {
+                // SAFETY: `control_map`/`data_c2g_map`/`data_g2c_map` are freshly
+                // mmapped, exclusively owned here, and outlive the rings (stored in
+                // the returned struct); each pointer/len pair describes a valid
+                // mapping ftruncated to `ctl_len`/`cap_c2g`/`cap_g2c` above, matching
+                // the lengths passed to `ShmControl::init`/`gateway_rings`.
                 ShmRingKind::ByteStream => unsafe {
                     ShmControl::init(control_map.as_ptr(), cap_c2g, cap_g2c, SHM_FLAG_SEALED_G2C);
                     let (consumer, producer) = gateway_rings(
@@ -563,6 +570,11 @@ impl ShmSegment {
                     .map_err(|e| io::Error::other(format!("shm rings: {e}")))?;
                     RingBackend::ByteStream { consumer, producer }
                 },
+                // SAFETY: same mapping invariants as the byte-stream arm — the three
+                // mappings are freshly mmapped, exclusively owned, and outlive the
+                // rings; `cap`/`seg_sz` are the slot geometry the data mapping was
+                // sized for (`ring_data_bytes(cap, seg_sz)`), and `control_map` was
+                // ftruncated to `ctl_len` (`slot_control_size(cap)`) above.
                 ShmRingKind::Slot => unsafe {
                     let cap = capacity as usize;
                     let seg_sz = segment_size as usize;
@@ -715,6 +727,9 @@ impl ShmSegment {
 
 /// Query the system page size (mappings and ring capacities are page-aligned).
 fn page_size() -> usize {
+    // SAFETY: `sysconf` only reads a system-wide configuration value for the
+    // valid `_SC_PAGESIZE` name; it touches no caller memory and its result is
+    // validated (`<= 0` falls back to 4096) before use.
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if v <= 0 {
         4096
@@ -748,6 +763,10 @@ fn poll_relay(
     let timeout = if tls_pending { 0 } else { timeout_ms };
 
     loop {
+        // SAFETY: `fds` is a live, mutable stack array of `fds.len()` fully
+        // initialised `pollfd` structs, so the pointer/count pair is valid for
+        // the duration of the call; `poll` only writes the `revents` fields. The
+        // negative return is checked and `EINTR` retried below.
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -772,6 +791,10 @@ fn poll_relay(
 fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
     let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     loop {
+        // SAFETY: `pfd` is a live, fully initialised `pollfd` on the stack, so the
+        // pointer is valid for a single-element array (count `1`); `poll` only
+        // writes its `revents` field. The negative return is checked and `EINTR`
+        // retried below.
         let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();

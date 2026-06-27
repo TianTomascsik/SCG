@@ -216,6 +216,11 @@ impl ShmClient {
         let backend = if is_slot {
             let capacity = offer.capacity as usize;
             let segment_size = offer.segment_size as usize;
+            // SAFETY: `control_map`, `data_c2g_map` and `data_g2c_map` are live
+            // mappings of at least `ctl_len`, `cap_c2g` and `cap_g2c` bytes
+            // respectively (just produced by `os::mmap_shared`); `data_c2g` is
+            // mapped read/write and `data_g2c` read-only, matching the
+            // producer/consumer direction required by `client_slot_rings`.
             let (producer, consumer) = unsafe {
                 client_slot_rings(
                     control_map.as_ptr(),
@@ -231,6 +236,11 @@ impl ShmClient {
             };
             ClientBackend::Slot { producer, consumer }
         } else {
+            // SAFETY: `control_map`, `data_c2g_map` and `data_g2c_map` are live
+            // mappings of at least `ctl_len`, `cap_c2g` and `cap_g2c` bytes
+            // respectively (just produced by `os::mmap_shared`); `data_c2g` is
+            // mapped read/write and `data_g2c` read-only, matching the
+            // producer/consumer direction required by `client_rings`.
             let (producer, consumer) = unsafe {
                 client_rings(
                     control_map.as_ptr(),
@@ -248,6 +258,9 @@ impl ShmClient {
         // SAFETY: each eventfd descriptor was just received with CLOEXEC and is
         // owned exclusively by this client now.
         let c2g_evt = unsafe { EventFd::from_raw_fd(c2g_evt_fd) };
+        // SAFETY: `g2c_evt_fd` was just received over the control socket with
+        // CLOEXEC and is now owned exclusively by this client; nothing else will
+        // close it, satisfying `EventFd::from_raw_fd`.
         let g2c_evt = unsafe { EventFd::from_raw_fd(g2c_evt_fd) };
 
         Ok(ShmClient {

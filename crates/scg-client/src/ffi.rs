@@ -245,18 +245,21 @@ pub unsafe extern "C" fn scg_client_recv(
 
     match result {
         Ok(Some((tid, buf))) => {
+            // Validate the output pointers BEFORE allocating: if `out_data` is
+            // null we must not `Box::into_raw` the buffer, or its allocation
+            // would leak (the caller never receives the pointer to free it).
+            if out_data.is_null() || out_len.is_null() {
+                h.set_err("out_data and out_len must not be null");
+                return SCG_ERR; // `buf` is dropped here — no leak.
+            }
             if !traffic_id_out.is_null() {
                 *traffic_id_out = tid;
             }
             let boxed = buf.into_boxed_slice();
             let n = boxed.len();
             let p = Box::into_raw(boxed) as *mut u8;
-            if !out_data.is_null() {
-                *out_data = p;
-            }
-            if !out_len.is_null() {
-                *out_len = n;
-            }
+            *out_data = p;
+            *out_len = n;
             SCG_OK
         }
         Ok(None) => SCG_TIMEOUT,

@@ -49,7 +49,7 @@ impl FramingSession for AleSession {
         let mut buf = Vec::new();
         self.writer
             .write_alepkt(&mut buf, ALE_PKT_AU1, &au1_data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ALE AU1 send: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("ALE AU1 send: {}", e)))?;
         stream.write_all(&buf)?;
 
         // Read AU2 response with poll-based timeout (50 * 100ms = 5s)
@@ -132,8 +132,7 @@ impl FramingSession for AleSession {
                                 self.writer
                                     .write_alepkt(&mut buf, ALE_PKT_AU2, &au2_data)
                                     .map_err(|e| {
-                                        io::Error::new(
-                                            io::ErrorKind::Other,
+                                        io::Error::other(
                                             format!("ALE AU2 send: {}", e),
                                         )
                                     })?;
@@ -167,7 +166,7 @@ impl FramingSession for AleSession {
     fn frame_datagram(&mut self, payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         self.writer
             .write_alepkt(out, ALE_PKT_DT, payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ALE frame: {}", e)))
+            .map_err(|e| io::Error::other(format!("ALE frame: {}", e)))
     }
 
     fn deframe(&mut self, data: &[u8]) -> io::Result<DeframeResult> {
@@ -210,7 +209,7 @@ impl FramingSession for AleSession {
         let mut buf = Vec::new();
         self.writer
             .write_alepkt(&mut buf, ALE_PKT_DI, &[])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ALE DI: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("ALE DI: {}", e)))?;
         stream.write_all(&buf)
     }
 }

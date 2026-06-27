@@ -40,14 +40,27 @@ pub fn decode_header(hdr: &[u8; FRAME_HEADER_LEN]) -> (u32, u32) {
 }
 
 /// Append a fully encoded frame (`header || data`) to `out`.
+///
+/// Callers must keep `data` within `u32::MAX` bytes (data-plane frames are bounded
+/// well below this by the relay's max-frame limit); the debug assertion catches a
+/// violation in tests rather than silently truncating the length field.
 pub fn encode_into(out: &mut Vec<u8>, traffic_id: u32, data: &[u8]) {
+    debug_assert!(
+        data.len() <= u32::MAX as usize,
+        "frame payload {} exceeds u32::MAX",
+        data.len()
+    );
     out.extend_from_slice(&encode_header(data.len() as u32, traffic_id));
     out.extend_from_slice(data);
 }
 
 /// Write one frame to a blocking writer.
 pub fn write_frame<W: Write>(w: &mut W, traffic_id: u32, data: &[u8]) -> io::Result<()> {
-    let hdr = encode_header(data.len() as u32, traffic_id);
+    // Checked conversion: a payload larger than u32::MAX cannot be represented in
+    // the length field, so reject it rather than truncate (corrupting the frame).
+    let len = u32::try_from(data.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame payload exceeds u32::MAX"))?;
+    let hdr = encode_header(len, traffic_id);
     w.write_all(&hdr)?;
     w.write_all(data)?;
     Ok(())

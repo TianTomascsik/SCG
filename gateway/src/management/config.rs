@@ -822,18 +822,15 @@ impl fmt::Display for TlsMode {
 /// Traffic priority class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TrafficClass {
     /// Normal priority — default for all traffic.
+    #[default]
     Normal,
     /// Safety-critical traffic — always processed first.
     Safety,
 }
 
-impl Default for TrafficClass {
-    fn default() -> Self {
-        TrafficClass::Normal
-    }
-}
 
 impl fmt::Display for TrafficClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -933,16 +930,13 @@ pub struct PolicyConfig {
 /// Policy default action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PolicyAction {
+    #[default]
     Allow,
     Deny,
 }
 
-impl Default for PolicyAction {
-    fn default() -> Self {
-        PolicyAction::Allow
-    }
-}
 
 fn default_policy_action() -> PolicyAction {
     PolicyAction::Allow
@@ -1409,8 +1403,8 @@ impl GatewayConfig {
             .rules
             .iter()
             .any(|r| r.effective_security_provider() == "ktls");
-        if has_ktls_rules {
-            if fs::metadata("/proc/modules").is_ok() {
+        if has_ktls_rules
+            && fs::metadata("/proc/modules").is_ok() {
                 let modules = fs::read_to_string("/proc/modules").unwrap_or_default();
                 if !modules.contains("tls ") && !modules.contains("tls\t") {
                     // Also check built-in via /proc/net/
@@ -1423,16 +1417,21 @@ impl GatewayConfig {
                     }
                 }
             }
-        }
 
         // Check for transparent/TPROXY requirements
         let has_transparent = self.rules.iter().any(|r| r.transparent);
         if has_transparent {
             // Check CAP_NET_ADMIN via a simple test
             // (trying IP_TRANSPARENT on a throwaway socket)
+            // SAFETY: `libc::socket` takes only scalar arguments and has no pointer
+            // preconditions; its return value is checked (`fd >= 0`) before `fd` is used.
             let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
             if fd >= 0 {
                 let one: libc::c_int = 1;
+                // SAFETY: `fd` is a valid open descriptor (checked `fd >= 0` above); the
+                // option pointer/len pair point to a fully-initialised `libc::c_int` (`one`)
+                // whose size is passed exactly via `size_of::<c_int>()`; the return value is
+                // checked below.
                 let ret = unsafe {
                     libc::setsockopt(
                         fd,
@@ -1442,6 +1441,8 @@ impl GatewayConfig {
                         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                     )
                 };
+                // SAFETY: `fd` is the valid descriptor returned by `socket` above and is not
+                // used after this call, so closing it exactly once is sound.
                 unsafe {
                     libc::close(fd);
                 }
@@ -1479,9 +1480,15 @@ impl GatewayConfig {
         let has_intercept = self.rules.iter().any(|r| r.intercept.is_some());
         if has_intercept {
             // CAP_NET_ADMIN is mandatory when intercept is configured.
+            // SAFETY: `libc::socket` takes only scalar arguments and has no pointer
+            // preconditions; its return value is checked (`fd >= 0`) before `fd` is used.
             let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
             if fd >= 0 {
                 let one: libc::c_int = 1;
+                // SAFETY: `fd` is a valid open descriptor (checked `fd >= 0` above); the
+                // option pointer/len pair point to a fully-initialised `libc::c_int` (`one`)
+                // whose size is passed exactly via `size_of::<c_int>()`; the return value is
+                // checked below.
                 let ret = unsafe {
                     libc::setsockopt(
                         fd,
@@ -1491,6 +1498,8 @@ impl GatewayConfig {
                         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                     )
                 };
+                // SAFETY: `fd` is the valid descriptor returned by `socket` above and is not
+                // used after this call, so closing it exactly once is sound.
                 unsafe {
                     libc::close(fd);
                 }
@@ -1505,20 +1514,18 @@ impl GatewayConfig {
             }
 
             // iptables binary must exist when self-configuring.
-            match std::process::Command::new("iptables")
+            if std::process::Command::new("iptables")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
+                .is_err()
             {
-                Err(_) => {
-                    errors.push(
-                        "Intercept rules configured but 'iptables' command not found. \
-                         Install iptables or remove the intercept configuration."
-                            .to_string(),
-                    );
-                }
-                _ => {}
+                errors.push(
+                    "Intercept rules configured but 'iptables' command not found. \
+                     Install iptables or remove the intercept configuration."
+                        .to_string(),
+                );
             }
 
             // ip command needed for TPROXY routing policy.
@@ -1527,21 +1534,19 @@ impl GatewayConfig {
                 .iter()
                 .any(|r| matches!(&r.intercept, Some(ic) if ic.mode == InterceptMode::Tproxy));
             if has_tproxy_intercept {
-                match std::process::Command::new("ip")
+                if std::process::Command::new("ip")
                     .arg("rule")
                     .arg("show")
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
+                    .is_err()
                 {
-                    Err(_) => {
-                        errors.push(
-                            "Intercept mode 'tproxy' configured but 'ip' command not found. \
-                             Install iproute2 or remove the tproxy intercept configuration."
-                                .to_string(),
-                        );
-                    }
-                    _ => {}
+                    errors.push(
+                        "Intercept mode 'tproxy' configured but 'ip' command not found. \
+                         Install iproute2 or remove the tproxy intercept configuration."
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -1809,11 +1814,25 @@ pub struct ConfigDiff {
     pub unchanged: Vec<String>,
 }
 
-/// Decode a hex string to bytes. Assumes valid hex (validated by config validation).
-pub fn decode_hex(hex: &str) -> Vec<u8> {
+/// Decode a hex string to bytes, returning an error on odd length or non-hex
+/// characters instead of panicking.
+///
+/// NOTE: the security path (PSK decoding) uses the `decode_hex` in
+/// `security::tls_engine::params`; this function currently has no callers and is
+/// a candidate for removal (see DRY cleanup) — it is kept and hardened for now so
+/// it is not a panicking landmine for any out-of-tree consumer.
+pub fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length {}", hex.len()));
+    }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .map(|i| {
+            let pair = hex
+                .get(i..i + 2)
+                .ok_or_else(|| "hex slice out of bounds".to_string())?;
+            u8::from_str_radix(pair, 16).map_err(|e| format!("invalid hex byte '{pair}': {e}"))
+        })
         .collect()
 }
 

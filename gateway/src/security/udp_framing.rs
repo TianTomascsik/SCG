@@ -16,6 +16,14 @@
 use ale_pipe::{AleError, AleFrameReader, AleFrameWriter, ALE_PKT_DI, ALE_PKT_DT};
 use log::error;
 
+/// Upper bound on a single reassembled raw datagram. The raw framing tunnels UDP
+/// datagrams, which cannot exceed the IPv4 UDP payload limit (65507 bytes); we
+/// cap at 65535 and treat any larger advertised length as corruption or a
+/// hostile/buggy peer (disconnect) rather than buffering unboundedly — otherwise
+/// a 4-byte header advertising a multi-gigabyte length would make the relay
+/// accumulate that much memory waiting for the frame to complete.
+const MAX_RAW_DATAGRAM_LEN: usize = 65_535;
+
 /// Per-session UDP-over-TLS framing state.
 pub enum UdpFraming {
     /// ETCS ALEPKT framing (Subset-098).
@@ -58,6 +66,15 @@ impl UdpFraming {
                 let _ = writer.write_alepkt(out, ALE_PKT_DT, payload);
             }
             UdpFraming::Raw { .. } => {
+                // Outbound datagrams originate from UDP recv, so they are bounded
+                // by the UDP payload limit; assert the invariant rather than
+                // silently truncating the length in the `as u32` cast below.
+                debug_assert!(
+                    payload.len() <= MAX_RAW_DATAGRAM_LEN,
+                    "raw outbound datagram {} exceeds max {}",
+                    payload.len(),
+                    MAX_RAW_DATAGRAM_LEN
+                );
                 out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 out.extend_from_slice(payload);
             }
@@ -114,6 +131,13 @@ impl UdpFraming {
                         break;
                     }
                     let len = u32::from_le_bytes([rem[0], rem[1], rem[2], rem[3]]) as usize;
+                    if len > MAX_RAW_DATAGRAM_LEN {
+                        error!(
+                            "[{}] raw framing: datagram length {} exceeds maximum {} — disconnecting",
+                            rule_name, len, MAX_RAW_DATAGRAM_LEN
+                        );
+                        return true;
+                    }
                     if rem.len() < 4 + len {
                         break;
                     }
@@ -135,6 +159,39 @@ impl UdpFraming {
         if let UdpFraming::Ale { writer, .. } = self {
             let _ = writer.write_alepkt(stream, ALE_PKT_DI, &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_bound_tests {
+    use super::*;
+
+    #[test]
+    fn raw_oversized_length_disconnects_without_buffering() {
+        let mut framing = UdpFraming::for_app_protocol("raw");
+        // 4-byte header advertising a ~4 GiB datagram.
+        let hdr = u32::MAX.to_le_bytes();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let disconnect = framing.deframe_each("test", &hdr, |d| got.push(d.to_vec()));
+        assert!(disconnect, "oversized advertised length must trigger disconnect");
+        assert!(got.is_empty(), "no datagram should be emitted");
+    }
+
+    #[test]
+    fn raw_roundtrip_within_bound_chunked() {
+        let mut tx = UdpFraming::for_app_protocol("raw");
+        let mut wire = Vec::new();
+        tx.frame_into(b"hello", &mut wire);
+        tx.frame_into(b"world", &mut wire);
+
+        let mut rx = UdpFraming::for_app_protocol("raw");
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        // Feed one byte at a time to exercise partial reassembly.
+        for b in &wire {
+            let disconnect = rx.deframe_each("test", &[*b], |d| got.push(d.to_vec()));
+            assert!(!disconnect);
+        }
+        assert_eq!(got, vec![b"hello".to_vec(), b"world".to_vec()]);
     }
 }
 
