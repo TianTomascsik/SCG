@@ -244,9 +244,7 @@ impl TlsSecurityParams {
             TlsProfile::Subset146Pki => {
                 // PKI mandates mutual authentication.
                 if self.verify != VerifyMode::Mutual {
-                    return Err(
-                        "subset146-pki profile requires verify = mutual".to_string(),
-                    );
+                    return Err("subset146-pki profile requires verify = mutual".to_string());
                 }
             }
             _ => {}
@@ -254,7 +252,9 @@ impl TlsSecurityParams {
 
         // psk_hex without the psk profile is a likely misconfiguration.
         if self.psk_key.is_some() && self.profile != TlsProfile::Subset146Psk {
-            return Err("psk_hex/psk_identity are only valid with profile = subset146-psk".to_string());
+            return Err(
+                "psk_hex/psk_identity are only valid with profile = subset146-psk".to_string(),
+            );
         }
 
         Ok(())
@@ -391,9 +391,13 @@ pub fn openssl_supports_null_cipher() -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
 
     fn params_from(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -410,6 +414,19 @@ mod tests {
         assert_eq!(p.profile, TlsProfile::Default);
         assert_eq!(p.verify, VerifyMode::None);
         assert!(p.is_ktls_offloadable());
+    }
+
+    #[test]
+    fn selected_identity_does_not_disable_ktls_offload() {
+        let m = params_from(&[
+            ("verify", json!("none")),
+            ("cert_path", json!("/certs/server.pem")),
+            ("key_path", json!("/certs/server.key")),
+        ]);
+        let p = TlsSecurityParams::from_params(&m, Some("tls1.3")).unwrap();
+        assert!(p.is_ktls_offloadable());
+        assert_eq!(p.cert_path.as_deref(), Some(Path::new("/certs/server.pem")));
+        assert_eq!(p.key_path.as_deref(), Some(Path::new("/certs/server.key")));
     }
 
     #[test]

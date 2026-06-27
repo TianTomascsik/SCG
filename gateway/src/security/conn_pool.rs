@@ -1,17 +1,17 @@
 //! Elastic connection thread pool — a base set of worker threads handles
-//! connections, with overflow threads spawned on demand when all workers
-//! are busy.
+//! connections. Safety pools may spawn overflow threads on demand when all
+//! workers are busy; normal pools queue behind their bounded worker set.
 //!
 //! Relay tasks are long-lived (they run for the entire connection lifetime),
 //! so a fixed pool would stall connections when concurrency exceeds pool
 //! size.  The elastic design keeps the benefits of thread reuse under
-//! normal load while guaranteeing no connection starvation under burst.
+//! normal load while preserving safety CPU capacity under normal-traffic bursts.
 //!
 //! Benefits:
 //! - Eliminates thread creation/teardown overhead under normal load
 //! - Keeps CPU caches warm (base workers stay on the same cores)
-//! - Automatically scales up for high-concurrency bursts
-//! - No connection starvation — every job gets a thread
+//! - Automatically scales safety handling up for high-concurrency bursts
+//! - Bounds normal traffic CPU consumption under overload
 
 use crate::management::config::TrafficClass;
 use crate::networking::socket_manager::apply_safety_priority;
@@ -30,14 +30,16 @@ const SAFETY_MIN_WORKERS: usize = 2;
 
 /// An elastic thread pool for connection handling.
 ///
-/// Maintains a base set of long-lived worker threads.  When a job is
-/// submitted and no base worker is idle, a temporary overflow thread is
-/// spawned to handle the job immediately, preventing queue stalls.
+/// Maintains a base set of long-lived worker threads.  When a safety job is
+/// submitted and no base worker is idle, a temporary overflow thread is spawned
+/// to handle the job immediately. Normal jobs queue behind the base workers
+/// instead of spawning unbounded extra threads.
 ///
 /// The pool is *class-aware*: a [`TrafficClass::Safety`] pool reserves a
 /// minimum worker count and runs every worker (base and overflow) at elevated
-/// scheduling priority, so a normal-traffic connection storm can never starve
-/// safety capacity.
+/// scheduling priority. Normal pools do not spawn overflow threads, so a
+/// normal-traffic connection storm cannot multiply runnable normal workers until
+/// they compete with the reserved safety capacity.
 pub struct ConnectionPool {
     sender: mpsc::Sender<Job>,
     idle_count: Arc<AtomicUsize>,
@@ -108,21 +110,19 @@ impl ConnectionPool {
     /// Submit a job to the pool.
     ///
     /// If at least one base worker is idle the job goes through the shared
-    /// channel and will be picked up cheaply.  If all base workers are busy
-    /// with long-lived relay tasks, an overflow thread is spawned immediately
-    /// so the connection is never queued behind an already-running relay.
+    /// channel and will be picked up cheaply. If all base workers are busy,
+    /// safety jobs spawn an overflow thread immediately; normal jobs remain
+    /// queued on the bounded base worker set.
     ///
     /// Returns `false` only if the pool has been shut down.
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> bool {
         // Fast path: idle worker available → queue through channel
         if self.idle_count.load(Ordering::Acquire) > 0 {
-            return match self.sender.send(Box::new(f)) {
-                Ok(()) => true,
-                Err(_) => {
-                    warn!("connection pool: channel disconnected, dropping job");
-                    false
-                }
-            };
+            return self.queue_job(Box::new(f));
+        }
+
+        if self.class == TrafficClass::Normal {
+            return self.queue_job(Box::new(f));
         }
 
         // Slow path: all base workers busy → spawn overflow thread
@@ -143,6 +143,16 @@ impl ConnectionPool {
                 match self.sender.send(Box::new(|| {})) {
                     _ => {}
                 }
+                false
+            }
+        }
+    }
+
+    fn queue_job(&self, job: Job) -> bool {
+        match self.sender.send(job) {
+            Ok(()) => true,
+            Err(_) => {
+                warn!("connection pool: channel disconnected, dropping job");
                 false
             }
         }
@@ -190,5 +200,83 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn normal_pool_queues_when_base_worker_is_busy() {
+        let pool = ConnectionPool::new_for_class(1, "test-normal-queue", TrafficClass::Normal);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(pool.execute(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_worker = ran.clone();
+        assert!(pool.execute(move || ran_worker.store(true, Ordering::SeqCst)));
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "normal jobs should queue instead of spawning overflow workers"
+        );
+
+        release_tx.send(()).unwrap();
+        for _ in 0..200 {
+            if ran.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn safety_pool_overflows_when_reserved_workers_are_busy() {
+        let pool = ConnectionPool::new_for_class(2, "test-safety-overflow", TrafficClass::Safety);
+        let worker_count = pool._workers.len();
+        for _ in 0..200 {
+            if pool.idle_count.load(Ordering::SeqCst) >= worker_count {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pool.idle_count.load(Ordering::SeqCst), worker_count);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut release_txs = Vec::new();
+
+        for _ in 0..worker_count {
+            let started = started_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            release_txs.push(release_tx);
+            assert!(pool.execute(move || {
+                started.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }));
+        }
+        drop(started_tx);
+        for _ in 0..worker_count {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_worker = ran.clone();
+        assert!(pool.execute(move || ran_worker.store(true, Ordering::SeqCst)));
+        for _ in 0..200 {
+            if ran.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "safety jobs should get overflow capacity when reserved workers are busy"
+        );
+
+        for tx in release_txs {
+            let _ = tx.send(());
+        }
     }
 }

@@ -108,7 +108,10 @@ fn bench_tls_version() -> SslVersion {
         "" | "1.2" | "1-2" | "1_2" | "12" => SslVersion::TLS1_2,
         "1.3" | "1-3" | "1_3" | "13" => SslVersion::TLS1_3,
         other => {
-            eprintln!("[tls] WARNING: unknown TLS version '{}', using TLS 1.2", other);
+            eprintln!(
+                "[tls] WARNING: unknown TLS version '{}', using TLS 1.2",
+                other
+            );
             SslVersion::TLS1_2
         }
     }
@@ -122,7 +125,9 @@ fn bench_tls_version() -> SslVersion {
 ///
 /// Cipher values (case-insensitive, `-`/`_` interchangeable):
 ///   * `aes128-gcm` (default), `aes256-gcm` (BSI + NIST), `chacha20-poly1305` (BSI)
-fn configure_bench_crypto(builder: &mut SslContextBuilder) -> Result<(), openssl::error::ErrorStack> {
+fn configure_bench_crypto(
+    builder: &mut SslContextBuilder,
+) -> Result<(), openssl::error::ErrorStack> {
     let ver = bench_tls_version();
     builder.set_min_proto_version(Some(ver))?;
     builder.set_max_proto_version(Some(ver))?;
@@ -516,7 +521,7 @@ impl TlsPipeLane {
         let mut stream = self
             .blocking_stream
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "TLS stream mutex poisoned"))?;
+            .map_err(|_| io::Error::other("TLS stream mutex poisoned"))?;
         let mut sent = 0usize;
         while sent < data.len() {
             match stream.write(&data[sent..]) {

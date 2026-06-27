@@ -1,7 +1,7 @@
 //! Decrypt direction: accept TLS/kTLS connections and relay to plain TCP/UDP upstream.
 
 use super::params::TlsSecurityParams;
-use super::{build_tls_acceptor, ProxyStream};
+use super::{build_ktls_acceptor, build_tls_acceptor, ProxyStream};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
@@ -18,10 +18,7 @@ use crate::management::config::{PerfKnobs, Proto, QosPolicy, TlsMode};
 use crate::management::telemetry::{format_rate, ConnectionMetrics};
 
 use foreign_types_shared::ForeignTypeRef;
-use ktls_pipe::{
-    build_server_acceptor as ktls_server_acceptor, enable_ktls_ssl, get_tcp_ulp,
-    ktls_privilege_hint, KtlsSession,
-};
+use ktls_pipe::{enable_ktls_ssl, get_tcp_ulp, ktls_privilege_hint, KtlsSession};
 use log::{debug, error, info, warn};
 use openssl::ssl::{Ssl, SslAcceptor};
 
@@ -54,29 +51,23 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
     );
 
     // Resolve typed security parameters from the rule's provider_params.
-    let tls_params = TlsSecurityParams::from_params(
-        &ctx.provider_params,
-        ctx.protocol_version.as_deref(),
-    )
-    .unwrap_or_else(|e| {
-        error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
-        std::process::exit(1);
-    });
+    let tls_params =
+        TlsSecurityParams::from_params(&ctx.provider_params, ctx.protocol_version.as_deref())
+            .unwrap_or_else(|e| {
+                error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
+                std::process::exit(1);
+            });
 
     // Build the TLS acceptor (reused across all connections).
     let acceptor = match ctx.tls_mode {
-        TlsMode::Tls => Some(
-            build_tls_acceptor(&tls_params).unwrap_or_else(|e| {
-                error!("[{}] TLS acceptor error: {}", ctx.rule_name, e);
-                std::process::exit(1);
-            }),
-        ),
-        TlsMode::Ktls => Some(
-            ktls_server_acceptor(ctx.protocol_version.as_deref()).unwrap_or_else(|e| {
-                error!("[{}] kTLS acceptor error: {}", ctx.rule_name, e);
-                std::process::exit(1);
-            }),
-        ),
+        TlsMode::Tls => Some(build_tls_acceptor(&tls_params).unwrap_or_else(|e| {
+            error!("[{}] TLS acceptor error: {}", ctx.rule_name, e);
+            std::process::exit(1);
+        })),
+        TlsMode::Ktls => Some(build_ktls_acceptor(&tls_params).unwrap_or_else(|e| {
+            error!("[{}] kTLS acceptor error: {}", ctx.rule_name, e);
+            std::process::exit(1);
+        })),
         TlsMode::Dtls => unreachable!("DTLS uses run_dtls_decrypt_relay, not tcp decrypt"),
     };
 
@@ -280,7 +271,10 @@ pub(crate) fn handle_tcp_decrypt(
         Proto::Uds | Proto::Shm => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("upstream protocol {} is not valid on the TLS decrypt path", upstream_proto),
+                format!(
+                    "upstream protocol {} is not valid on the TLS decrypt path",
+                    upstream_proto
+                ),
             ));
         }
         Proto::Tcp => {
@@ -320,6 +314,9 @@ pub(crate) fn handle_tcp_decrypt(
                         shutdown,
                         delay_ms,
                         perf.pipe_size,
+                        perf.busy_poll_us,
+                        perf.bdp_adaptive,
+                        perf.bdp_queue_budget_us,
                     )
                 }
                 _ => relay_bidirectional(
@@ -330,6 +327,9 @@ pub(crate) fn handle_tcp_decrypt(
                     delay_ms,
                     perf.enable_cork,
                     perf.relay_buf_size,
+                    perf.busy_poll_us,
+                    perf.bdp_adaptive,
+                    perf.bdp_queue_budget_us,
                 ),
             }
         }
@@ -342,7 +342,11 @@ pub(crate) fn handle_tcp_decrypt(
             })?;
             // Bind the egress socket in the target's address family so IPv6
             // upstreams work (an IPv4 wildcard cannot connect to an IPv6 peer).
-            let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let bind_addr = if target.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
             let upstream = UdpSocket::bind(bind_addr)
                 .map_err(|e| io::Error::new(e.kind(), format!("UDP bind: {}", e)))?;
             upstream.connect(target)?;

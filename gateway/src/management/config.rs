@@ -277,25 +277,28 @@ const LATENCY_BUSY_POLL_US: u32 = 50;
 
 /// Splice pipe capacity per profile (bytes).
 const THROUGHPUT_PIPE_SIZE: usize = 16 * 1024 * 1024;
-const BALANCED_PIPE_SIZE: usize = 2 * 1024 * 1024;
+const BALANCED_PIPE_SIZE: usize = 8 * 1024 * 1024;
 const LATENCY_PIPE_SIZE: usize = 256 * 1024;
 
 /// Userspace-TLS relay buffer size per profile (bytes).
 const THROUGHPUT_RELAY_BUF: usize = 4 * 1024 * 1024;
-const BALANCED_RELAY_BUF: usize = 1024 * 1024;
+const BALANCED_RELAY_BUF: usize = 2 * 1024 * 1024;
 const LATENCY_RELAY_BUF: usize = 256 * 1024;
 
 /// Socket-buffer cap per profile (bytes). The effective `SO_SNDBUF`/`SO_RCVBUF`
 /// is `min(configured sock_buf_size, cap)`, so an explicitly small global
 /// `sock_buf_size` still wins over the profile default.
-const BALANCED_SOCK_BUF_CAP: usize = 2 * 1024 * 1024;
+const BALANCED_SOCK_BUF_CAP: usize = 8 * 1024 * 1024;
 const LATENCY_SOCK_BUF_CAP: usize = 256 * 1024;
 
 /// `TCP_NOTSENT_LOWAT` target per profile (bytes). Bounds the unsent bytes the
 /// kernel keeps queued before signalling writability, trimming local queueing
 /// latency. `None` leaves the kernel default (the `throughput` profile).
-const BALANCED_NOTSENT_LOWAT: usize = 256 * 1024;
+const BALANCED_NOTSENT_LOWAT: usize = 2 * 1024 * 1024;
 const LATENCY_NOTSENT_LOWAT: usize = 16 * 1024;
+
+/// Target local queueing budget for opt-in BDP-adaptive latency sizing.
+const DEFAULT_BDP_QUEUE_BUDGET_US: u64 = 1_000;
 
 /// Low-level relay knobs resolved from a [`PerfProfile`] together with a rule's
 /// explicit overrides. Cheap to copy; carried on the rule's hot path.
@@ -315,6 +318,10 @@ pub struct PerfKnobs {
     pub notsent_lowat: Option<usize>,
     /// `SO_BUSY_POLL` / pre-poll spin window for the TCP data path (µs).
     pub busy_poll_us: u32,
+    /// Re-tune socket/pipe depths from observed bandwidth-delay product.
+    pub bdp_adaptive: bool,
+    /// Target local queueing budget used by BDP-adaptive sizing (µs).
+    pub bdp_queue_budget_us: u64,
 }
 
 impl PerfKnobs {
@@ -338,9 +345,13 @@ impl PerfKnobs {
             0
         };
         let (pipe_size, relay_buf_size, sock_cap, notsent_lowat, busy_poll_us) = match profile {
-            PerfProfile::Throughput => {
-                (THROUGHPUT_PIPE_SIZE, THROUGHPUT_RELAY_BUF, usize::MAX, None, 0)
-            }
+            PerfProfile::Throughput => (
+                THROUGHPUT_PIPE_SIZE,
+                THROUGHPUT_RELAY_BUF,
+                usize::MAX,
+                None,
+                0,
+            ),
             PerfProfile::Balanced => (
                 BALANCED_PIPE_SIZE,
                 BALANCED_RELAY_BUF,
@@ -364,7 +375,43 @@ impl PerfKnobs {
             relay_buf_size,
             notsent_lowat,
             busy_poll_us,
+            bdp_adaptive: false,
+            bdp_queue_budget_us: DEFAULT_BDP_QUEUE_BUDGET_US,
         }
+    }
+
+    /// Apply explicit rule-level low-level overrides on top of the profile
+    /// defaults. `notsent_lowat = Some(0)` deliberately disables the option.
+    fn with_rule_overrides(
+        mut self,
+        sock_buf_size: Option<usize>,
+        pipe_size: Option<usize>,
+        relay_buf_size: Option<usize>,
+        notsent_lowat: Option<usize>,
+        busy_poll_us: Option<u32>,
+        bdp_adaptive: bool,
+        bdp_queue_budget_us: Option<u64>,
+    ) -> Self {
+        if let Some(value) = sock_buf_size {
+            self.sock_buf_size = value;
+        }
+        if let Some(value) = pipe_size {
+            self.pipe_size = value;
+        }
+        if let Some(value) = relay_buf_size {
+            self.relay_buf_size = value;
+        }
+        if let Some(value) = notsent_lowat {
+            self.notsent_lowat = (value != 0).then_some(value);
+        }
+        if let Some(value) = busy_poll_us {
+            self.busy_poll_us = value;
+        }
+        self.bdp_adaptive = bdp_adaptive;
+        if let Some(value) = bdp_queue_budget_us {
+            self.bdp_queue_budget_us = value;
+        }
+        self
     }
 }
 
@@ -560,6 +607,38 @@ pub struct RuleConfig {
     #[serde(default)]
     pub perf_profile: Option<PerfProfile>,
 
+    /// Optional per-rule `SO_SNDBUF`/`SO_RCVBUF` override in bytes. When unset,
+    /// the selected performance profile supplies the socket-buffer size.
+    #[serde(default)]
+    pub sock_buf_size: Option<usize>,
+
+    /// Optional per-rule splice pipe/chunk override in bytes.
+    #[serde(default)]
+    pub pipe_size: Option<usize>,
+
+    /// Optional per-rule userspace relay buffer override in bytes.
+    #[serde(default)]
+    pub relay_buf_size: Option<usize>,
+
+    /// Optional per-rule `TCP_NOTSENT_LOWAT` override in bytes. A value of `0`
+    /// disables `TCP_NOTSENT_LOWAT` even when the selected profile would set it.
+    #[serde(default)]
+    pub notsent_lowat: Option<usize>,
+
+    /// Optional per-rule `SO_BUSY_POLL` / pre-poll spin override in microseconds.
+    #[serde(default)]
+    pub busy_poll_us: Option<u32>,
+
+    /// Opt in to bandwidth-delay-product adaptive socket/pipe sizing. Currently
+    /// active only on the `latency` profile; other profiles keep fixed depths.
+    #[serde(default)]
+    pub bdp_adaptive: bool,
+
+    /// Target local queueing budget for BDP-adaptive sizing in microseconds.
+    /// Default: 1000 µs.
+    #[serde(default)]
+    pub bdp_queue_budget_us: Option<u64>,
+
     /// Firewall interception configuration. When present, the gateway will
     /// install iptables rules at startup to redirect matching traffic to this
     /// rule's listen port and tear them down on graceful shutdown.
@@ -579,6 +658,15 @@ impl RuleConfig {
             self.simulated_delay_ms,
             self.spin_wait_us,
             sock_buf_size,
+        )
+        .with_rule_overrides(
+            self.sock_buf_size,
+            self.pipe_size,
+            self.relay_buf_size,
+            self.notsent_lowat,
+            self.busy_poll_us,
+            self.bdp_adaptive && profile == PerfProfile::Latency,
+            self.bdp_queue_budget_us,
         )
     }
 
@@ -1049,12 +1137,13 @@ impl GatewayConfig {
                     ));
                 }
             } else {
-                let listen_sock: SocketAddr = rule.listen_addr.parse::<SocketAddr>().map_err(|e| {
-                    format!(
-                        "Rule '{}' (index {}): invalid listen_addr '{}': {}",
-                        rule.name, i, rule.listen_addr, e
-                    )
-                })?;
+                let listen_sock: SocketAddr =
+                    rule.listen_addr.parse::<SocketAddr>().map_err(|e| {
+                        format!(
+                            "Rule '{}' (index {}): invalid listen_addr '{}': {}",
+                            rule.name, i, rule.listen_addr, e
+                        )
+                    })?;
 
                 // Duplicate listen addresses (same proto+addr = port conflict)
                 let listen_key = format!("{}:{}", rule.listen_proto, listen_sock);
@@ -1095,11 +1184,9 @@ impl GatewayConfig {
             // surfaced early instead of at connection time. Other non-offloadable
             // profiles (PKI/PSK/verify) fall back to userspace TLS at runtime.
             let is_ktls = rule.effective_security_provider() == "ktls"
-                || (rule.tls_mode == TlsMode::Ktls
-                    && rule.effective_security_provider() == "tls");
+                || (rule.tls_mode == TlsMode::Ktls && rule.effective_security_provider() == "tls");
             if is_ktls {
-                if let Some(profile) =
-                    rule.provider_params.get("profile").and_then(|v| v.as_str())
+                if let Some(profile) = rule.provider_params.get("profile").and_then(|v| v.as_str())
                 {
                     if matches!(profile, "integrity-only" | "integrity" | "null") {
                         return Err(format!(
@@ -1226,8 +1313,7 @@ impl GatewayConfig {
                 })?;
 
                 // egress_redirect requires at least one match_dst.
-                if intercept.mode == InterceptMode::EgressRedirect
-                    && intercept.match_dst.is_empty()
+                if intercept.mode == InterceptMode::EgressRedirect && intercept.match_dst.is_empty()
                 {
                     return Err(format!(
                         "Rule '{}' (index {}): intercept mode 'egress_redirect' requires at least one match_dst",
@@ -1595,9 +1681,7 @@ impl GatewayConfig {
     fn validate_ip_or_cidr(s: &str) -> Result<(), String> {
         let s = s.trim();
         if let Some((ip_str, prefix_str)) = s.split_once('/') {
-            let ip: IpAddr = ip_str
-                .parse()
-                .map_err(|e| format!("invalid IP: {}", e))?;
+            let ip: IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {}", e))?;
             let prefix_len: u8 = prefix_str
                 .parse()
                 .map_err(|e| format!("invalid prefix length: {}", e))?;
@@ -1846,18 +1930,22 @@ mod perf_knobs_tests {
         assert_eq!(k.spin_wait_us, 0);
         assert_eq!(k.notsent_lowat, None);
         assert_eq!(k.busy_poll_us, 0);
+        assert!(!k.bdp_adaptive);
+        assert_eq!(k.bdp_queue_budget_us, 1_000);
     }
 
     #[test]
     fn balanced_profile_uses_medium_buffers() {
         let k = PerfKnobs::resolve(PerfProfile::Balanced, 0, 0, 16 * MIB);
-        assert_eq!(k.sock_buf_size, 2 * MIB); // clamped to balanced cap
-        assert_eq!(k.pipe_size, 2 * MIB);
-        assert_eq!(k.relay_buf_size, MIB);
+        assert_eq!(k.sock_buf_size, 8 * MIB); // clamped to balanced cap
+        assert_eq!(k.pipe_size, 8 * MIB);
+        assert_eq!(k.relay_buf_size, 2 * MIB);
         assert!(k.enable_cork);
         assert_eq!(k.spin_wait_us, 0);
-        assert_eq!(k.notsent_lowat, Some(256 * KIB));
+        assert_eq!(k.notsent_lowat, Some(2 * MIB));
         assert_eq!(k.busy_poll_us, 0);
+        assert!(!k.bdp_adaptive);
+        assert_eq!(k.bdp_queue_budget_us, 1_000);
     }
 
     #[test]
@@ -1870,6 +1958,8 @@ mod perf_knobs_tests {
         assert_eq!(k.spin_wait_us, 50);
         assert_eq!(k.notsent_lowat, Some(16 * KIB));
         assert_eq!(k.busy_poll_us, 50);
+        assert!(!k.bdp_adaptive);
+        assert_eq!(k.bdp_queue_budget_us, 1_000);
     }
 
     #[test]
@@ -1926,6 +2016,54 @@ mod perf_knobs_tests {
         let k = rule.perf_knobs(PerfProfile::Latency, 16 * MIB);
         assert_eq!(k.pipe_size, 256 * KIB); // inherited latency
     }
+
+    #[test]
+    fn low_level_rule_overrides_win_over_profile_defaults() {
+        let rule = rule_with(serde_json::json!({
+            "perf_profile": "latency",
+            "sock_buf_size": 3 * MIB,
+            "pipe_size": 4 * MIB,
+            "relay_buf_size": 512 * KIB,
+            "notsent_lowat": 64 * KIB,
+            "busy_poll_us": 75,
+            "bdp_adaptive": true,
+            "bdp_queue_budget_us": 500
+        }));
+        let k = rule.perf_knobs(PerfProfile::Throughput, 16 * MIB);
+
+        assert_eq!(k.sock_buf_size, 3 * MIB);
+        assert_eq!(k.pipe_size, 4 * MIB);
+        assert_eq!(k.relay_buf_size, 512 * KIB);
+        assert_eq!(k.notsent_lowat, Some(64 * KIB));
+        assert_eq!(k.busy_poll_us, 75);
+        assert!(k.bdp_adaptive);
+        assert_eq!(k.bdp_queue_budget_us, 500);
+        assert!(!k.enable_cork);
+    }
+
+    #[test]
+    fn zero_notsent_lowat_rule_override_disables_profile_default() {
+        let rule = rule_with(serde_json::json!({
+            "perf_profile": "latency",
+            "notsent_lowat": 0,
+            "busy_poll_us": 0
+        }));
+        let k = rule.perf_knobs(PerfProfile::Throughput, 16 * MIB);
+
+        assert_eq!(k.notsent_lowat, None);
+        assert_eq!(k.busy_poll_us, 0);
+    }
+
+    #[test]
+    fn bdp_adaptive_only_applies_to_latency_profile() {
+        let rule = rule_with(serde_json::json!({ "bdp_adaptive": true }));
+
+        let throughput = rule.perf_knobs(PerfProfile::Throughput, 16 * MIB);
+        assert!(!throughput.bdp_adaptive);
+
+        let latency = rule.perf_knobs(PerfProfile::Latency, 16 * MIB);
+        assert!(latency.bdp_adaptive);
+    }
 }
 
 #[cfg(test)]
@@ -1965,7 +2103,10 @@ mod crypto_provider_tests {
     #[test]
     fn other_providers_pass_through_unchanged() {
         assert_eq!(resolve_crypto_provider("dtls", false, true, true), "dtls");
-        assert_eq!(resolve_crypto_provider("routing", true, true, true), "routing");
+        assert_eq!(
+            resolve_crypto_provider("routing", true, true, true),
+            "routing"
+        );
     }
 }
 
@@ -2073,7 +2214,10 @@ mod intercept_tests {
         }))
         .expect("deserialize");
         let err = cfg2.validate().unwrap_err();
-        assert!(err.contains("tproxy") && err.contains("transparent"), "got: {err}");
+        assert!(
+            err.contains("tproxy") && err.contains("transparent"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2154,7 +2298,10 @@ mod intercept_tests {
         }))
         .expect("deserialize");
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("match_dports") && err.contains("invalid"), "got: {err}");
+        assert!(
+            err.contains("match_dports") && err.contains("invalid"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2199,7 +2346,10 @@ mod intercept_tests {
         // It should parse but fail validation.
         let cfg = result.expect("deserialize");
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("intercept") && err.contains("uds"), "got: {err}");
+        assert!(
+            err.contains("intercept") && err.contains("uds"),
+            "got: {err}"
+        );
     }
 
     #[test]

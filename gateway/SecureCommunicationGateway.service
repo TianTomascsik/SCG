@@ -13,9 +13,9 @@ Group=scg
 EnvironmentFile=-/etc/scg/environment
 ExecStart=/opt/scg/gateway --config ${CONFIG:-/etc/scg/gateway.json} --watch
 
-# Capabilities required for TPROXY, kTLS, and raw socket operations
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+# Capabilities required for TPROXY/kTLS/raw sockets and Safety-class nice priority
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE
 NoNewPrivileges=yes
 
 # Reload config on `systemctl reload SecureCommunicationGateway`

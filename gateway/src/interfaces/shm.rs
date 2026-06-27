@@ -26,7 +26,7 @@
 
 use crate::interfaces::endpoint::{accept_tls_upstream, authenticate_peer, connect_tls_upstream};
 use crate::management::config::{Direction, QosPolicy, ShmNotify, ShmRingKind, TlsMode};
-use crate::networking::socket_manager::{set_nodelay, set_nonblocking_fd};
+use crate::networking::socket_manager::{apply_safety_priority, set_nodelay, set_nonblocking_fd};
 use crate::security::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::security::RELAY_BUF_SIZE;
 
@@ -123,6 +123,8 @@ const RING_FULL_BACKOFF: Duration = Duration::from_micros(50);
 /// the loop keeps listening, so a denied attacker cannot block the legitimate
 /// client.
 pub fn run_shm_endpoint(task: ShmEndpointTask) {
+    apply_safety_priority(task.qos.traffic_class);
+
     let _ = std::fs::remove_file(&task.control_socket_path);
 
     let listener = match UnixListener::bind(&task.control_socket_path) {

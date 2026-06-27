@@ -382,11 +382,32 @@ journalctl -u SecureCommunicationGateway -f
 
 ### Service Features
 
-- Runs as `scg` user with ambient capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_NET_BIND_SERVICE`)
+- Runs as `scg` user with ambient capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_NET_BIND_SERVICE`, `CAP_SYS_NICE`)
 - Auto-restart on crash (max 5 attempts per 60s)
 - Security hardening: `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`
 - `systemctl reload` triggers hot-reload via SIGHUP
 - Logs captured by journald
+
+### Host QoS
+
+Safety traffic is isolated inside the gateway by class-specific endpoint
+templates and elevated Safety workers. To make that priority visible to the
+host egress queue, install the host qdisc policy on the interface that carries
+gateway traffic:
+
+```bash
+sudo ./scripts/scg-host-qos.sh apply --dev eth0 --normal-rate 800mbit
+sudo ./scripts/scg-host-qos.sh status --dev eth0
+```
+
+The helper maps Safety sockets (`SO_PRIORITY=6`) to the highest strict-priority
+band and Normal sockets (`SO_PRIORITY=0`) below it. `--normal-rate` is optional,
+but recommended when bulk traffic must be bounded so Safety capacity remains
+reserved. Remove the policy with:
+
+```bash
+sudo ./scripts/scg-host-qos.sh clear --dev eth0
+```
 
 ### Override Settings
 
@@ -440,6 +461,7 @@ gateway --config gateway.json --validate
 | Rule consistency | Error | No duplicate names, no listen port conflicts, valid combinations |
 | Log directory | Error | Directory exists (or can be created) and is writable |
 | `CAP_NET_ADMIN` | Error | Required capability for transparent/TPROXY rules |
+| `CAP_SYS_NICE` | Warning | Required for elevated Safety worker scheduling priority |
 | iptables chains | Warning | Traffic interception chains exist |
 | TPROXY routing | Warning | Routing policy is in place |
 | kTLS module | Warning | Kernel TLS module loaded (when kTLS rules are configured) |
@@ -508,4 +530,3 @@ cargo build --release --bin gateway
 | `ale_pipe` | ALE/ALEPKT framing (workspace member) |
 | `serde` + `serde_json` | JSON config deserialization |
 | `libc` | Low-level system calls (TPROXY, signals, poll) |
-

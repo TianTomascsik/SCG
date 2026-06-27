@@ -7,7 +7,7 @@ use log::{error, info};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ─── Socket helpers ──────────────────────────────────────────────────────────
 
@@ -512,6 +512,42 @@ pub fn poll_two_fds(
         return Ok((true, true));
     }
 
+    poll_two_fds_once(fd_a, fd_b, timeout_ms)
+}
+
+/// Poll two fds with a short userspace spin phase before blocking.
+///
+/// Used by the latency profile to catch packets that arrive just after the relay
+/// drains a direction, avoiding an avoidable scheduler sleep. The spin window is
+/// bounded in microseconds and falls back to the regular blocking poll.
+pub fn poll_two_fds_with_spin(
+    fd_a: RawFd,
+    fd_b: RawFd,
+    tls_pending: usize,
+    spin_us: u32,
+    timeout_ms: i32,
+) -> io::Result<(bool, bool)> {
+    if tls_pending > 0 {
+        return Ok((true, true));
+    }
+    if spin_us > 0 {
+        let deadline = Instant::now() + Duration::from_micros(spin_us as u64);
+        loop {
+            let ready = poll_two_fds_once(fd_a, fd_b, 0)?;
+            if ready.0 || ready.1 {
+                return Ok(ready);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    poll_two_fds_once(fd_a, fd_b, timeout_ms)
+}
+
+fn poll_two_fds_once(fd_a: RawFd, fd_b: RawFd, timeout_ms: i32) -> io::Result<(bool, bool)> {
     let mut fds = [
         libc::pollfd {
             fd: fd_a,
@@ -584,7 +620,8 @@ pub fn write_all_nb<W: Write + AsRawFd>(w: &mut W, data: &[u8]) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::UdpSocket;
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::os::unix::net::UnixStream;
 
     /// Read back a socket option as a `c_int` for assertion in tests.
     fn getsockopt_int(fd: RawFd, level: libc::c_int, optname: libc::c_int) -> libc::c_int {
@@ -610,7 +647,7 @@ mod tests {
         assert_eq!(dscp_to_tos(18), 72); // AF21
         assert_eq!(dscp_to_tos(48), 192); // CS6
         assert_eq!(dscp_to_tos(63), 252); // max
-        // Values above 6 bits are masked, never bleeding into ECN.
+                                          // Values above 6 bits are masked, never bleeding into ECN.
         assert_eq!(dscp_to_tos(0xff), 252);
     }
 
@@ -646,6 +683,37 @@ mod tests {
     }
 
     #[test]
+    fn set_notsent_lowat_roundtrip() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).expect("connect tcp");
+        let (server, _) = listener.accept().expect("accept tcp");
+
+        set_notsent_lowat(client.as_raw_fd(), 16 * 1024);
+        let lowat = getsockopt_int(
+            client.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+        );
+        assert_eq!(lowat, 16 * 1024);
+
+        drop(server);
+    }
+
+    #[test]
+    fn poll_two_fds_with_spin_observes_ready_fd() {
+        let (readable, mut peer) = UnixStream::pair().expect("pair a");
+        let (idle, _idle_peer) = UnixStream::pair().expect("pair b");
+        peer.write_all(b"x").expect("write readiness byte");
+
+        let (a_ready, b_ready) =
+            poll_two_fds_with_spin(readable.as_raw_fd(), idle.as_raw_fd(), 0, 50, 100)
+                .expect("poll with spin");
+        assert!(a_ready);
+        assert!(!b_ready);
+    }
+
+    #[test]
     fn enable_recvtos_does_not_error() {
         // Smoke test: enabling RECVTOS must not panic and the option must stick.
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind v4");
@@ -671,4 +739,3 @@ mod tests {
         assert_eq!(dscp, Some(46), "receiver should recover the EF marking");
     }
 }
-

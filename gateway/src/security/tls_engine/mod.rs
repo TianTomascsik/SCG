@@ -6,7 +6,7 @@ pub mod params;
 
 use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 
-use ktls_pipe::KtlsSession;
+use ktls_pipe::{enable_ktls_ctx, KtlsSession};
 use openssl::ssl::{
     SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslSessionCacheMode,
     SslStream, SslVerifyMode, SslVersion,
@@ -104,6 +104,21 @@ const SESSION_ID_CONTEXT: &[u8] = b"scg-gateway";
 /// configuration. With default parameters this reproduces the historical
 /// behaviour (self-signed cert, `SslVerifyMode::NONE`, AES-GCM).
 pub fn build_tls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String> {
+    build_acceptor(params, false)
+}
+
+/// Build a kTLS-capable `SslAcceptor` from the same typed security parameters
+/// as the userspace TLS path. The OpenSSL context is identical apart from the
+/// `SSL_OP_ENABLE_KTLS` option, so file-based identities, CA trust, cipher
+/// policy and resumption behave consistently across `tls` and `ktls`.
+pub fn build_ktls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String> {
+    build_acceptor(params, true)
+}
+
+fn build_acceptor(
+    params: &TlsSecurityParams,
+    enable_kernel_tls: bool,
+) -> Result<SslAcceptor, String> {
     let is13 = params.is_tls13();
     let mut builder = if is13 {
         SslAcceptor::mozilla_modern_v5(SslMethod::tls())
@@ -115,6 +130,11 @@ pub fn build_tls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, Str
     // PSK handshakes carry no certificate; everything else needs an identity.
     if params.profile != TlsProfile::Subset146Psk {
         apply_identity(&mut builder, params)?;
+    }
+    if enable_kernel_tls {
+        unsafe {
+            enable_ktls_ctx(builder.as_ptr());
+        }
     }
 
     apply_cipher_policy(&mut builder, params, is13)?;
@@ -133,6 +153,19 @@ pub fn build_tls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, Str
 /// `ca_path` (and hostname checked at `connect` time); `mutual` additionally
 /// presents the client identity from `cert_path`/`key_path`.
 pub fn build_tls_connector(params: &TlsSecurityParams) -> Result<SslConnector, String> {
+    build_connector(params, false)
+}
+
+/// Build a kTLS-capable `SslConnector` from the same typed security parameters
+/// as the userspace TLS path.
+pub fn build_ktls_connector(params: &TlsSecurityParams) -> Result<SslConnector, String> {
+    build_connector(params, true)
+}
+
+fn build_connector(
+    params: &TlsSecurityParams,
+    enable_kernel_tls: bool,
+) -> Result<SslConnector, String> {
     let is13 = params.is_tls13();
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| format!("connector builder: {}", e))?;
@@ -140,6 +173,11 @@ pub fn build_tls_connector(params: &TlsSecurityParams) -> Result<SslConnector, S
     // Present a client identity when configured (required for mutual auth).
     if params.cert_path.is_some() {
         apply_identity(&mut builder, params)?;
+    }
+    if enable_kernel_tls {
+        unsafe {
+            enable_ktls_ctx(builder.as_ptr());
+        }
     }
 
     apply_cipher_policy(&mut builder, params, is13)?;
@@ -155,7 +193,10 @@ pub fn build_tls_connector(params: &TlsSecurityParams) -> Result<SslConnector, S
 
 /// Load the file-based identity if configured, otherwise the cached self-signed
 /// certificate. Applies it to the builder and verifies the key matches.
-fn apply_identity(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+fn apply_identity(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
     match (&params.cert_path, &params.key_path) {
         (Some(cert), Some(key)) => {
             let (pkey, x509) = load_identity_pem(cert, key)?;
@@ -167,7 +208,8 @@ fn apply_identity(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -
                 .map_err(|e| format!("set certificate: {}", e))?;
         }
         _ => {
-            let (pkey, x509) = get_or_init_cert().map_err(|e| format!("self-signed cert: {}", e))?;
+            let (pkey, x509) =
+                get_or_init_cert().map_err(|e| format!("self-signed cert: {}", e))?;
             builder
                 .set_private_key(pkey)
                 .map_err(|e| format!("set private key: {}", e))?;
@@ -254,7 +296,10 @@ fn set_ca(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result
 }
 
 /// Wire the server-side PSK callback for the `subset146-psk` profile.
-fn apply_psk_server(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+fn apply_psk_server(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
     if params.profile != TlsProfile::Subset146Psk {
         return Ok(());
     }
@@ -275,7 +320,10 @@ fn apply_psk_server(builder: &mut SslContextBuilder, params: &TlsSecurityParams)
 }
 
 /// Wire the client-side PSK callback for the `subset146-psk` profile.
-fn apply_psk_client(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
+fn apply_psk_client(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
     if params.profile != TlsProfile::Subset146Psk {
         return Ok(());
     }
@@ -313,7 +361,7 @@ fn pin_version(builder: &mut SslContextBuilder, is13: bool) -> Result<(), String
 
 /// Configure TLS session resumption per the rule's `resumption` toggle.
 ///
-/// When enabled (the default) a reconnecting peer can skip the full handshake:
+/// When enabled, a reconnecting peer can skip the full handshake:
 /// the server side advertises tickets and keeps a session cache keyed by a
 /// stable session-id context, and the client side caches the sessions/tickets
 /// the upstream issues. When disabled, tickets and the session cache are turned

@@ -2,7 +2,8 @@
 
 use super::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::networking::socket_manager::{
-    poll_two_fds, set_nonblocking_fd, set_quickack, write_all_nb, TcpCorkGuard,
+    poll_two_fds, poll_two_fds_with_spin, set_nonblocking_fd, set_quickack, tune_socket_buffers,
+    write_all_nb, TcpCorkGuard,
 };
 use crate::security::udp_framing::UdpFraming;
 
@@ -15,6 +16,7 @@ use std::io::{self, Read};
 use std::net::{TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 // ─── Splice constants ────────────────────────────────────────────────────────
 
@@ -33,6 +35,67 @@ pub fn apply_geo_delay(delay_ms: u64) {
     }
 }
 
+const ADAPTIVE_MIN_BUF_SIZE: usize = 64 * 1024;
+
+struct AdaptiveBufferTuner {
+    enabled: bool,
+    target_queue_us: u64,
+    min_size: usize,
+    max_size: usize,
+    current_size: usize,
+    window_start: Instant,
+    window_bytes: usize,
+}
+
+impl AdaptiveBufferTuner {
+    fn new(enabled: bool, target_queue_us: u64, max_size: usize) -> Self {
+        let max_size = max_size.max(ADAPTIVE_MIN_BUF_SIZE);
+        Self {
+            enabled: enabled && target_queue_us > 0,
+            target_queue_us,
+            min_size: ADAPTIVE_MIN_BUF_SIZE,
+            max_size,
+            current_size: max_size,
+            window_start: Instant::now(),
+            window_bytes: 0,
+        }
+    }
+
+    fn record(&mut self, bytes: usize, socket_fds: &[RawFd], pipe_fds: &[RawFd]) {
+        if !self.enabled || bytes == 0 {
+            return;
+        }
+        self.window_bytes = self.window_bytes.saturating_add(bytes);
+        let elapsed = self.window_start.elapsed();
+        if elapsed < Duration::from_millis(250) {
+            return;
+        }
+
+        let bytes_per_sec = self.window_bytes as f64 / elapsed.as_secs_f64();
+        let desired = (bytes_per_sec * (self.target_queue_us as f64 / 1_000_000.0)).ceil() as usize;
+        let desired = round_page(desired.clamp(self.min_size, self.max_size)).min(self.max_size);
+        if desired.abs_diff(self.current_size) >= (self.current_size / 8).max(4096) {
+            for &fd in socket_fds {
+                tune_socket_buffers(fd, desired);
+            }
+            for &fd in pipe_fds {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETPIPE_SZ, desired as libc::c_int);
+                }
+            }
+            self.current_size = desired;
+        }
+
+        self.window_start = Instant::now();
+        self.window_bytes = 0;
+    }
+}
+
+fn round_page(bytes: usize) -> usize {
+    const PAGE: usize = 4096;
+    bytes.div_ceil(PAGE) * PAGE
+}
+
 /// Bidirectional relay between a TLS ProxyStream and a plain TcpStream.
 /// Uses poll()-based I/O for full-duplex forwarding in a single thread.
 pub fn relay_bidirectional(
@@ -43,6 +106,9 @@ pub fn relay_bidirectional(
     delay_ms: u64,
     enable_cork: bool,
     relay_buf_size: usize,
+    busy_poll_us: u32,
+    bdp_adaptive: bool,
+    bdp_queue_budget_us: u64,
 ) -> io::Result<()> {
     let tls_fd = tls_stream.raw_fd();
     let up_fd = upstream.as_raw_fd();
@@ -55,6 +121,7 @@ pub fn relay_bidirectional(
     // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
     let mut buf_fwd = vec![0u8; relay_buf_size];
     let mut buf_rev = vec![0u8; relay_buf_size];
+    let mut tuner = AdaptiveBufferTuner::new(bdp_adaptive, bdp_queue_budget_us, relay_buf_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -62,7 +129,8 @@ pub fn relay_bidirectional(
         }
 
         let tls_pending = tls_stream.ssl_pending();
-        let (a_ready, b_ready) = poll_two_fds(tls_fd, up_fd, tls_pending, 100)?;
+        let (a_ready, b_ready) =
+            poll_two_fds_with_spin(tls_fd, up_fd, tls_pending, busy_poll_us, 100)?;
         if !a_ready && !b_ready {
             continue;
         }
@@ -79,6 +147,7 @@ pub fn relay_bidirectional(
                     Ok(n) => {
                         apply_geo_delay(delay_ms);
                         write_all_nb(&mut upstream, &buf_fwd[..n])?;
+                        tuner.record(n, &[tls_fd, up_fd], &[]);
                         conn_metrics.record_read(n);
                         conn_metrics.record_relay(n);
                         if tls_stream.ssl_pending() == 0 {
@@ -103,6 +172,7 @@ pub fn relay_bidirectional(
                     }
                     Ok(n) => {
                         write_all_nb_proxy(tls_stream, &buf_rev[..n])?;
+                        tuner.record(n, &[tls_fd, up_fd], &[]);
                         conn_metrics.record_read(n);
                         conn_metrics.record_relay(n);
                     }
@@ -221,6 +291,9 @@ pub fn relay_encrypt_bidirectional(
     delay_ms: u64,
     enable_cork: bool,
     relay_buf_size: usize,
+    busy_poll_us: u32,
+    bdp_adaptive: bool,
+    bdp_queue_budget_us: u64,
 ) -> io::Result<()> {
     let client_fd = client.as_raw_fd();
     let tls_fd = upstream.raw_fd();
@@ -235,6 +308,7 @@ pub fn relay_encrypt_bidirectional(
     let mut buf_rev = vec![0u8; relay_buf_size];
     let mut client_w = client.try_clone()?;
     let mut client_r = client;
+    let mut tuner = AdaptiveBufferTuner::new(bdp_adaptive, bdp_queue_budget_us, relay_buf_size);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -243,7 +317,8 @@ pub fn relay_encrypt_bidirectional(
 
         let tls_pending = upstream.ssl_pending();
         // Note: for encrypt, fd_a=client, fd_b=tls upstream
-        let (client_ready, tls_ready) = poll_two_fds(client_fd, tls_fd, tls_pending, 100)?;
+        let (client_ready, tls_ready) =
+            poll_two_fds_with_spin(client_fd, tls_fd, tls_pending, busy_poll_us, 100)?;
         if !client_ready && !tls_ready {
             continue;
         }
@@ -260,6 +335,7 @@ pub fn relay_encrypt_bidirectional(
                     Ok(n) => {
                         apply_geo_delay(delay_ms);
                         write_all_nb_proxy(upstream, &buf_fwd[..n])?;
+                        tuner.record(n, &[client_fd, tls_fd], &[]);
                         conn_metrics.record_read(n);
                         conn_metrics.record_relay(n);
                     }
@@ -281,6 +357,7 @@ pub fn relay_encrypt_bidirectional(
                     }
                     Ok(n) => {
                         write_all_nb(&mut client_w, &buf_rev[..n])?;
+                        tuner.record(n, &[client_fd, tls_fd], &[]);
                         conn_metrics.record_read(n);
                         conn_metrics.record_relay(n);
                         if upstream.ssl_pending() == 0 {
@@ -424,6 +501,9 @@ pub fn relay_bidirectional_splice(
     shutdown: &AtomicBool,
     delay_ms: u64,
     pipe_size: usize,
+    busy_poll_us: u32,
+    bdp_adaptive: bool,
+    bdp_queue_budget_us: u64,
 ) -> io::Result<()> {
     set_nonblocking_fd(tls_fd);
     set_nonblocking_fd(upstream_fd);
@@ -433,6 +513,7 @@ pub fn relay_bidirectional_splice(
     // Create two pipes — one per direction
     let (pipe_fwd_r, pipe_fwd_w) = make_splice_pipe(pipe_size)?;
     let (pipe_rev_r, pipe_rev_w) = make_splice_pipe(pipe_size)?;
+    let mut tuner = AdaptiveBufferTuner::new(bdp_adaptive, bdp_queue_budget_us, pipe_size);
 
     let result = (|| -> io::Result<()> {
         loop {
@@ -441,7 +522,8 @@ pub fn relay_bidirectional_splice(
             }
 
             // Poll both fds for read readiness (ssl_pending is always 0 for kTLS)
-            let (tls_ready, up_ready) = poll_two_fds(tls_fd, upstream_fd, 0, 100)?;
+            let (tls_ready, up_ready) =
+                poll_two_fds_with_spin(tls_fd, upstream_fd, 0, busy_poll_us, 100)?;
             if !tls_ready && !up_ready {
                 continue;
             }
@@ -451,9 +533,15 @@ pub fn relay_bidirectional_splice(
             if tls_ready {
                 apply_geo_delay(delay_ms);
                 loop {
-                    match splice_one_direction(tls_fd, pipe_fwd_w, pipe_fwd_r, upstream_fd, pipe_size)
-                    {
+                    match splice_one_direction(
+                        tls_fd,
+                        pipe_fwd_w,
+                        pipe_fwd_r,
+                        upstream_fd,
+                        pipe_size,
+                    ) {
                         Ok(SpliceResult::Moved(n)) => {
+                            tuner.record(n, &[tls_fd, upstream_fd], &[pipe_fwd_r, pipe_rev_r]);
                             conn_metrics.record_read(n);
                             conn_metrics.record_relay(n);
                             // Continue draining
@@ -476,9 +564,15 @@ pub fn relay_bidirectional_splice(
             // Reverse: upstream fd → pipe → kTLS fd
             if up_ready {
                 loop {
-                    match splice_one_direction(upstream_fd, pipe_rev_w, pipe_rev_r, tls_fd, pipe_size)
-                    {
+                    match splice_one_direction(
+                        upstream_fd,
+                        pipe_rev_w,
+                        pipe_rev_r,
+                        tls_fd,
+                        pipe_size,
+                    ) {
                         Ok(SpliceResult::Moved(n)) => {
+                            tuner.record(n, &[tls_fd, upstream_fd], &[pipe_fwd_r, pipe_rev_r]);
                             conn_metrics.record_read(n);
                             conn_metrics.record_relay(n);
                         }

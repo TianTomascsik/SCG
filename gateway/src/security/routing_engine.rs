@@ -162,7 +162,10 @@ fn handle_tcp_routing(
     set_nodelay(up_fd, true);
     apply_tcp_latency_opts(up_fd, perf.notsent_lowat, perf.busy_poll_us);
     // Mark + prioritise the upstream (SCG → upstream) egress socket.
-    let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    let up_is_v6 = upstream_tcp
+        .peer_addr()
+        .map(|a| a.is_ipv6())
+        .unwrap_or(false);
     apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
 
     // Zero-copy splice passthrough between the two plain TCP sockets. Both
@@ -175,6 +178,9 @@ fn handle_tcp_routing(
         shutdown,
         delay_ms,
         perf.pipe_size,
+        perf.busy_poll_us,
+        perf.bdp_adaptive,
+        perf.bdp_queue_budget_us,
     )?;
 
     Ok(())

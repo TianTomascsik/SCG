@@ -10,6 +10,7 @@ use crate::interfaces::endpoint::{
     accept_tls_upstream, authenticate_peer, connect_tls_upstream, relay_uds_tls,
 };
 use crate::management::config::{Direction, QosPolicy, TlsMode};
+use crate::networking::socket_manager::apply_safety_priority;
 
 use scg_ipc::os::{self, PeerCred};
 use scg_ipc::token::CapabilityToken;
@@ -71,6 +72,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// the loop keeps listening, so a denied attacker cannot block the legitimate
 /// client from connecting.
 pub fn run_uds_endpoint(task: UdsEndpointTask) {
+    apply_safety_priority(task.qos.traffic_class);
+
     // Remove any stale socket left by a previous run with the same path.
     let _ = std::fs::remove_file(&task.socket_path);
 

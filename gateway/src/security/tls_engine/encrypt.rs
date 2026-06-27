@@ -4,8 +4,8 @@
 //! - `handle_tcp_encrypt` -- per-connection handler for a single TCP encrypt connection
 //! - `run_udp_encrypt_relay` -- receive UDP datagrams, tunnel through TLS with framing
 
-use super::{build_tls_connector, write_all_nb_proxy, ProxyStream};
 use super::params::TlsSecurityParams;
+use super::{build_ktls_connector, build_tls_connector, write_all_nb_proxy, ProxyStream};
 use crate::networking::connector::{connect_with_retry, sleep_with_shutdown_check};
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
@@ -16,8 +16,8 @@ use crate::processing::RuleContext;
 use crate::security::relay::{
     apply_geo_delay, relay_bidirectional_splice, relay_encrypt_bidirectional,
 };
-use crate::security::{ACCEPT_TIMEOUT, RELAY_BUF_SIZE, UDP_BUF_SIZE};
 use crate::security::udp_framing::UdpFraming;
+use crate::security::{ACCEPT_TIMEOUT, RELAY_BUF_SIZE, UDP_BUF_SIZE};
 use ale_pipe::{
     AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_CLASS_D, ALE_PKT_AU1, ALE_PKT_AU2,
 };
@@ -27,11 +27,9 @@ use crate::management::config::{PerfKnobs, QosPolicy, TlsMode};
 use crate::management::telemetry::{format_rate, ConnectionMetrics};
 
 use foreign_types_shared::ForeignTypeRef;
-use ktls_pipe::{
-    build_client_connector as ktls_client_connector, enable_ktls_ssl, get_tcp_ulp,
-    ktls_privilege_hint, KtlsSession,
-};
+use ktls_pipe::{enable_ktls_ssl, get_tcp_ulp, ktls_privilege_hint, KtlsSession};
 use log::{debug, error, info, warn};
+use openssl::ssl::SslConnector;
 
 use std::io;
 use std::net::{SocketAddr, TcpStream};
@@ -39,6 +37,17 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+fn build_connector_for_mode(
+    tls_mode: TlsMode,
+    params: &TlsSecurityParams,
+) -> Result<SslConnector, String> {
+    match tls_mode {
+        TlsMode::Tls => build_tls_connector(params),
+        TlsMode::Ktls => build_ktls_connector(params),
+        TlsMode::Dtls => Err("DTLS does not use the TCP TLS connector".to_string()),
+    }
+}
 
 // =============================================================================
 //                         ENCRYPT DIRECTION: TCP -> TLS
@@ -53,15 +62,27 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
     listener.set_nonblocking(false).ok();
 
     // Resolve typed security parameters once; shared by all connections.
-    let tls_params = match TlsSecurityParams::from_params(
-        &ctx.provider_params,
-        ctx.protocol_version.as_deref(),
-    ) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
-            return;
-        }
+    let tls_params =
+        match TlsSecurityParams::from_params(&ctx.provider_params, ctx.protocol_version.as_deref())
+        {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
+                return;
+            }
+        };
+    let tls_connector = match ctx.tls_mode {
+        TlsMode::Tls | TlsMode::Ktls => match build_connector_for_mode(ctx.tls_mode, &tls_params) {
+            Ok(connector) => Some(Arc::new(connector)),
+            Err(e) => {
+                error!(
+                    "[{}] {} connector error: {}",
+                    ctx.rule_name, ctx.tls_mode, e
+                );
+                return;
+            }
+        },
+        TlsMode::Dtls => None,
     };
 
     while !ctx.shutdown.load(Ordering::Relaxed) {
@@ -121,6 +142,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         let traffic_class = ctx.traffic_class;
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let tls_params = tls_params.clone();
+        let tls_connector = tls_connector.clone();
         let qos = ctx.qos;
         let perf = ctx.perf;
 
@@ -145,6 +167,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
                 &shutdown,
                 simulated_delay_ms,
                 &tls_params,
+                tls_connector.as_deref(),
                 qos,
                 perf,
             );
@@ -186,6 +209,7 @@ pub(crate) fn handle_tcp_encrypt(
     shutdown: &AtomicBool,
     delay_ms: u64,
     params: &TlsSecurityParams,
+    tls_connector: Option<&SslConnector>,
     qos: QosPolicy,
     perf: PerfKnobs,
 ) -> io::Result<()> {
@@ -215,8 +239,8 @@ pub(crate) fn handle_tcp_encrypt(
     let hs_start = Instant::now();
     let mut upstream: ProxyStream = match tls_mode {
         TlsMode::Tls => {
-            let connector = build_tls_connector(params).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("TLS connector: {}", e))
+            let connector = tls_connector.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "TLS connector was not initialised")
             })?;
             let ssl_stream = connector.connect(&sni, upstream_tcp).map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {}", e))
@@ -229,8 +253,8 @@ pub(crate) fn handle_tcp_encrypt(
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let connector = ktls_client_connector(params.version.as_deref()).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("kTLS connector: {}", e))
+            let connector = tls_connector.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "kTLS connector was not initialised")
             })?;
             let mut ssl = connector
                 .configure()
@@ -288,6 +312,9 @@ pub(crate) fn handle_tcp_encrypt(
                 shutdown,
                 delay_ms,
                 perf.pipe_size,
+                perf.busy_poll_us,
+                perf.bdp_adaptive,
+                perf.bdp_queue_budget_us,
             )?;
         }
         _ => {
@@ -299,6 +326,9 @@ pub(crate) fn handle_tcp_encrypt(
                 delay_ms,
                 perf.enable_cork,
                 perf.relay_buf_size,
+                perf.busy_poll_us,
+                perf.bdp_adaptive,
+                perf.bdp_queue_budget_us,
             )?;
         }
     }
@@ -334,16 +364,15 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
     let udp_is_v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     ctx.apply_egress_qos(socket.as_raw_fd(), udp_is_v6, None);
     ctx.enable_inbound_dscp_sampling(socket.as_raw_fd(), udp_is_v6);
-    let tls_params = match TlsSecurityParams::from_params(
-        &ctx.provider_params,
-        ctx.protocol_version.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
-            return;
-        }
-    };
+    let tls_params =
+        match TlsSecurityParams::from_params(&ctx.provider_params, ctx.protocol_version.as_deref())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!("[{}] TLS parameter error: {}", ctx.rule_name, e);
+                return;
+            }
+        };
     let sni = tls_params.sni_name(&ctx.upstream_addr);
 
     // Lazy TLS tunnel: established on first UDP datagram, not at startup.
@@ -425,7 +454,10 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                 tune_socket_buffers(upstream_tcp.as_raw_fd(), ctx.sock_buf_size);
                 set_nodelay(upstream_tcp.as_raw_fd(), true);
                 // Mark + prioritise the upstream TLS-tunnel egress socket.
-                let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+                let up_is_v6 = upstream_tcp
+                    .peer_addr()
+                    .map(|a| a.is_ipv6())
+                    .unwrap_or(false);
                 ctx.apply_egress_qos(upstream_tcp.as_raw_fd(), up_is_v6, None);
 
                 let hs_start = Instant::now();
@@ -472,8 +504,7 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                         }
                     }
                     TlsMode::Ktls => {
-                        let connector = match ktls_client_connector(tls_params.version.as_deref())
-                        {
+                        let connector = match build_ktls_connector(&tls_params) {
                             Ok(c) => c,
                             Err(e) => {
                                 error!(

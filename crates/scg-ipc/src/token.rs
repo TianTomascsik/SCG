@@ -46,8 +46,8 @@ impl CapabilityToken {
             return false;
         }
         let mut diff: u8 = 0;
-        for i in 0..TOKEN_LEN {
-            diff |= self.0[i] ^ candidate[i];
+        for (&actual, &expected) in self.0.iter().zip(candidate.iter()) {
+            diff |= actual ^ expected;
         }
         // `diff == 0` iff every byte matched; the subtraction/shift keeps the
         // result branch-free.

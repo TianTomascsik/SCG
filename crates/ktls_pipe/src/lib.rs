@@ -173,7 +173,7 @@ impl Read for KtlsSession {
                 }
                 Err(err)
             }
-            _ => Err(io::Error::new(io::ErrorKind::Other, ErrorStack::get())),
+            _ => Err(io::Error::other(ErrorStack::get())),
         }
     }
 }
@@ -204,7 +204,7 @@ impl Write for KtlsSession {
                 Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ssl closed"))
             }
             openssl_sys::SSL_ERROR_SYSCALL => Err(io::Error::last_os_error()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, ErrorStack::get())),
+            _ => Err(io::Error::other(ErrorStack::get())),
         }
     }
 
@@ -257,7 +257,10 @@ fn bench_tls_version(override_: Option<&str>) -> SslVersion {
         "" | "1.2" | "1-2" | "1_2" | "12" => SslVersion::TLS1_2,
         "1.3" | "1-3" | "1_3" | "13" => SslVersion::TLS1_3,
         other => {
-            eprintln!("[ktls] WARNING: unknown TLS version '{}', using TLS 1.2", other);
+            eprintln!(
+                "[ktls] WARNING: unknown TLS version '{}', using TLS 1.2",
+                other
+            );
             SslVersion::TLS1_2
         }
     }
@@ -350,10 +353,24 @@ pub fn build_client_connector(
     Ok(builder.build())
 }
 
+/// Enable kTLS on an OpenSSL context.
+///
+/// # Safety
+///
+/// `ctx` must be a valid, non-null `SSL_CTX*` whose lifetime outlives this call.
+/// The caller is responsible for ensuring OpenSSL owns the context and that
+/// setting options is synchronized with any concurrent context use.
 pub unsafe fn enable_ktls_ctx(ctx: *mut openssl_sys::SSL_CTX) {
     openssl_sys::SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
 }
 
+/// Enable kTLS on an OpenSSL connection.
+///
+/// # Safety
+///
+/// `ssl` must be a valid, non-null `SSL*` whose lifetime outlives this call.
+/// The caller is responsible for ensuring the connection is not concurrently
+/// mutated while the option is set.
 pub unsafe fn enable_ktls_ssl(ssl: *mut openssl_sys::SSL) {
     SSL_set_options(ssl, SSL_OP_ENABLE_KTLS);
 }
@@ -585,12 +602,7 @@ fn write_splice(
 /// This avoids any kernel→userspace copy on the receive side: the kernel decrypts
 /// the TLS records and discards the plaintext directly.
 fn splice_sink_loop(sock_fd: RawFd, stop: &AtomicBool) -> u64 {
-    let devnull = unsafe {
-        libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_WRONLY,
-        )
-    };
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
     if devnull < 0 {
         eprintln!(
             "kTLS sink: failed to open /dev/null: {}",
@@ -752,8 +764,7 @@ impl IoUringSender {
             }
 
             if reaped == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "io_uring: no completions after submit_and_wait",
                 ));
             }
@@ -1113,7 +1124,7 @@ impl KtlsPipeLane {
                 if let Some(ref mut sender) = uring_sender {
                     sender.send_all(&probe_data)
                 } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "no sender"))
+                    Err(io::Error::other("no sender"))
                 }
             }
         };
