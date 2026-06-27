@@ -1213,6 +1213,31 @@ impl GatewayConfig {
                 }
             }
 
+            // WireGuard validation: UDP-only, no "auto" upstream (a single peer
+            // endpoint is configured), and the provider params (keys, ports,
+            // tunnel addresses) must be well-formed. Parsing them here surfaces
+            // misconfiguration at `--validate` instead of when the kernel
+            // interface is provisioned at rule startup. This never touches the
+            // kernel and never panics.
+            if rule.effective_security_provider() == "wireguard" {
+                if rule.listen_proto != Proto::Udp {
+                    return Err(format!(
+                        "Rule '{}' (index {}): WireGuard requires listen_proto = \"udp\"",
+                        rule.name, i
+                    ));
+                }
+                if rule.upstream_addr == "auto" {
+                    return Err(format!(
+                        "Rule '{}' (index {}): WireGuard does not support upstream_addr = \"auto\"",
+                        rule.name, i
+                    ));
+                }
+                crate::security::wireguard_engine::WgProviderConfig::from_params(
+                    &rule.provider_params,
+                )
+                .map_err(|e| format!("Rule '{}' (index {}): {}", rule.name, i, e))?;
+            }
+
             // Buffer config validation
             if rule.buffer_slots == 0 {
                 return Err(format!(
@@ -1417,6 +1442,20 @@ impl GatewayConfig {
                     }
                 }
             }
+
+        // Check for kernel WireGuard prerequisites (module, `wg`/`ip` tools,
+        // CAP_NET_ADMIN). Warn (not fail) so config can be validated on an
+        // unprivileged host; the provider fails fast at startup if still unmet.
+        let has_wireguard_rules = self
+            .rules
+            .iter()
+            .any(|r| r.effective_security_provider() == "wireguard");
+        if has_wireguard_rules && !crate::security::wireguard_engine::wireguard_available() {
+            warnings.push(format!(
+                "WireGuard rules configured but prerequisites are missing: {}",
+                crate::security::wireguard_engine::unavailable_reason()
+            ));
+        }
 
         // Check for transparent/TPROXY requirements
         let has_transparent = self.rules.iter().any(|r| r.transparent);

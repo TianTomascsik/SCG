@@ -33,6 +33,7 @@ use gateway::security::providers::dtls_provider::DtlsProvider;
 use gateway::security::providers::ktls_provider::KtlsProvider;
 use gateway::security::providers::routing_provider::RoutingProvider;
 use gateway::security::providers::tls_provider::TlsProvider;
+use gateway::security::providers::wireguard_provider::WireguardProvider;
 
 /// A loopback TLS server that echoes every byte it receives back to the sender.
 ///
@@ -289,6 +290,7 @@ pub fn built_in_registry() -> Arc<ProviderRegistry> {
     registry.register_crypto(Box::new(TlsProvider));
     registry.register_crypto(Box::new(KtlsProvider));
     registry.register_crypto(Box::new(DtlsProvider));
+    registry.register_crypto(Box::new(WireguardProvider));
     registry.register_crypto(Box::new(RoutingProvider));
     registry.register_app_protocol(Box::new(AleProtocolProvider));
     registry.register_app_protocol(Box::new(RawProtocolProvider));

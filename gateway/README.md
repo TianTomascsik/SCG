@@ -28,6 +28,7 @@ application.
 | **TLS (userspace)** | OpenSSL-based TLS for TCP streams |
 | **kTLS (kernel)** | Kernel TLS offload -- higher throughput, lower CPU |
 | **DTLS** | Native UDP encryption -- preserves datagram semantics |
+| **WireGuard (kernel)** | Kernel WireGuard offload -- provisions a `wg` interface; UDP only (needs `CAP_NET_ADMIN`) |
 | **ALE framing** | ALEPKT framing per Subset-098/037 for UDP-over-TLS (EuroRadio) |
 | **Raw framing** | Simple length-prefix framing for UDP-over-TLS without ALE overhead |
 | **TPROXY** | Transparent proxy via `IP_TRANSPARENT` + `SO_ORIGINAL_DST` |
@@ -102,7 +103,7 @@ Each entry in the `"rules"` array defines a forwarding rule:
 | `listen_proto` | No | `"tcp"` | `"tcp"` or `"udp"` |
 | `upstream_addr` | No | `"auto"` | Destination address or `"auto"` for TPROXY |
 | `upstream_proto` | No | `"tcp"` | Upstream protocol (decrypt direction) |
-| `security_provider` | No | `"tls"` | Security engine: `"tls"`, `"ktls"`, `"dtls"` (plus any custom provider registered at startup) |
+| `security_provider` | No | `"tls"` | Security engine: `"tls"`, `"ktls"`, `"dtls"`, `"wireguard"`, `"routing"` (plus any custom provider registered at startup) |
 | `app_protocol` | No | `"ale"` | App protocol for UDP-over-TLS: `"ale"`, `"raw"` |
 | `priority` | No | `0` | Process nice value (0 = normal) |
 | `transparent` | No | `false` | Enable TPROXY transparent mode |
@@ -142,6 +143,54 @@ Native encryption for UDP datagrams. Preserves datagram boundary semantics. **UD
   "listen_proto": "udp"
 }
 ```
+
+#### `wireguard` -- Kernel WireGuard offload
+
+Offloads the WireGuard data plane (Noise_IKpsk2 handshake + ChaCha20-Poly1305
+transport) to the in-kernel `wireguard` module, the way `ktls` offloads TLS. At
+rule startup the provider provisions a `wg` interface (via `wg` + `ip`) and then
+relays plaintext UDP through the tunnel; the kernel does all cryptography.
+**UDP only.** Models a single gateway-to-gateway flow.
+
+```json
+{
+  "security_provider": "wireguard",
+  "listen_proto": "udp",
+  "upstream_addr": "10.0.0.2:7000",
+  "wg_interface": "wg-scg0",
+  "wg_listen_port": 51820,
+  "private_key": "<base64 X25519 private key>",
+  "peer_public_key": "<base64 X25519 public key>",
+  "peer_endpoint": "peer-gateway.example:51821",
+  "tunnel_local_ip": "10.0.0.1/32",
+  "peer_allowed_ips": "10.0.0.2/32",
+  "persistent_keepalive": 25
+}
+```
+
+`provider_params`:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `wg_interface` | yes | kernel interface name to manage (e.g. `wg-scg0`) |
+| `private_key` | yes | this gateway's X25519 private key (base64) |
+| `wg_listen_port` | yes | UDP port the kernel WireGuard interface listens on |
+| `peer_public_key` | yes | peer gateway's X25519 public key (base64) |
+| `peer_endpoint` | yes | peer gateway's WireGuard endpoint (`host:port`) |
+| `tunnel_local_ip` | yes | this interface's tunnel address (CIDR), e.g. `10.0.0.1/32` |
+| `peer_allowed_ips` | yes | allowed-IPs / route for the peer, e.g. `10.0.0.2/32` |
+| `preshared_key` | no | optional Noise_IKpsk2 preshared key (base64) |
+| `persistent_keepalive` | no | keepalive interval in seconds |
+| `manage_interface` | no (default `true`) | `false` attaches to an externally-provisioned interface instead of creating/destroying it |
+
+Requirements:
+- the `wireguard` kernel module (`modprobe wireguard`)
+- `wireguard-tools` (`wg`) and `iproute2` (`ip`)
+- `CAP_NET_ADMIN` (or run as root)
+
+Private keys are written to `0600` files for `wg` to read (never passed on the
+command line, where `/proc/<pid>/cmdline` would expose them) and zeroized after
+use. Keys are never logged or `Debug`-printed.
 
 ### App Protocols (for UDP-over-TLS)
 
@@ -327,6 +376,8 @@ fn main() {
 | Crypto | `tls` | `security/providers/tls_provider.rs` |
 | Crypto | `ktls` | `security/providers/ktls_provider.rs` |
 | Crypto | `dtls` | `security/providers/dtls_provider.rs` |
+| Crypto | `wireguard` | `security/providers/wireguard_provider.rs` |
+| Crypto | `routing` | `security/providers/routing_provider.rs` |
 | App Protocol | `ale` | `app_protocols/ale_provider.rs` |
 | App Protocol | `raw` | `app_protocols/raw_provider.rs` |
 

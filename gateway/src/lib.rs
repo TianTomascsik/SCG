@@ -43,14 +43,15 @@ use security::providers::dtls_provider::DtlsProvider;
 use security::providers::ktls_provider::KtlsProvider;
 use security::providers::routing_provider::RoutingProvider;
 use security::providers::tls_provider::TlsProvider;
+use security::providers::wireguard_provider::WireguardProvider;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::path::{Path, PathBuf};
 
 /// Run the gateway runtime.
 ///
-/// The built-in TLS/kTLS/DTLS crypto providers and ALE/Raw app-protocol
-/// providers are always registered. `extra_crypto` and `extra_app` let a
+/// The built-in TLS/kTLS/DTLS/WireGuard/routing crypto providers and ALE/Raw
+/// app-protocol providers are always registered. `extra_crypto` and `extra_app` let a
 /// downstream binary register additional providers (e.g. proprietary crypto)
 /// before startup. Pass empty vectors for the default open configuration.
 ///
@@ -69,6 +70,7 @@ pub fn run(
     registry.register_crypto(Box::new(TlsProvider));
     registry.register_crypto(Box::new(KtlsProvider));
     registry.register_crypto(Box::new(DtlsProvider));
+    registry.register_crypto(Box::new(WireguardProvider));
     registry.register_crypto(Box::new(RoutingProvider));
     for provider in extra_crypto {
         registry.register_crypto(provider);

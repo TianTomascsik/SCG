@@ -8,7 +8,7 @@ applications behind it. Part of the **SCG** project.
 
 | Path | Description |
 |---|---|
-| `gateway/` | Gateway library + binary (`gateway`). Built-in crypto providers: TLS, kTLS, DTLS; app protocols: ALE, raw. |
+| `gateway/` | Gateway library + binary (`gateway`). Built-in crypto providers: TLS, kTLS, DTLS, WireGuard (kernel), routing; app protocols: ALE, raw. |
 | `crates/ktls_pipe/` | Kernel TLS (kTLS) pipe library |
 | `crates/tls_pipe/` | Userspace TLS pipe library (OpenSSL) |
 

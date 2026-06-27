@@ -1,7 +1,7 @@
 //! Security Enforcer subsystem.
 //!
-//! TLS/kTLS engine, DTLS engine, bidirectional relay, and stubs for
-//! IPSec, WireGuard, and GDOI.
+//! TLS/kTLS engine, DTLS engine, kernel WireGuard engine, bidirectional relay,
+//! and stubs for IPSec and GDOI.
 
 pub mod conn_pool;
 pub mod dtls_engine;
@@ -13,6 +13,7 @@ pub mod routing_engine;
 pub mod stubs;
 pub mod tls_engine;
 pub mod udp_framing;
+pub mod wireguard_engine;
 
 use std::time::Duration;
 

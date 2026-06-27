@@ -23,6 +23,10 @@ ktls_pipe = { path = "../crates/ktls_pipe" }
 tls_pipe = { path = "../crates/tls_pipe" }
 log = "0.4"
 env_logger = "0.11"
+# Zeroize WireGuard key material (private keys / PSKs) on drop — the only crypto
+# the WireGuard provider holds in userspace, since the cipher work is offloaded
+# to the kernel `wireguard` module. Apache-2.0/MIT.
+zeroize = "1"
 
 # Local-interface IPC primitives and management gRPC.
 scg-ipc = { path = "../crates/scg-ipc" }

@@ -36,7 +36,7 @@ The file `gateway.json` declares rules. Three fields drive provider selection:
 
 | Field | Example | Purpose |
 |---|---|---|
-| `security_provider` | `"tls"`, `"ktls"`, `"dtls"` | Selects the CryptoProvider |
+| `security_provider` | `"tls"`, `"ktls"`, `"dtls"`, `"wireguard"`, `"routing"` | Selects the CryptoProvider |
 | `app_protocol` | `"ale"`, `"raw"`, or omitted | Selects the AppProtocolProvider (UDP-over-TLS only) |
 | `direction` | `"encrypt"` / `"decrypt"` | Determines which provider method is called |
 
@@ -51,6 +51,7 @@ let mut registry = ProviderRegistry::new();
 registry.register_crypto(Box::new(TlsProvider));
 registry.register_crypto(Box::new(KtlsProvider));
 registry.register_crypto(Box::new(DtlsProvider));
+registry.register_crypto(Box::new(WireguardProvider));
 
 // App protocol providers
 registry.register_app_protocol(Box::new(AleProtocolProvider));
@@ -66,7 +67,7 @@ After `into_arc()` the registry is **frozen** — no more registrations. Every r
 The registry holds two `Vec`s:
 
 ```
-crypto:         Vec<Box<dyn CryptoProvider>>       ← 3 built-in entries
+crypto:         Vec<Box<dyn CryptoProvider>>       ← 5 built-in entries
 app_protocols:  Vec<Box<dyn AppProtocolProvider>>   ← 2 built-in entries
 ```
 
@@ -79,10 +80,14 @@ Lookup is by name: `registry.find_crypto("tls")` iterates the `Vec` and returns 
 | `TlsProvider` | `"tls"` | OpenSSL userspace TLS | TCP + UDP-over-TLS (encrypt & decrypt) |
 | `KtlsProvider` | `"ktls"` | Kernel TLS offload | TCP + UDP-over-TLS (encrypt & decrypt) |
 | `DtlsProvider` | `"dtls"` | Datagram TLS | UDP only (encrypt & decrypt) |
+| `WireguardProvider` | `"wireguard"` | Kernel WireGuard offload | UDP only (encrypt & decrypt) |
+| `RoutingProvider` | `"routing"` | Plaintext L4 passthrough | TCP only (encrypt & decrypt) |
 
 **TLS and kTLS share the same engine code.** Both call the same `tls_engine::encrypt` / `tls_engine::decrypt` functions. The kTLS path branches internally on `ctx.tls_mode` to offload symmetric crypto to the kernel.
 
 **DTLS is UDP-only.** It guards on `ctx.listen_proto == Proto::Udp` and returns an error if given TCP.
+
+**WireGuard is a kernel offload, like kTLS — but at the interface, not the socket.** The provider performs *no* userspace cryptography. At rule startup it provisions an in-kernel `wireguard` interface via the `wg` + `ip` tools (`wireguard_engine::admin`), then runs a plain UDP relay (`wireguard_engine`) that steers datagrams through the tunnel; the kernel performs the Noise_IKpsk2 handshake and ChaCha20-Poly1305 transport. It is UDP-only and requires `CAP_NET_ADMIN`, the `wireguard` module, and `wg`. WireGuard keys and tunnel parameters are read from `provider_params` (`private_key`, `peer_public_key`, `wg_listen_port`, `peer_endpoint`, `tunnel_local_ip`, `peer_allowed_ips`, optional `preshared_key` / `persistent_keepalive`, and `manage_interface` to attach to an externally-provisioned interface instead of creating one). Private keys are passed to `wg` via `0600` files, never on the command line, and are zeroized after use.
 
 #### 3b. AppProtocolProvider implementations (purple boxes)
 

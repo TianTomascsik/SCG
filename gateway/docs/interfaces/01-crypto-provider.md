@@ -109,6 +109,7 @@ forward plaintext on the protected side when protection cannot be established.
 | `TlsProvider` | `"tls"` | [providers/tls_provider.rs](../../src/security/providers/tls_provider.rs) | OpenSSL userspace TLS; TCP + UDP-over-TLS. Honours the security profiles + verify modes below. |
 | `KtlsProvider` | `"ktls"` | [providers/ktls_provider.rs](../../src/security/providers/ktls_provider.rs) | Kernel TLS offload; shares the TLS engine. Non-offloadable profiles fall back to userspace `tls`; integrity-only is rejected at config-load. |
 | `DtlsProvider` | `"dtls"` | [providers/dtls_provider.rs](../../src/security/providers/dtls_provider.rs) | Datagram TLS; UDP only. DTLS 1.0 (CBC) + DTLS 1.2 (AEAD), verify/CA/identity parity with `tls`. |
+| `WireguardProvider` | `"wireguard"` | [providers/wireguard_provider.rs](../../src/security/providers/wireguard_provider.rs) | Kernel WireGuard offload; UDP only. Provisions a `wg` interface ([wireguard_engine/](../../src/security/wireguard_engine.rs)) and relays plaintext through the kernel tunnel. Needs `CAP_NET_ADMIN`, the `wireguard` module, and `wg`; keys via `provider_params`. Interface-lifecycle provider — see also [06-transport.md](06-transport.md). |
 | `RoutingProvider` | `"routing"` | [providers/routing_provider.rs](../../src/security/providers/routing_provider.rs) | Plaintext L4 passthrough (no crypto): forward + classify/policy only. TCP encrypt + decrypt. |
 
 Shared engines: [tls_engine/](../../src/security/tls_engine/),
@@ -186,6 +187,7 @@ Registered once in [main.rs](../../src/main.rs) on the
 registry.register_crypto(Box::new(TlsProvider));
 registry.register_crypto(Box::new(KtlsProvider));
 registry.register_crypto(Box::new(DtlsProvider));
+registry.register_crypto(Box::new(WireguardProvider));
 registry.register_crypto(Box::new(RoutingProvider));
 // registry.register_crypto(Box::new(MyProvider));   // ← add here
 let registry = registry.into_arc();

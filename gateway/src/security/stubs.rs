@@ -7,11 +7,8 @@
 // - Integration with cert_store for IKE authentication
 // - ESP/AH transform configuration
 
-// TODO: WireGuard Engine
-// - WireGuard tunnel creation and management
-// - Peer configuration and key exchange
-// - Integration with networking layer for tunnel interfaces
-// - Keepalive and handshake management
+// WireGuard is implemented as a kernel-offload crypto provider — see
+// `security::wireguard_engine` and `security::providers::wireguard_provider`.
 
 // TODO: GDOI (Group Domain of Interpretation)
 // - Group key management protocol
