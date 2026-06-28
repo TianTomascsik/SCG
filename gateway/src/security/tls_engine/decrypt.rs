@@ -212,6 +212,10 @@ pub(crate) fn handle_tcp_decrypt(
     let hs_start = Instant::now();
     let fd = stream.as_raw_fd();
 
+    // True only when kTLS actually activates (ULP=tls) on the accept arm below.
+    // The splice relay MUST gate on this, not on `tls_mode` — see TRA #56.
+    let mut ktls_active = false;
+
     let mut tls_stream: ProxyStream = match tls_mode {
         TlsMode::Tls => {
             let ssl_stream = acceptor
@@ -248,7 +252,7 @@ pub(crate) fn handle_tcp_decrypt(
                 .map_err(|e| io::Error::other(format!("kTLS accept: {}", e)))?;
 
             let ulp = get_tcp_ulp(&stream).unwrap_or_default();
-            let ktls_active = ulp.starts_with("tls");
+            ktls_active = ulp.starts_with("tls");
             // Ground-truth session resumption (see the userspace arm above): the
             // kTLS handshake still runs through OpenSSL, so `SSL_session_reused`
             // is valid on the session's SSL handle after `accept()`.
@@ -311,25 +315,28 @@ pub(crate) fn handle_tcp_decrypt(
                 rule_name, upstream_addr
             );
 
-            // Bidirectional relay: TLS <-> plain TCP
-            // Use zero-copy splice for kTLS, buffered relay for userspace TLS
-            match tls_mode {
-                TlsMode::Ktls => {
-                    let tls_fd = tls_stream.raw_fd();
-                    let up_fd = upstream.as_raw_fd();
-                    relay_bidirectional_splice(
-                        tls_fd,
-                        up_fd,
-                        conn_metrics,
-                        shutdown,
-                        delay_ms,
-                        perf.pipe_size,
-                        perf.busy_poll_us,
-                        perf.bdp_adaptive,
-                        perf.bdp_queue_budget_us,
-                    )
-                }
-                _ => relay_bidirectional(
+            // Bidirectional relay: TLS <-> plain TCP.
+            // Zero-copy splice is correct ONLY when kTLS actually activated: the
+            // raw fd then carries plaintext (the kernel does the crypto). If kTLS
+            // was requested but did not activate, the fd carries ciphertext, so we
+            // relay through the userspace SSL session instead — otherwise we would
+            // splice cleartext onto the wire (TRA #56).
+            if matches!(tls_mode, TlsMode::Ktls) && ktls_active {
+                let tls_fd = tls_stream.raw_fd();
+                let up_fd = upstream.as_raw_fd();
+                relay_bidirectional_splice(
+                    tls_fd,
+                    up_fd,
+                    conn_metrics,
+                    shutdown,
+                    delay_ms,
+                    perf.pipe_size,
+                    perf.busy_poll_us,
+                    perf.bdp_adaptive,
+                    perf.bdp_queue_budget_us,
+                )
+            } else {
+                relay_bidirectional(
                     &mut tls_stream,
                     upstream,
                     conn_metrics,
@@ -340,7 +347,7 @@ pub(crate) fn handle_tcp_decrypt(
                     perf.busy_poll_us,
                     perf.bdp_adaptive,
                     perf.bdp_queue_budget_us,
-                ),
+                )
             }
         }
         Proto::Udp => {

@@ -486,22 +486,29 @@ mod tests {
     }
 
     #[test]
-    fn ktls_rule_requiring_verification_falls_back_to_userspace_tls() {
-        // A verify-requiring kTLS rule must NOT use the no-verify kTLS connector;
-        // it falls back to userspace TLS, which honours `verify`/cert/CA.
+    fn ktls_rule_with_verification_stays_ktls() {
+        // Verified TLS (server- or mutual-auth) on the Default profile is now
+        // kTLS-offloadable: the kTLS acceptor/connector apply the same CA trust +
+        // client-cert verification as the userspace engine, and the relay
+        // separately guards the splice path on runtime activation (TRA #56). So a
+        // verify-requiring ktls rule STAYS kTLS rather than downgrading.
         let server = params(&[("verify", json!("server"))]);
         assert_eq!(
             upstream_tls_mode("ktls", &server, Some("tls1.3")),
-            TlsMode::Tls
+            TlsMode::Ktls
         );
 
         let mutual = params(&[("verify", json!("mutual"))]);
         assert_eq!(
             upstream_tls_mode("ktls", &mutual, Some("tls1.2")),
-            TlsMode::Tls
+            TlsMode::Ktls
         );
+    }
 
-        // A non-default profile (e.g. PKI ⇒ mutual) is likewise not offloadable.
+    #[test]
+    fn ktls_rule_with_non_default_profile_falls_back_to_userspace_tls() {
+        // A non-Default profile (PKI ⇒ mutual, with a non-GCM / PSK cipher
+        // policy) is not kTLS-offloadable and falls back to the userspace engine.
         let pki = params(&[("profile", json!("subset146-pki"))]);
         assert_eq!(
             upstream_tls_mode("ktls", &pki, Some("tls1.2")),

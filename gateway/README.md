@@ -203,10 +203,14 @@ startup emit a **warning** when an encrypt rule contacts a non-loopback upstream
 with `verify: none` (MITM exposure) or a decrypt listener uses a non-`mutual`
 mode (it relays traffic from unauthenticated clients). Prefer `verify: server`
 (or `mutual`) with a `ca_path` for remote upstreams — see the
-`web-encrypt-tls-verified` rule in `gateway.example.json`. Local-interface
-(UDS/SHM) `ktls` rules that request verification automatically fall back to the
-userspace TLS path, which honours `verify`/`ca_path` (kTLS offload itself only
-covers the unverified default path).
+`web-encrypt-tls-verified` rule in `gateway.example.json`. `ktls` rules keep the
+zero-copy kernel offload **even with `verify: server`/`mutual`**: verification
+runs on the kTLS context exactly as on the userspace path and completes during
+the handshake before kTLS activates, so the secure path is also the fast path.
+Only a non-`Default` profile (`subset146-pki`/`-psk`, non-GCM/PSK cipher policy)
+falls back to userspace TLS. The relay still gates the splice on *runtime* kTLS
+activation, falling back to the userspace SSL relay if kTLS does not engage, so a
+silent offload failure never relays cleartext (TRA #56).
 
 **Safety traffic and policy (`enforce_policy_on_safety`).** By design,
 `safety`-classified traffic bypasses the policy whitelist / default-deny so a

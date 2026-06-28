@@ -342,13 +342,20 @@ impl TlsSecurityParams {
 
     /// Whether this configuration can be offloaded to kernel TLS.
     ///
-    /// kTLS only offloads the default AES-GCM, server-authenticated path. Any
-    /// profile, peer verification, or PSK requires the userspace `tls` engine
-    /// (see decision 8: non-offloadable `ktls` rules fall back to `tls`).
+    /// kTLS offloads only the post-handshake AES-GCM record layer, which is
+    /// independent of *how* the peer was authenticated: `build_acceptor` /
+    /// `build_connector` apply the same `apply_*_verify` (CA trust, mutual client
+    /// cert) to the kTLS context as to userspace, and peer auth completes during
+    /// the handshake *before* kTLS activates. So server- and mutual-verified TLS
+    /// are offloadable; only a non-`Default` profile (subset146 — non-GCM / PSK
+    /// cipher policy) or a PSK handshake (no AES-GCM record path) is not.
+    ///
+    /// This is *static* eligibility only. The relay must still gate the zero-copy
+    /// splice path on **runtime** activation (`ktls_active`), never on this flag,
+    /// or a silent kTLS-enable failure would relay cleartext — see
+    /// `tls_engine::{decrypt,encrypt}` and TRA register #56.
     pub fn is_ktls_offloadable(&self) -> bool {
-        self.profile == TlsProfile::Default
-            && self.verify == VerifyMode::None
-            && self.psk_key.is_none()
+        self.profile == TlsProfile::Default && self.psk_key.is_none()
     }
 
     /// The SNI / verification hostname to present on the connector. Falls back
@@ -542,11 +549,31 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_with_explicit_server() {
+    fn default_profile_server_verify_is_ktls_offloadable() {
+        // Server verification only adds CA trust to the handshake; the AES-GCM
+        // record layer is still kTLS-offloadable (verification runs on the kTLS
+        // context too). The relay guards the splice path on runtime activation
+        // separately — see TRA #56.
         let m = params_from(&[("verify", json!("server"))]);
         let p = TlsSecurityParams::from_params(&m, None).unwrap();
         assert_eq!(p.verify, VerifyMode::Server);
-        assert!(!p.is_ktls_offloadable());
+        assert!(p.is_ktls_offloadable());
+    }
+
+    #[test]
+    fn default_profile_mutual_verify_is_ktls_offloadable() {
+        // Mutual TLS on the Default profile (the mTLS benchmark path): client-cert
+        // auth is a handshake concern, so kTLS still offloads the record layer.
+        // Only subset146-pki (a non-Default profile) stays on the userspace engine.
+        let m = params_from(&[
+            ("verify", json!("mutual")),
+            ("cert_path", json!("/certs/client.pem")),
+            ("key_path", json!("/certs/client.key")),
+            ("ca_path", json!("/certs/ca.pem")),
+        ]);
+        let p = TlsSecurityParams::from_params(&m, Some("tls1.3")).unwrap();
+        assert_eq!(p.verify, VerifyMode::Mutual);
+        assert!(p.is_ktls_offloadable());
     }
 
     #[test]

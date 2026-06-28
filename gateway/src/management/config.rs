@@ -218,7 +218,11 @@ fn default_prefer_ktls() -> bool {
 /// `configured` provider so the gateway always runs the best safe engine:
 ///
 /// * a `ktls` rule whose parameters are **not** offloadable (a non-default
-///   profile, peer verification, or PSK) is downgraded to userspace `tls`,
+///   profile or a PSK handshake — both lacking the AES-GCM record path) is
+///   downgraded to userspace `tls`. Peer verification (server/mutual) does NOT
+///   downgrade: kTLS offloads the post-handshake record layer regardless of how
+///   the peer was authenticated, and the relay guards splice on runtime
+///   activation (see `is_ktls_offloadable` and TRA #56),
 /// * a userspace `tls` rule whose parameters **are** offloadable is upgraded to
 ///   `ktls` when `prefer_ktls` is set and the kernel exposes the `tls` ULP
 ///   (`kernel_ktls`), making the zero-copy fast path the default.
