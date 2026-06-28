@@ -64,9 +64,10 @@ impl LifecycleOrchestrator {
                 Ok(event) => match event {
                     LifecycleEvent::ConfigChanged { diff, new_policy } => {
                         eprintln!(
-                            "[lifecycle] Config changed: {} added, {} removed",
+                            "[lifecycle] Config changed: {} added, {} removed, {} changed",
                             diff.added.len(),
-                            diff.removed.len()
+                            diff.removed.len(),
+                            diff.changed.len()
                         );
                         // Clear traffic cache — classification may have changed
                         self.cache.clear();

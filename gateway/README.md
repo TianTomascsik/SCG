@@ -192,6 +192,38 @@ Private keys are written to `0600` files for `wg` to read (never passed on the
 command line, where `/proc/<pid>/cmdline` would expose them) and zeroized after
 use. Keys are never logged or `Debug`-printed.
 
+### Security posture (verification, policy, DoS limits)
+
+**Peer verification / mTLS.** The `tls`/`ktls`/`dtls` providers take a `verify`
+mode in `provider_params`: `none` (legacy, no verification), `server` (verify the
+upstream certificate against `ca_path`), or `mutual` (mTLS — both sides present
+X.509). The `default` and `subset146-psk` profiles require `verify` to be set
+explicitly (fail-secure); `subset146-pki` implies `mutual`. `--validate` and
+startup emit a **warning** when an encrypt rule contacts a non-loopback upstream
+with `verify: none` (MITM exposure) or a decrypt listener uses a non-`mutual`
+mode (it relays traffic from unauthenticated clients). Prefer `verify: server`
+(or `mutual`) with a `ca_path` for remote upstreams — see the
+`web-encrypt-tls-verified` rule in `gateway.example.json`. Local-interface
+(UDS/SHM) `ktls` rules that request verification automatically fall back to the
+userspace TLS path, which honours `verify`/`ca_path` (kTLS offload itself only
+covers the unverified default path).
+
+**Safety traffic and policy (`enforce_policy_on_safety`).** By design,
+`safety`-classified traffic bypasses the policy whitelist / default-deny so a
+policy misconfiguration can never silence safety-critical signalling
+(fail-open for availability). High-security deployments can set
+`policy.enforce_policy_on_safety: true` to also subject safety traffic to the
+whitelist. Because classification is driven by configured `traffic_rules`
+(source/destination), bind a `safety` traffic-rule only to **trusted,
+non-spoofable** sources — a wide/non-loopback `safety` source is flagged at
+`--validate`, since it lets a spoofed source obtain the bypass.
+
+**DTLS DoS limits.** A DTLS encrypt relay bounds concurrent peer sessions with
+`max_sessions` (default 1024) and reclaims idle ones after `idle_ttl_secs`
+(default 60), resisting source-address-spoofing floods. DTLS decrypt listeners
+perform a stateless HelloVerifyRequest **cookie** exchange (bound to the peer
+address) before the expensive handshake, and bound the per-peer handshake wait.
+
 ### App Protocols (for UDP-over-TLS)
 
 When using `tls` or `ktls` security providers with UDP listen, an app-level protocol frames the UDP datagrams over the TLS stream:

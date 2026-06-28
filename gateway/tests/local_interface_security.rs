@@ -70,7 +70,10 @@ fn assert_rejected(stream: &mut UnixStream) {
         Ok(0) => {} // clean EOF — connection closed by the gateway
         Ok(n) => panic!("gateway relayed {n} bytes after a rejected handshake"),
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // reset — rejected
-        Err(e) => panic!("expected EOF/reset after rejection, got error: {e} ({:?})", e.kind()),
+        Err(e) => panic!(
+            "expected EOF/reset after rejection, got error: {e} ({:?})",
+            e.kind()
+        ),
     }
 }
 

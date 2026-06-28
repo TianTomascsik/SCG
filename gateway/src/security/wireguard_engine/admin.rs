@@ -13,9 +13,12 @@
 //! directory) immediately after `wg` reads them. The in-memory [`Secret`]
 //! zeroizes itself on drop.
 
+use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -125,16 +128,45 @@ impl KeyDir {
         } else {
             std::env::temp_dir()
         };
-        // SAFETY: `getpid` takes no arguments, has no preconditions, and always
-        // succeeds; its return value is only used to build a unique path.
-        let pid = unsafe { libc::getpid() };
-        let path = base.join(format!("scg-wg-{iface}-{pid}"));
-        let _ = fs::remove_dir_all(&path);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|e| format!("failed to create key dir {}: {e}", path.display()))?;
-        Ok(KeyDir { path })
+        // The interface name is config-derived; keep only path-safe characters
+        // so the template cannot escape `base`.
+        let safe_iface: String = iface
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        // Create the directory atomically with an UNPREDICTABLE random suffix
+        // via mkdtemp(3) (mode 0700). On a world-writable fallback base such as
+        // /tmp (used only when /run is absent), a co-located uid therefore
+        // cannot pre-create or symlink the key directory to interfere with the
+        // private key written into it (#44, CWE-377); mkdtemp never reuses an
+        // existing path.
+        let mut tmpl = base
+            .join(format!("scg-wg-{safe_iface}-XXXXXX"))
+            .into_os_string()
+            .into_vec();
+        tmpl.push(0); // NUL terminator required by mkdtemp
+                      // SAFETY: `tmpl` is a mutable, NUL-terminated C string ending in the
+                      // required `XXXXXX` template; mkdtemp writes the resolved unique path
+                      // back into the buffer in place and returns a pointer into it (or null
+                      // on failure, checked below). `tmpl` outlives the call.
+        let ret = unsafe { libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+        if ret.is_null() {
+            return Err(format!(
+                "failed to create key dir under {}: {}",
+                base.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        tmpl.pop(); // strip the NUL before converting back to a path
+        Ok(KeyDir {
+            path: PathBuf::from(OsString::from_vec(tmpl)),
+        })
     }
 
     /// Write `secret` to a `0600` file (created exclusively) and return its path.

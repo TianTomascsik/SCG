@@ -60,7 +60,11 @@ pub struct Hello {
 impl Hello {
     /// Build a HELLO for the given role and token.
     pub fn new(role: Role, token: CapabilityToken) -> Self {
-        Hello { version: HELLO_VERSION, role, token }
+        Hello {
+            version: HELLO_VERSION,
+            role,
+            token,
+        }
     }
 
     /// Serialize to the fixed-size wire form.
@@ -88,7 +92,11 @@ impl Hello {
         let role = Role::from_u8(buf[5]).ok_or(HelloError::BadRole(buf[5]))?;
         let mut token = [0u8; TOKEN_LEN];
         token.copy_from_slice(&buf[8..8 + TOKEN_LEN]);
-        Ok(Hello { version, role, token: CapabilityToken::from_bytes(token) })
+        Ok(Hello {
+            version,
+            role,
+            token: CapabilityToken::from_bytes(token),
+        })
     }
 }
 
@@ -241,14 +249,16 @@ mod tests {
 
     #[test]
     fn rejects_bad_magic() {
-        let mut wire = Hello::new(Role::Consumer, CapabilityToken::from_bytes([0; TOKEN_LEN])).encode();
+        let mut wire =
+            Hello::new(Role::Consumer, CapabilityToken::from_bytes([0; TOKEN_LEN])).encode();
         wire[0] = b'X';
         assert!(matches!(Hello::decode(&wire), Err(HelloError::BadMagic)));
     }
 
     #[test]
     fn rejects_bad_role() {
-        let mut wire = Hello::new(Role::Consumer, CapabilityToken::from_bytes([0; TOKEN_LEN])).encode();
+        let mut wire =
+            Hello::new(Role::Consumer, CapabilityToken::from_bytes([0; TOKEN_LEN])).encode();
         wire[5] = 99;
         assert!(matches!(Hello::decode(&wire), Err(HelloError::BadRole(99))));
     }

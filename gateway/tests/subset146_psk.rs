@@ -74,7 +74,10 @@ fn subset146_psk_round_trip() {
     let tmp = temp_dir("s146-psk-ok");
     let echo = psk_echo(IDENTITY, PSK_HEX);
     let listen = format!("127.0.0.1:{}", free_port());
-    let config = load_single_rule(&tmp, &psk_rule("tls", &listen, &echo.addr, IDENTITY, PSK_HEX));
+    let config = load_single_rule(
+        &tmp,
+        &psk_rule("tls", &listen, &echo.addr, IDENTITY, PSK_HEX),
+    );
     let (handles, shutdown) = run_rules(&config);
 
     let echoed = plain_round_trip(&listen, b"subset146-psk-payload")
@@ -94,7 +97,10 @@ fn subset146_psk_wrong_key_refused() {
     let echo = psk_echo(IDENTITY, PSK_HEX);
     let listen = format!("127.0.0.1:{}", free_port());
     // Same identity the server accepts, but the wrong key → Finished MAC fails.
-    let config = load_single_rule(&tmp, &psk_rule("tls", &listen, &echo.addr, IDENTITY, OTHER_HEX));
+    let config = load_single_rule(
+        &tmp,
+        &psk_rule("tls", &listen, &echo.addr, IDENTITY, OTHER_HEX),
+    );
     let (handles, shutdown) = run_rules(&config);
 
     let result = plain_round_trip(&listen, b"wrong-key");
@@ -143,7 +149,10 @@ fn ktls_psk_falls_back_to_userspace_tls() {
     // Request kTLS with a PSK profile: not offloadable, so the gateway must
     // auto-fall-back to userspace TLS (decision 8) and still complete the PSK
     // handshake — proving the fallback preserves the security parameters.
-    let config = load_single_rule(&tmp, &psk_rule("ktls", &listen, &echo.addr, IDENTITY, PSK_HEX));
+    let config = load_single_rule(
+        &tmp,
+        &psk_rule("ktls", &listen, &echo.addr, IDENTITY, PSK_HEX),
+    );
     let (handles, shutdown) = run_rules(&config);
 
     let echoed = plain_round_trip(&listen, b"ktls-psk-fallback")

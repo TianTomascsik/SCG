@@ -28,7 +28,8 @@ pub mod shm_slot;
 pub mod token;
 
 pub use frame::{
-    decode_header, encode_header, read_frame, write_frame, FrameDecoder, FrameError, FRAME_HEADER_LEN,
+    decode_header, encode_header, read_frame, write_frame, FrameDecoder, FrameError,
+    FRAME_HEADER_LEN,
 };
 pub use handshake::{
     Hello, HelloError, Role, ShmOffer, HELLO_LEN, SHM_FD_CONTROL, SHM_FD_DATA_C2G, SHM_FD_DATA_G2C,

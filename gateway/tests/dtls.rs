@@ -104,7 +104,14 @@ fn dtls12_round_trip() {
     let listen = format!("127.0.0.1:{}", free_port());
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls12", "encrypt", &listen, &echo.addr, "dtls1.2", r#","verify":"none""#),
+        &dtls_rule(
+            "dtls12",
+            "encrypt",
+            &listen,
+            &echo.addr,
+            "dtls1.2",
+            r#","verify":"none""#,
+        ),
     );
 
     run(&config, || {
@@ -123,7 +130,14 @@ fn dtls10_round_trip() {
     let listen = format!("127.0.0.1:{}", free_port());
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls10", "encrypt", &listen, &echo.addr, "dtls1.0", r#","verify":"none""#),
+        &dtls_rule(
+            "dtls10",
+            "encrypt",
+            &listen,
+            &echo.addr,
+            "dtls1.0",
+            r#","verify":"none""#,
+        ),
     );
 
     run(&config, || {
@@ -146,7 +160,14 @@ fn dtls_server_verify_round_trip() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-verify", "encrypt", &listen, &echo.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-verify",
+            "encrypt",
+            &listen,
+            &echo.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -172,7 +193,14 @@ fn dtls_server_verify_wrong_ca_fails() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-verify-bad", "encrypt", &listen, &echo.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-verify-bad",
+            "encrypt",
+            &listen,
+            &echo.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -205,7 +233,14 @@ fn dtls_mutual_round_trip() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-mutual", "encrypt", &listen, &echo.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-mutual",
+            "encrypt",
+            &listen,
+            &echo.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -235,7 +270,14 @@ fn dtls_mutual_missing_client_cert_fails() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-mutual-bad", "encrypt", &listen, &echo.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-mutual-bad",
+            "encrypt",
+            &listen,
+            &echo.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -264,7 +306,14 @@ fn dtls_decrypt_round_trip() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-dec", "decrypt", &listen, &backend.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-dec",
+            "decrypt",
+            &listen,
+            &backend.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -289,7 +338,14 @@ fn dtls_decrypt_mutual_round_trip() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-dec-mutual", "decrypt", &listen, &backend.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-dec-mutual",
+            "decrypt",
+            &listen,
+            &backend.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -319,7 +375,14 @@ fn dtls_decrypt_mutual_missing_client_cert_fails() {
     );
     let config = load_single_rule(
         &tmp,
-        &dtls_rule("dtls-dec-mutual-bad", "decrypt", &listen, &backend.addr, "dtls1.2", &extra),
+        &dtls_rule(
+            "dtls-dec-mutual-bad",
+            "decrypt",
+            &listen,
+            &backend.addr,
+            "dtls1.2",
+            &extra,
+        ),
     );
 
     run(&config, || {
@@ -328,5 +391,53 @@ fn dtls_decrypt_mutual_missing_client_cert_fails() {
             "mutual DTLS server must refuse a client that presents no certificate",
         );
     });
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn dtls_decrypt_policy_denied_is_not_forwarded() {
+    // A `normal`-class decrypt rule under the deny-by-default policy
+    // (run_rules wires `PolicyManager::new(None)`) must be dropped at the policy
+    // gate *before* the DTLS accept — parity with the TLS decrypt and DTLS
+    // encrypt paths. The plain-UDP backend must therefore see nothing.
+    let tmp = temp_dir("dtls-dec-denied");
+    let pki = TestPki::generate(&tmp);
+    let backend = PlainUdpEchoServer::start();
+    let listen = format!("127.0.0.1:{}", free_port());
+    // `dtls_rule` hardcodes traffic_class=safety (which always passes policy);
+    // build the rule inline so we can mark it `normal` and exercise the gate.
+    let rule = format!(
+        r#"{{
+            "name": "dtls-dec-denied",
+            "direction": "decrypt",
+            "listen_addr": "{listen}",
+            "listen_proto": "udp",
+            "upstream_addr": "{upstream}",
+            "upstream_proto": "udp",
+            "security_provider": "dtls",
+            "traffic_class": "normal",
+            "protocol_version": "dtls1.2",
+            "verify": "none",
+            "cert_path": "{cert}",
+            "key_path": "{key}"
+        }}"#,
+        listen = listen,
+        upstream = backend.addr,
+        cert = pki.server_cert.display(),
+        key = pki.server_key.display(),
+    );
+    let config = load_single_rule(&tmp, &rule);
+
+    run(&config, || {
+        assert!(
+            dtls_client_round_trip(&listen, "dtls1.2", None, b"denied").is_err(),
+            "a policy-denied DTLS decrypt flow must not complete a handshake",
+        );
+    });
+    assert_eq!(
+        backend.received(),
+        0,
+        "policy-denied traffic must never reach the plain-UDP backend",
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }

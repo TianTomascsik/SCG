@@ -100,9 +100,7 @@ fn routing_plaintext_passthrough_round_trip() {
     let _ = client.flush();
 
     let mut received = vec![0u8; payload.len()];
-    client
-        .read_exact(&mut received)
-        .expect("read echoed reply");
+    client.read_exact(&mut received).expect("read echoed reply");
     assert_eq!(
         received, payload,
         "payload should round-trip verbatim through routing passthrough"

@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -88,6 +88,11 @@ impl std::fmt::Debug for ShmCreated {
 }
 
 /// Template derived from a `uds`/`shm` rule in the gateway config.
+///
+/// `Clone` so a short read-lock can hand a copy to the (potentially I/O-bound)
+/// endpoint-creation path without holding the templates lock — letting a
+/// hot-reload swap the template set without blocking on in-flight creates (#42).
+#[derive(Clone)]
 struct EndpointTemplate {
     rule_name: String,
     upstream_addr: String,
@@ -166,8 +171,10 @@ impl RateLimiter {
 
 /// Owns templates and the live-endpoint registry for the local interfaces.
 pub struct InterfaceManager {
-    templates: HashMap<String, EndpointTemplate>,
-    all_rules: Vec<RuleInfo>,
+    /// UDS/SHM authorization templates, swappable on hot-reload (#42).
+    templates: RwLock<HashMap<String, EndpointTemplate>>,
+    /// Rule snapshot for ListRules, swapped alongside `templates` on reload.
+    all_rules: RwLock<Vec<RuleInfo>>,
     runtime_dir: String,
     sock_buf_size: usize,
     version: String,
@@ -187,6 +194,55 @@ impl InterfaceManager {
         version: impl Into<String>,
         _global_shutdown: Arc<AtomicBool>,
     ) -> Arc<Self> {
+        let api = config.api.clone().unwrap_or_default();
+        let (templates, all_rules) = Self::build_templates(config);
+
+        info!(
+            "interface-manager: {} local-interface template(s) registered",
+            templates.len()
+        );
+
+        Arc::new(InterfaceManager {
+            templates: RwLock::new(templates),
+            all_rules: RwLock::new(all_rules),
+            runtime_dir: api.runtime_dir,
+            sock_buf_size: config.sock_buf_size,
+            version: version.into(),
+            max_endpoints_per_uid: api.max_endpoints_per_uid,
+            max_create_per_min: api.create_rate_per_min,
+            live: Mutex::new(LiveState {
+                next_id: 1,
+                by_id: HashMap::new(),
+                by_owner: HashMap::new(),
+            }),
+            rate: Mutex::new(RateLimiter::new()),
+        })
+    }
+
+    /// Re-derive the UDS/SHM authorization templates (and the ListRules
+    /// snapshot) from `config` and swap them in atomically. Called from the
+    /// hot-reload path so a tightened (or relaxed) `allowed_uids`/`allowed_pids`
+    /// takes effect without a process restart (#42). Live endpoints are not
+    /// disturbed; only subsequent `create_uds`/`create_shm` authorization
+    /// decisions use the new templates. Startup-only knobs (runtime_dir, rate
+    /// limits) are intentionally not changed here.
+    pub fn reload_from_config(&self, config: &GatewayConfig) {
+        let (templates, all_rules) = Self::build_templates(config);
+        let n = templates.len();
+        if let Ok(mut guard) = self.templates.write() {
+            *guard = templates;
+        }
+        if let Ok(mut guard) = self.all_rules.write() {
+            *guard = all_rules;
+        }
+        info!("interface-manager: reloaded {n} local-interface template(s) from config");
+    }
+
+    /// Derive the UDS/SHM authorization templates and the rule snapshot from a
+    /// config. Shared by [`InterfaceManager::new`] and [`reload_from_config`].
+    fn build_templates(
+        config: &GatewayConfig,
+    ) -> (HashMap<String, EndpointTemplate>, Vec<RuleInfo>) {
         let api = config.api.clone().unwrap_or_default();
         let mut templates: HashMap<String, EndpointTemplate> = HashMap::new();
         let mut all_rules = Vec::with_capacity(config.rules.len());
@@ -220,8 +276,17 @@ impl InterfaceManager {
                     rule.name
                 );
             }
-            let tls_mode = upstream_tls_mode(rule.effective_security_provider());
-            let key = template_key(&app_id, rule.traffic_class, rule.direction, rule.listen_proto);
+            let tls_mode = upstream_tls_mode(
+                rule.effective_security_provider(),
+                &rule.provider_params,
+                rule.protocol_version.as_deref(),
+            );
+            let key = template_key(
+                &app_id,
+                rule.traffic_class,
+                rule.direction,
+                rule.listen_proto,
+            );
             if templates.contains_key(&key) {
                 warn!(
                     "duplicate uds/shm template (app_id={app_id}, class={}, direction={}, \
@@ -252,26 +317,7 @@ impl InterfaceManager {
             );
         }
 
-        info!(
-            "interface-manager: {} local-interface template(s) registered",
-            templates.len()
-        );
-
-        Arc::new(InterfaceManager {
-            templates,
-            all_rules,
-            runtime_dir: api.runtime_dir,
-            sock_buf_size: config.sock_buf_size,
-            version: version.into(),
-            max_endpoints_per_uid: api.max_endpoints_per_uid,
-            max_create_per_min: api.create_rate_per_min,
-            live: Mutex::new(LiveState {
-                next_id: 1,
-                by_id: HashMap::new(),
-                by_owner: HashMap::new(),
-            }),
-            rate: Mutex::new(RateLimiter::new()),
-        })
+        (templates, all_rules)
     }
 
     /// Gateway version string (for the Health RPC).
@@ -281,7 +327,7 @@ impl InterfaceManager {
 
     /// Snapshot of the configured pipeline rules (for the ListRules RPC).
     pub fn list_rules(&self) -> Vec<RuleInfo> {
-        self.all_rules.clone()
+        self.all_rules.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Emit a structured audit record for a denied control-plane request. All
@@ -299,7 +345,13 @@ impl InterfaceManager {
     /// direction, kind) slot: re-creating an existing slot is a replacement and
     /// does not count against the quota. Returns a ready-to-return `Status` on
     /// rejection.
-    fn check_admission(&self, op: &str, caller: CallerCred, app_id: &str, owner_key: &str) -> Result<(), Status> {
+    fn check_admission(
+        &self,
+        op: &str,
+        caller: CallerCred,
+        app_id: &str,
+        owner_key: &str,
+    ) -> Result<(), Status> {
         // Token-bucket rate limit on create requests.
         if self.max_create_per_min > 0 {
             let admitted = self
@@ -350,7 +402,16 @@ impl InterfaceManager {
         _ring_capacity: usize,
     ) -> Result<UdsCreated, Status> {
         let key = template_key(app_id, class, direction, Proto::Uds);
-        let template = self.templates.get(&key).ok_or_else(|| {
+        // Clone the template out under a short read lock so a concurrent
+        // hot-reload (write) is never blocked by this create's I/O, and so this
+        // request sees a consistent snapshot of the authorization fields (#42).
+        let template = self
+            .templates
+            .read()
+            .map_err(|_| Status::internal("interface-manager templates lock poisoned"))?
+            .get(&key)
+            .cloned();
+        let template = template.ok_or_else(|| {
             Status::not_found(format!(
                 "no uds rule for app_id={app_id} class={class} direction={direction}"
             ))
@@ -382,7 +443,8 @@ impl InterfaceManager {
             .map_err(|e| Status::internal(format!("runtime dir: {e}")))?;
 
         // Allocate an id, an owner key, and a fresh single-use token.
-        let token = CapabilityToken::random().map_err(|e| Status::internal(format!("token: {e}")))?;
+        let token =
+            CapabilityToken::random().map_err(|e| Status::internal(format!("token: {e}")))?;
         let token_bytes = token.as_bytes().to_vec();
         let id = self.alloc_id();
 
@@ -463,7 +525,14 @@ impl InterfaceManager {
         const MAX_SHM_RING_CAPACITY: usize = 256 * 1024 * 1024;
 
         let key = template_key(app_id, class, direction, Proto::Shm);
-        let template = self.templates.get(&key).ok_or_else(|| {
+        // Clone the template out under a short read lock (see create_uds, #42).
+        let template = self
+            .templates
+            .read()
+            .map_err(|_| Status::internal("interface-manager templates lock poisoned"))?
+            .get(&key)
+            .cloned();
+        let template = template.ok_or_else(|| {
             Status::not_found(format!(
                 "no shm rule for app_id={app_id} class={class} direction={direction}"
             ))
@@ -512,11 +581,18 @@ impl InterfaceManager {
             .resolve_runtime_dir(caller.uid)
             .map_err(|e| Status::internal(format!("runtime dir: {e}")))?;
 
-        let token = CapabilityToken::random().map_err(|e| Status::internal(format!("token: {e}")))?;
+        let token =
+            CapabilityToken::random().map_err(|e| Status::internal(format!("token: {e}")))?;
         let token_bytes = token.as_bytes().to_vec();
         let id = self.alloc_id();
 
-        let file_name = format!("{}.{}.{}.{}.ctl.sock", sanitize(app_id), class, direction, id);
+        let file_name = format!(
+            "{}.{}.{}.{}.ctl.sock",
+            sanitize(app_id),
+            class,
+            direction,
+            id
+        );
         let control_socket_path = dir.join(file_name);
         let label = format!("{}#{id}", template.rule_name);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -715,7 +791,10 @@ impl InterfaceManager {
         // Fallback: the caller's XDG runtime directory.
         let xdg = PathBuf::from(format!("/run/user/{uid}")).join("scg");
         ensure_dir(&xdg, 0o700)?;
-        info!("interface-manager: using fallback runtime dir {}", xdg.display());
+        info!(
+            "interface-manager: using fallback runtime dir {}",
+            xdg.display()
+        );
         Ok(xdg)
     }
 }
@@ -843,8 +922,20 @@ mod tests {
         let k1 = template_key("app1", TrafficClass::Normal, Direction::Encrypt, Proto::Uds);
         let k2 = template_key("app1", TrafficClass::Safety, Direction::Encrypt, Proto::Uds);
         assert_ne!(k1, k2);
-        let o1 = owner_key(1000, "app1", TrafficClass::Normal, Direction::Encrypt, Proto::Uds);
-        let o2 = owner_key(1001, "app1", TrafficClass::Normal, Direction::Encrypt, Proto::Uds);
+        let o1 = owner_key(
+            1000,
+            "app1",
+            TrafficClass::Normal,
+            Direction::Encrypt,
+            Proto::Uds,
+        );
+        let o2 = owner_key(
+            1001,
+            "app1",
+            TrafficClass::Normal,
+            Direction::Encrypt,
+            Proto::Uds,
+        );
         assert_ne!(o1, o2);
     }
 
@@ -852,7 +943,11 @@ mod tests {
     fn create_uds_unknown_app_is_not_found() {
         let tmp = unique_tmp();
         let mgr = manager_with_uds_rule(1000, &tmp);
-        let caller = CallerCred { uid: 1000, gid: 1000, pid: 1 };
+        let caller = CallerCred {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
         let err = mgr
             .create_uds(caller, "nope", TrafficClass::Normal, Direction::Encrypt, 0)
             .unwrap_err();
@@ -868,7 +963,11 @@ mod tests {
         // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_uds_rule(uid, &tmp);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
         // Decrypt-direction endpoints are now supported and create like encrypt.
         let created = mgr
             .create_uds(caller, "app1", TrafficClass::Normal, Direction::Decrypt, 0)
@@ -888,11 +987,67 @@ mod tests {
         let tmp = unique_tmp();
         // Rule authorises uid 1000; caller is uid 4242.
         let mgr = manager_with_uds_rule(1000, &tmp);
-        let caller = CallerCred { uid: 4242, gid: 4242, pid: 1 };
+        let caller = CallerCred {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+        };
         let err = mgr
             .create_uds(caller, "app1", TrafficClass::Normal, Direction::Encrypt, 0)
             .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reload_from_config_revokes_uid() {
+        let tmp = unique_tmp();
+        // SAFETY: `getuid` is a nullary POSIX syscall that takes no arguments,
+        // touches no memory, and always succeeds.
+        let uid = unsafe { libc::getuid() };
+        let mgr = manager_with_uds_rule(uid, &tmp);
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
+
+        // Initially authorised: create succeeds.
+        let created = mgr
+            .create_uds(caller, "app1", TrafficClass::Normal, Direction::Encrypt, 0)
+            .expect("authorised uid should create before revoke");
+        let _ = mgr.close(caller, created.endpoint_id);
+
+        // Reload with a config that revokes this uid (authorises a different one).
+        let revoke_uid = uid.wrapping_add(1);
+        let json = format!(
+            r#"{{
+                "rules": [{{
+                    "name": "uds-app1",
+                    "direction": "encrypt",
+                    "listen_addr": "unused",
+                    "listen_proto": "uds",
+                    "upstream_addr": "127.0.0.1:1",
+                    "security_provider": "tls",
+                    "app_id": "app1",
+                    "traffic_class": "normal",
+                    "allowed_uids": [{revoke_uid}]
+                }}],
+                "api": {{ "runtime_dir": "{}", "uds_path": "{}/mgmt.sock" }}
+            }}"#,
+            tmp.display(),
+            tmp.display()
+        );
+        let new_config: GatewayConfig = serde_json::from_str(&json).expect("parse reload config");
+        mgr.reload_from_config(&new_config);
+
+        // After the revoke reload, the previously-authorised uid is denied (#42).
+        let err = mgr
+            .create_uds(caller, "app1", TrafficClass::Normal, Direction::Encrypt, 0)
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        mgr.shutdown_all();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -904,7 +1059,11 @@ mod tests {
         // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_uds_rule(uid, &tmp);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
         let created = mgr
             .create_uds(caller, "app1", TrafficClass::Normal, Direction::Encrypt, 0)
             .expect("create_uds should succeed for an authorised uid");
@@ -962,7 +1121,11 @@ mod tests {
     fn create_shm_unknown_app_is_not_found() {
         let tmp = unique_tmp();
         let mgr = manager_with_shm_rule(1000, &tmp);
-        let caller = CallerCred { uid: 1000, gid: 1000, pid: 1 };
+        let caller = CallerCred {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
         let err = mgr
             .create_shm(caller, "nope", TrafficClass::Safety, Direction::Encrypt, 0)
             .unwrap_err();
@@ -978,9 +1141,19 @@ mod tests {
         // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_shm_rule(uid, &tmp);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
         let created = mgr
-            .create_shm(caller, "app1", TrafficClass::Safety, Direction::Decrypt, 4096)
+            .create_shm(
+                caller,
+                "app1",
+                TrafficClass::Safety,
+                Direction::Decrypt,
+                4096,
+            )
             .expect("decrypt create_shm should succeed for an authorised uid");
         assert_eq!(created.token.len(), 32, "token must be 256-bit");
         assert!(
@@ -996,7 +1169,11 @@ mod tests {
     fn create_shm_wrong_uid_is_denied() {
         let tmp = unique_tmp();
         let mgr = manager_with_shm_rule(1000, &tmp);
-        let caller = CallerCred { uid: 4242, gid: 4242, pid: 1 };
+        let caller = CallerCred {
+            uid: 4242,
+            gid: 4242,
+            pid: 1,
+        };
         let err = mgr
             .create_shm(caller, "app1", TrafficClass::Safety, Direction::Encrypt, 0)
             .unwrap_err();
@@ -1012,10 +1189,20 @@ mod tests {
         // sound from any thread at any time.
         let uid = unsafe { libc::getuid() };
         let mgr = manager_with_shm_rule(uid, &tmp);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
         // Request a small ring; it is rounded up to a page.
         let created = mgr
-            .create_shm(caller, "app1", TrafficClass::Safety, Direction::Encrypt, 4096)
+            .create_shm(
+                caller,
+                "app1",
+                TrafficClass::Safety,
+                Direction::Encrypt,
+                4096,
+            )
             .expect("create_shm should succeed for an authorised uid");
         assert_eq!(created.token.len(), 32, "token must be 256-bit");
         assert_eq!(created.endpoint_id, 1);
@@ -1097,7 +1284,11 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         // Quota disabled; allow a single create per minute.
         let mgr = manager_with_limits(uid, &tmp, 0, 1);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
         // First create consumes the only token in the bucket.
         mgr.create_uds(caller, "app1", TrafficClass::Normal, Direction::Encrypt, 0)
             .expect("first create should pass the rate limit");
@@ -1119,7 +1310,11 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         // One live endpoint allowed; rate limit disabled.
         let mgr = manager_with_limits(uid, &tmp, 1, 0);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
         // First (normal) endpoint occupies the quota.
         mgr.create_uds(caller, "app1", TrafficClass::Normal, Direction::Encrypt, 0)
             .expect("first endpoint fits the quota");
@@ -1144,7 +1339,11 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         // No quota, no rate limit: hammer create-or-replace on one slot.
         let mgr = manager_with_limits(uid, &tmp, 0, 0);
-        let caller = CallerCred { uid, gid: uid, pid: 1 };
+        let caller = CallerCred {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
 
         let baseline_fds = count_open_fds();
         for _ in 0..100 {
@@ -1185,4 +1384,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
-

@@ -50,7 +50,10 @@ pub fn map_connections_to_rules(merged: &Value) -> Result<MappedRules, String> {
             .unwrap_or("<unnamed>")
             .to_string();
 
-        let enabled = conn.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = conn
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         if !enabled {
             warnings.push(format!(
                 "connection '{cid}': disabled — not mapped to a data-plane rule"
@@ -151,11 +154,7 @@ fn resolve_provider(
                 protocol_version,
             }
         }
-        other => {
-            return Err(format!(
-                "unsupported crypto profile protocol '{other}'"
-            ))
-        }
+        other => return Err(format!("unsupported crypto profile protocol '{other}'")),
     };
 
     Ok(provider)
@@ -185,7 +184,9 @@ fn pick_primary(paths: &[Value]) -> &Value {
         .find(|p| p.get("role").and_then(|v| v.as_str()) == Some("primary"))
         .or_else(|| {
             paths.iter().min_by_key(|p| {
-                p.get("priority").and_then(|v| v.as_i64()).unwrap_or(i64::MAX)
+                p.get("priority")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(i64::MAX)
             })
         })
         .unwrap_or(&paths[0])
@@ -202,17 +203,26 @@ fn map_one(
         .ok_or("missing connection_id")?
         .to_string();
 
-    let transparent = conn.get("transparent").and_then(|v| v.as_bool()).unwrap_or(false);
+    let transparent = conn
+        .get("transparent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let traffic_class = conn
         .get("traffic_class")
         .and_then(|v| v.as_str())
         .unwrap_or("normal")
         .to_string();
-    let app_id = conn.get("app_id").and_then(|v| v.as_str()).map(str::to_string);
+    let app_id = conn
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     // ── protection → direction + provider ───────────────────────────────────
     let prot = conn.get("protection").ok_or("missing 'protection'")?;
-    let role = prot.get("role").and_then(|v| v.as_str()).unwrap_or("client");
+    let role = prot
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("client");
     let mode = prot.get("mode").and_then(|v| v.as_str()).unwrap_or("full");
     let profile_ref = prot
         .get("profile_ref")
@@ -319,7 +329,10 @@ fn map_one(
     // ── assemble the rule object ────────────────────────────────────────────
     let mut rule = Map::new();
     rule.insert("name".to_string(), Value::String(cid));
-    rule.insert("direction".to_string(), Value::String(direction.to_string()));
+    rule.insert(
+        "direction".to_string(),
+        Value::String(direction.to_string()),
+    );
     rule.insert("listen_addr".to_string(), Value::String(listen_addr));
     rule.insert("listen_proto".to_string(), Value::String(listen_proto));
     rule.insert("upstream_addr".to_string(), Value::String(upstream_addr));
@@ -368,7 +381,10 @@ fn map_one(
                 intercept.insert("in_interface".to_string(), Value::String(iface.to_string()));
             }
             if let Some(dports) = ic.get("match_dports").and_then(|v| v.as_str()) {
-                intercept.insert("match_dports".to_string(), Value::String(dports.to_string()));
+                intercept.insert(
+                    "match_dports".to_string(),
+                    Value::String(dports.to_string()),
+                );
             }
             if let Some(dst) = ic.get("match_dst") {
                 intercept.insert("match_dst".to_string(), dst.clone());
@@ -468,7 +484,9 @@ mod tests {
         }]));
         assert!(m.rules.is_empty());
         assert!(
-            m.warnings.iter().any(|w| w.contains("uds") && w.contains("skipped")),
+            m.warnings
+                .iter()
+                .any(|w| w.contains("uds") && w.contains("skipped")),
             "got: {:?}",
             m.warnings
         );
@@ -487,7 +505,9 @@ mod tests {
         }]));
         assert!(m.rules.is_empty());
         assert!(
-            m.warnings.iter().any(|w| w.contains("requires transparent")),
+            m.warnings
+                .iter()
+                .any(|w| w.contains("requires transparent")),
             "got: {:?}",
             m.warnings
         );

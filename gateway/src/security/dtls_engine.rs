@@ -16,20 +16,21 @@ use crate::security::{RELAY_BUF_SIZE, UDP_BUF_SIZE};
 
 use crate::management::config::Proto;
 use crate::management::telemetry::{format_rate, ConnectionMetrics};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use openssl::ssl::{
-    ErrorCode, SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslStream, SslVerifyMode,
-    SslVersion,
+    ErrorCode, SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslRef,
+    SslStream, SslVerifyMode, SslVersion,
 };
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // =============================================================================
 //                     DtlsUdpStream -- UDP wrapper for OpenSSL DTLS
@@ -186,6 +187,78 @@ fn build_dtls_connector(params: &TlsSecurityParams) -> Result<SslConnector, Stri
     Ok(builder.build())
 }
 
+/// Maximum time a DTLS decrypt accept may block on one peer's handshake. Kept
+/// short so a peer that completes the stateless cookie exchange but then stalls
+/// the handshake cannot wedge the (serial) accept loop for long. Combined with
+/// the cookie exchange below, this bounds the spoofed-source DoS (CWE-400).
+const DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+thread_local! {
+    /// Peer address the current DTLS accept is bound to. The decrypt accept loop
+    /// is serial and connects its socket to one peer before `accept()`, so the
+    /// cookie callbacks (invoked synchronously on this thread during `accept`)
+    /// can read the peer here to bind the cookie to it.
+    static CURRENT_DTLS_PEER: std::cell::Cell<Option<SocketAddr>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Process-lifetime secret keying the DTLS HelloVerifyRequest cookie HMAC.
+fn dtls_cookie_secret() -> &'static [u8; 32] {
+    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    SECRET.get_or_init(|| {
+        let mut s = [0u8; 32];
+        // rand_bytes only fails if the RNG is unavailable; fall back to the
+        // zero key (still address-bound, still forces a round trip) rather than
+        // panicking in library code. The RNG essentially never fails here.
+        if openssl::rand::rand_bytes(&mut s).is_err() {
+            warn!("DTLS cookie RNG unavailable; using a weak fallback cookie secret");
+        }
+        s
+    })
+}
+
+/// Compute the stateless cookie `HMAC-SHA256(secret, peer)` into `out`,
+/// returning the number of bytes written (truncated to `out`).
+fn compute_dtls_cookie(
+    peer: &SocketAddr,
+    out: &mut [u8],
+) -> Result<usize, openssl::error::ErrorStack> {
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::sign::Signer;
+    let key = PKey::hmac(dtls_cookie_secret())?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
+    signer.update(peer.to_string().as_bytes())?;
+    let mac = signer.sign_to_vec()?;
+    let n = mac.len().min(out.len());
+    out[..n].copy_from_slice(&mac[..n]);
+    Ok(n)
+}
+
+/// DTLS cookie-generate callback: bind the cookie to the connected peer.
+fn dtls_cookie_generate(
+    _ssl: &mut SslRef,
+    buf: &mut [u8],
+) -> Result<usize, openssl::error::ErrorStack> {
+    match CURRENT_DTLS_PEER.with(|c| c.get()) {
+        Some(peer) => compute_dtls_cookie(&peer, buf),
+        None => Ok(0),
+    }
+}
+
+/// DTLS cookie-verify callback: accept only a cookie matching the peer binding,
+/// compared in constant time.
+fn dtls_cookie_verify(_ssl: &mut SslRef, cookie: &[u8]) -> bool {
+    let Some(peer) = CURRENT_DTLS_PEER.with(|c| c.get()) else {
+        return false;
+    };
+    let mut expected = [0u8; 32];
+    match compute_dtls_cookie(&peer, &mut expected) {
+        Ok(n) if n == cookie.len() => openssl::memcmp::eq(&expected[..n], cookie),
+        _ => false,
+    }
+}
+
 /// Build a DTLS `SslAcceptor` (server side) from resolved security params.
 ///
 /// Uses a file-based identity when `cert_path`/`key_path` are configured, else
@@ -224,8 +297,18 @@ fn build_dtls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String
     set_dtls_cipher_list(&mut builder, params, is_dtls10)?;
     apply_dtls_acceptor_verify(&mut builder, params)?;
 
-    // Enable cookie exchange for DTLS (DoS protection)
-    // Note: stateless cookie verification adds complexity; skip for POC
+    // Stateless DTLS cookie exchange (RFC 6347 §4.2.1): the client must echo a
+    // keyed-HMAC cookie, bound to its (connected) source address, before the
+    // server commits to the expensive handshake — blunting spoofed-source
+    // floods. The cookie is transparent to compliant clients (OpenSSL answers
+    // the HelloVerifyRequest automatically).
+    //
+    // SSL_OP_COOKIE_EXCHANGE is REQUIRED: without it `SSL_accept` skips the
+    // HelloVerifyRequest round-trip entirely and the callbacks below are never
+    // invoked (the cookie protection would be silently inert).
+    builder.set_options(SslOptions::COOKIE_EXCHANGE);
+    builder.set_cookie_generate_cb(dtls_cookie_generate);
+    builder.set_cookie_verify_cb(dtls_cookie_verify);
     Ok(builder.build())
 }
 
@@ -353,6 +436,48 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
 //                   ENCRYPT DIRECTION: UDP -> DTLS (native UDP)
 // =============================================================================
 
+/// Whether a *new* DTLS session may be admitted given the current count and the
+/// configured maximum. Pure (testable without sockets).
+fn session_admitted(current: usize, max: usize) -> bool {
+    current < max
+}
+
+/// Peers whose last activity is at least `ttl` in the past, relative to `now`.
+/// Pure (testable without sockets); `evict_idle_sessions` applies the result.
+fn stale_peers(
+    last_activity: &[(SocketAddr, Instant)],
+    ttl: Duration,
+    now: Instant,
+) -> Vec<SocketAddr> {
+    last_activity
+        .iter()
+        .filter(|(_, last)| now.saturating_duration_since(*last) >= ttl)
+        .map(|(peer, _)| *peer)
+        .collect()
+}
+
+/// Shut down and remove every DTLS session idle for at least `ttl`.
+fn evict_idle_sessions(
+    sessions: &mut HashMap<SocketAddr, (SslStream<DtlsUdpStream>, Instant)>,
+    ttl: Duration,
+    now: Instant,
+    rule_name: &str,
+) {
+    let snapshot: Vec<(SocketAddr, Instant)> = sessions
+        .iter()
+        .map(|(peer, (_, last))| (*peer, *last))
+        .collect();
+    for peer in stale_peers(&snapshot, ttl, now) {
+        if let Some((mut ssl, _)) = sessions.remove(&peer) {
+            let _ = ssl.shutdown();
+            debug!(
+                "[{}] DTLS session evicted (idle {:?}) for {}",
+                rule_name, ttl, peer
+            );
+        }
+    }
+}
+
 /// DTLS encrypt relay: receives plaintext UDP datagrams, encrypts each via
 /// DTLS, and sends as encrypted UDP to upstream. Preserves UDP semantics:
 /// no ordering guarantee, no head-of-line blocking.
@@ -374,7 +499,10 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
     tune_socket_buffers(plain_socket.as_raw_fd(), ctx.sock_buf_size);
     // Prioritise the client-facing UDP return path; sample inbound DSCP when
     // the rule preserves it.
-    let plain_is_v6 = plain_socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    let plain_is_v6 = plain_socket
+        .local_addr()
+        .map(|a| a.is_ipv6())
+        .unwrap_or(false);
     ctx.apply_egress_qos(plain_socket.as_raw_fd(), plain_is_v6, None);
     ctx.enable_inbound_dscp_sampling(plain_socket.as_raw_fd(), plain_is_v6);
 
@@ -390,16 +518,15 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
     };
 
     // Resolve typed security parameters and build the DTLS connector.
-    let tls_params = match TlsSecurityParams::from_params(
-        &ctx.provider_params,
-        ctx.protocol_version.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("[{}] DTLS parameter error: {}", ctx.rule_name, e);
-            return;
-        }
-    };
+    let tls_params =
+        match TlsSecurityParams::from_params(&ctx.provider_params, ctx.protocol_version.as_deref())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!("[{}] DTLS parameter error: {}", ctx.rule_name, e);
+                return;
+            }
+        };
     let connector = match build_dtls_connector(&tls_params) {
         Ok(c) => c,
         Err(e) => {
@@ -408,8 +535,14 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         }
     };
 
-    // Per-peer DTLS sessions (since UDP is connectionless, we track sessions by peer addr)
-    let mut sessions: HashMap<SocketAddr, SslStream<DtlsUdpStream>> = HashMap::new();
+    // Per-peer DTLS sessions (since UDP is connectionless, we track sessions by
+    // peer addr). Each entry carries its last-activity instant so idle sessions
+    // can be evicted; admission is bounded by `max_sessions` to resist a
+    // source-address-spoofing flood (CWE-400).
+    let mut sessions: HashMap<SocketAddr, (SslStream<DtlsUdpStream>, Instant)> = HashMap::new();
+    let max_sessions = tls_params.max_sessions;
+    let idle_ttl = Duration::from_secs(tls_params.idle_ttl_secs);
+    let mut last_evict = Instant::now();
     let mut conn_metrics =
         ConnectionMetrics::with_rule_metrics("encrypt-dtls", "dtls", ctx.metrics.clone());
     ctx.metrics.connection_opened();
@@ -419,6 +552,14 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
     let plain_fd = plain_socket.as_raw_fd();
 
     while !ctx.shutdown.load(Ordering::Relaxed) {
+        // Reclaim idle sessions at most ~once per second so a flood of
+        // short-lived peers cannot pin resources between admissions.
+        let now = Instant::now();
+        if now.saturating_duration_since(last_evict) >= Duration::from_secs(1) {
+            evict_idle_sessions(&mut sessions, idle_ttl, now, &ctx.rule_name);
+            last_evict = now;
+        }
+
         // Build dynamic pollfd array: [plain_socket, ...dtls_upstream_fds]
         let mut pollfds = vec![libc::pollfd {
             fd: plain_fd,
@@ -427,7 +568,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         }];
         let session_snapshot: Vec<(SocketAddr, RawFd)> = sessions
             .iter()
-            .map(|(peer, ssl)| (*peer, ssl.get_ref().sock.as_raw_fd()))
+            .map(|(peer, (ssl, _))| (*peer, ssl.get_ref().sock.as_raw_fd()))
             .collect();
         for &(_, fd) in &session_snapshot {
             pollfds.push(libc::pollfd {
@@ -472,8 +613,24 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
 
                         conn_metrics.record_read(n);
 
+                        // Admission control: refuse a *new* peer once the
+                        // session cap is reached (idle sessions are reclaimed by
+                        // the periodic eviction above), bounding resource use
+                        // under a source-spoofing flood.
+                        if !sessions.contains_key(&peer_addr)
+                            && !session_admitted(sessions.len(), max_sessions)
+                        {
+                            warn!(
+                                "[{}] DTLS session cap {} reached; dropping new peer {}",
+                                ctx.rule_name, max_sessions, peer_addr
+                            );
+                            continue;
+                        }
+
                         // Get or create DTLS session for this peer
-                        if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(peer_addr) {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            sessions.entry(peer_addr)
+                        {
                             let target_addr: SocketAddr = match target.parse() {
                                 Ok(a) => a,
                                 Err(e) => {
@@ -528,7 +685,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                                     );
                                     // Switch to non-blocking for poll() loop
                                     ssl_stream.get_ref().sock.set_nonblocking(true).ok();
-                                    e.insert(ssl_stream);
+                                    e.insert((ssl_stream, Instant::now()));
                                 }
                                 Err(e) => {
                                     error!(
@@ -543,8 +700,9 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                         // Encrypt and send
                         if let Some(dtls) = sessions.get_mut(&peer_addr) {
                             apply_geo_delay(ctx.simulated_delay_ms);
-                            match dtls.ssl_write(&fwd_buf[..n]) {
+                            match dtls.0.ssl_write(&fwd_buf[..n]) {
                                 Ok(_) => {
+                                    dtls.1 = Instant::now();
                                     conn_metrics.record_relay(n);
                                 }
                                 Err(e) => {
@@ -573,12 +731,13 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
             if pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 if let Some(dtls) = sessions.get_mut(&peer_addr) {
                     loop {
-                        match dtls.ssl_read(&mut rev_buf) {
+                        match dtls.0.ssl_read(&mut rev_buf) {
                             Ok(0) => {
                                 to_remove.push(peer_addr);
                                 break;
                             }
                             Ok(n) => {
+                                dtls.1 = Instant::now();
                                 conn_metrics.record_read(n);
                                 let _ = plain_socket.send_to(&rev_buf[..n], peer_addr);
                                 conn_metrics.record_relay(n);
@@ -598,7 +757,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
             }
         }
         for peer in to_remove {
-            if let Some(mut ssl) = sessions.remove(&peer) {
+            if let Some((mut ssl, _)) = sessions.remove(&peer) {
                 let _ = ssl.shutdown();
                 info!("[{}] DTLS session closed for {}", ctx.rule_name, peer);
             }
@@ -606,7 +765,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
     }
 
     // Shutdown all DTLS sessions
-    for (peer, mut dtls) in sessions {
+    for (peer, (mut dtls, _)) in sessions {
         let _ = dtls.shutdown();
         info!("[{}] DTLS session closed for {}", ctx.rule_name, peer);
     }
@@ -638,16 +797,15 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
 ///   3. `acceptor.accept()` -- OpenSSL reads ClientHello and does handshake
 ///   4. Spawn a relay thread, create a new listen socket for the next peer
 pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
-    let tls_params = match TlsSecurityParams::from_params(
-        &ctx.provider_params,
-        ctx.protocol_version.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("[{}] DTLS parameter error: {}", ctx.rule_name, e);
-            return;
-        }
-    };
+    let tls_params =
+        match TlsSecurityParams::from_params(&ctx.provider_params, ctx.protocol_version.as_deref())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!("[{}] DTLS parameter error: {}", ctx.rule_name, e);
+                return;
+            }
+        };
     let acceptor = match build_dtls_acceptor(&tls_params) {
         Ok(a) => a,
         Err(e) => {
@@ -655,6 +813,16 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
             return;
         }
     };
+    // Shared across per-session worker threads (each runs its own accept()).
+    let acceptor = Arc::new(acceptor);
+    // Bound concurrent in-flight handshakes + established sessions on the
+    // decrypt path. This lets the blocking DTLS handshake run off the accept
+    // loop (de-serialized, #37) without a flood of peers exhausting threads.
+    let max_sessions = tls_params.max_sessions;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    // Idle eviction so the bounded slots above are reclaimed from quiet
+    // sessions, mirroring the encrypt path (#48); 0 disables it.
+    let idle_ttl_secs = tls_params.idle_ttl_secs;
 
     ctx.metrics.connection_opened();
     info!("[{}] DTLS decrypt relay ready", ctx.rule_name);
@@ -694,7 +862,10 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
         tune_socket_buffers(listen_socket.as_raw_fd(), ctx.sock_buf_size);
         // Prioritise the client-facing DTLS return path; sample inbound DSCP
         // when the rule preserves it.
-        let listen_is_v6 = listen_socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let listen_is_v6 = listen_socket
+            .local_addr()
+            .map(|a| a.is_ipv6())
+            .unwrap_or(false);
         ctx.apply_egress_qos(listen_socket.as_raw_fd(), listen_is_v6, None);
         ctx.enable_inbound_dscp_sampling(listen_socket.as_raw_fd(), listen_is_v6);
 
@@ -722,6 +893,22 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
 
         debug!("[{}] DTLS peer detected: {}", ctx.rule_name, peer_addr);
 
+        // Resolve the upstream target once (reused by the relay thread below)
+        // and apply the classification + policy gate *before* the expensive
+        // DTLS accept, matching the DTLS encrypt path (run_dtls_encrypt_relay)
+        // and the TLS decrypt path (tls_engine::decrypt). A denied peer is
+        // dropped without spending handshake CPU or opening an upstream socket.
+        let upstream_target = if ctx.upstream_addr == "auto" {
+            peer_addr.to_string()
+        } else {
+            ctx.upstream_addr.clone()
+        };
+        if let Ok(dst_addr) = upstream_target.parse::<SocketAddr>() {
+            if !ctx.classify_and_check_policy(&peer_addr, &dst_addr) {
+                continue; // policy denied -- drop and re-arm the listener
+            }
+        }
+
         // Connect socket to this peer -- recv()/send() now locked to this
         // 4-tuple, and the peeked ClientHello stays in the receive buffer.
         if let Err(e) = listen_socket.connect(peer_addr) {
@@ -732,48 +919,79 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
             continue;
         }
 
-        // Increase timeout for handshake
+        // Bound the handshake-blocking window (see DTLS_HANDSHAKE_TIMEOUT). The
+        // timeout travels with the socket into the worker thread below.
         listen_socket
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(DTLS_HANDSHAKE_TIMEOUT))
             .ok();
 
-        // DTLS accept
+        // Admission control (#37): reserve a session slot before spawning so the
+        // count of concurrent in-flight handshakes + established sessions is
+        // bounded by `max_sessions`. This lets the blocking handshake run off
+        // the accept loop (below) without a flood of peers exhausting threads.
+        // At capacity, drop this peer and immediately re-arm the listener.
+        if !session_admitted(in_flight.load(Ordering::Relaxed), max_sessions) {
+            warn!(
+                "[{}] DTLS decrypt session cap {} reached; dropping new peer {}",
+                ctx.rule_name, max_sessions, peer_addr
+            );
+            continue;
+        }
+        in_flight.fetch_add(1, Ordering::Relaxed);
+
+        // The connected, peeked socket moves into the worker, which runs the
+        // (blocking) handshake there rather than on this accept loop.
         let dtls_stream = DtlsUdpStream::new(listen_socket);
-        let ssl_stream = match acceptor.accept(dtls_stream) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    "[{}] DTLS accept failed from {}: {}",
-                    ctx.rule_name, peer_addr, e
-                );
-                continue; // try next peer
-            }
-        };
 
-        info!(
-            "[{}] DTLS session accepted from {}",
-            ctx.rule_name, peer_addr
-        );
-
-        // Clone context fields for the spawned thread (shadowing avoids _2 suffixes)
+        // Clone context fields for the spawned thread (shadowing avoids _2 suffixes).
+        // `upstream_target` was already resolved (and policy-checked) above.
         let rule_name = ctx.rule_name.clone();
-        let upstream_target = if ctx.upstream_addr == "auto" {
-            peer_addr.to_string()
-        } else {
-            ctx.upstream_addr.clone()
-        };
         let upstream_proto = ctx.upstream_proto;
         let shutdown = ctx.shutdown.clone();
         let metrics = ctx.metrics.clone();
         let simulated_delay_ms = ctx.simulated_delay_ms;
         let qos = ctx.qos;
         let traffic_class = ctx.traffic_class;
+        let acceptor = Arc::clone(&acceptor);
+        let in_flight_slot = Arc::clone(&in_flight);
 
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name(format!("{}-dtls-dec-{}", rule_name, peer_addr))
             .spawn(move || {
+                // Release the reserved session slot on every exit path (handshake
+                // failure or relay end), mirroring the encrypt path's RAII bound.
+                struct SessionSlot(Arc<AtomicUsize>);
+                impl Drop for SessionSlot {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let _slot = SessionSlot(in_flight_slot);
+
                 // Safety traffic always runs at elevated thread priority.
                 apply_safety_priority(traffic_class);
+
+                // Bind the stateless cookie to THIS worker's thread-local before
+                // the handshake. Per-worker thread-locals keep the binding
+                // race-free now that handshakes run concurrently rather than on
+                // one serial loop.
+                CURRENT_DTLS_PEER.with(|c| c.set(Some(peer_addr)));
+
+                // Run the (blocking, <= DTLS_HANDSHAKE_TIMEOUT) DTLS handshake
+                // here, off the accept loop, so a slow or stalling peer cannot
+                // head-of-line block admission of other peers (#37).
+                let ssl_stream = match acceptor.accept(dtls_stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(
+                            "[{}] DTLS accept failed from {}: {}",
+                            rule_name, peer_addr, e
+                        );
+                        return;
+                    }
+                };
+
+                info!("[{}] DTLS session accepted from {}", rule_name, peer_addr);
 
                 let mut conn =
                     ConnectionMetrics::with_rule_metrics("decrypt-dtls", "dtls", metrics.clone());
@@ -782,6 +1000,15 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                 // Set DTLS socket to non-blocking for poll()-based bidirectional I/O
                 let dtls_fd = ssl.get_ref().sock.as_raw_fd();
                 set_nonblocking_fd(dtls_fd);
+
+                // Idle eviction deadline (#48): a quiet session releases its
+                // bounded `in_flight` slot + thread so the cap cannot be
+                // permanently held by idle peers. `0` disables eviction.
+                let idle_deadline = if idle_ttl_secs > 0 {
+                    Some(Duration::from_secs(idle_ttl_secs))
+                } else {
+                    None
+                };
 
                 match upstream_proto {
                     Proto::Uds | Proto::Shm => {
@@ -802,7 +1029,11 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                 return;
                             }
                         };
-                        let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                        let bind_addr = if target.is_ipv6() {
+                            "[::]:0"
+                        } else {
+                            "0.0.0.0:0"
+                        };
                         let upstream = match UdpSocket::bind(bind_addr) {
                             Ok(s) => s,
                             Err(e) => {
@@ -825,6 +1056,7 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
 
                         let mut fwd_buf = vec![0u8; UDP_BUF_SIZE];
                         let mut rev_buf = vec![0u8; UDP_BUF_SIZE];
+                        let mut last_activity = Instant::now();
 
                         'relay: loop {
                             if shutdown.load(Ordering::Relaxed) {
@@ -857,8 +1089,18 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                 break;
                             }
                             if ret == 0 {
+                                if let Some(ttl) = idle_deadline {
+                                    if last_activity.elapsed() >= ttl {
+                                        debug!(
+                                            "[{}] DTLS decrypt session idle >= {}s; evicting",
+                                            rule_name, idle_ttl_secs
+                                        );
+                                        break 'relay;
+                                    }
+                                }
                                 continue;
                             }
+                            last_activity = Instant::now();
 
                             // Forward: DTLS -> upstream UDP (decrypt)
                             if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
@@ -931,6 +1173,7 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
 
                         let mut fwd_buf = vec![0u8; RELAY_BUF_SIZE];
                         let mut rev_buf = vec![0u8; RELAY_BUF_SIZE];
+                        let mut last_activity = Instant::now();
 
                         'relay: loop {
                             if shutdown.load(Ordering::Relaxed) {
@@ -963,8 +1206,18 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                 break;
                             }
                             if ret == 0 {
+                                if let Some(ttl) = idle_deadline {
+                                    if last_activity.elapsed() >= ttl {
+                                        debug!(
+                                            "[{}] DTLS decrypt session idle >= {}s; evicting",
+                                            rule_name, idle_ttl_secs
+                                        );
+                                        break 'relay;
+                                    }
+                                }
                                 continue;
                             }
+                            last_activity = Instant::now();
 
                             // Forward: DTLS -> upstream TCP (decrypt)
                             if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
@@ -1027,8 +1280,16 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                 );
 
                 metrics.merge_connection(&conn);
-            })
-            .ok();
+            });
+        if spawned.is_err() {
+            // Spawn failed: release the slot we reserved above so the cap does
+            // not leak.
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+            error!(
+                "[{}] failed to spawn DTLS session thread for {}",
+                ctx.rule_name, peer_addr
+            );
+        }
 
         // Loop continues -- next iteration creates a new listen socket
         // The spawned thread keeps the connected socket alive via SO_REUSEPORT
@@ -1036,4 +1297,72 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
 
     ctx.metrics.connection_closed();
     info!("[{}] DTLS decrypt relay shutting down", ctx.rule_name);
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn admits_below_cap_refuses_at_cap() {
+        assert!(session_admitted(0, 1024));
+        assert!(session_admitted(1023, 1024));
+        assert!(!session_admitted(1024, 1024));
+        assert!(!session_admitted(2000, 1024));
+        // A zero cap admits nothing (config validation forbids it, but the
+        // predicate must still be well-defined).
+        assert!(!session_admitted(0, 0));
+    }
+
+    #[test]
+    fn stale_peers_selects_only_expired() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let fresh: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let old: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let activity = vec![
+            (fresh, now - Duration::from_secs(5)),
+            (old, now - Duration::from_secs(120)),
+        ];
+        let stale = stale_peers(&activity, ttl, now);
+        assert_eq!(stale, vec![old]);
+    }
+
+    #[test]
+    fn stale_peers_boundary_is_inclusive() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let p: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        // Exactly at the TTL boundary counts as stale (>=).
+        let activity = vec![(p, now - Duration::from_secs(60))];
+        assert_eq!(stale_peers(&activity, ttl, now), vec![p]);
+    }
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    #[test]
+    fn cookie_is_deterministic_per_peer() {
+        let peer: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        let na = compute_dtls_cookie(&peer, &mut a).unwrap();
+        let nb = compute_dtls_cookie(&peer, &mut b).unwrap();
+        assert_eq!(na, nb);
+        assert!(na > 0);
+        assert_eq!(a, b, "same peer must yield the same cookie");
+    }
+
+    #[test]
+    fn cookie_differs_across_peers() {
+        let p1: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        let p2: SocketAddr = "203.0.113.5:5001".parse().unwrap(); // different port
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        compute_dtls_cookie(&p1, &mut a).unwrap();
+        compute_dtls_cookie(&p2, &mut b).unwrap();
+        assert_ne!(a, b, "a different peer must yield a different cookie");
+    }
 }

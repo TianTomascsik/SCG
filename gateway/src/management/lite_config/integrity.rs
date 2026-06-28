@@ -26,8 +26,8 @@ pub fn sig_path_for(path: &Path, suffix: &str) -> PathBuf {
 
 /// Load a PEM-encoded Ed25519 public key, rejecting any other key type.
 pub fn load_ed25519_public_pem(pem: &[u8]) -> Result<PKey<Public>, String> {
-    let pkey = PKey::public_key_from_pem(pem)
-        .map_err(|e| format!("cannot load public key: {e}"))?;
+    let pkey =
+        PKey::public_key_from_pem(pem).map_err(|e| format!("cannot load public key: {e}"))?;
     if pkey.id() != Id::ED25519 {
         return Err("public key is not an Ed25519 key".to_string());
     }
@@ -38,8 +38,8 @@ pub fn load_ed25519_public_pem(pem: &[u8]) -> Result<PKey<Public>, String> {
 pub fn verify_ed25519(pubkey: &PKey<Public>, msg: &[u8], sig: &[u8]) -> Result<(), String> {
     // Ed25519 is a "one-shot, no pre-hash" scheme: the verifier is created
     // without a digest and the whole message is passed to `verify_oneshot`.
-    let mut verifier = Verifier::new_without_digest(pubkey)
-        .map_err(|e| format!("verifier init failed: {e}"))?;
+    let mut verifier =
+        Verifier::new_without_digest(pubkey).map_err(|e| format!("verifier init failed: {e}"))?;
     let ok = verifier
         .verify_oneshot(sig, msg)
         .map_err(|e| format!("verify error: {e}"))?;
@@ -72,8 +72,7 @@ pub fn verify_signature(file: &Path, suffix: &str, pubkey: &PKey<Public>) -> Res
 
 /// Lowercase hex SHA-256 of `data`.
 pub fn sha256_hex(data: &[u8]) -> Result<String, String> {
-    let digest = hash(MessageDigest::sha256(), data)
-        .map_err(|e| format!("sha256 failed: {e}"))?;
+    let digest = hash(MessageDigest::sha256(), data).map_err(|e| format!("sha256 failed: {e}"))?;
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest.iter() {
         out.push_str(&format!("{byte:02x}"));

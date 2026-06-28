@@ -173,7 +173,10 @@ mod raw_bound_tests {
         let hdr = u32::MAX.to_le_bytes();
         let mut got: Vec<Vec<u8>> = Vec::new();
         let disconnect = framing.deframe_each("test", &hdr, |d| got.push(d.to_vec()));
-        assert!(disconnect, "oversized advertised length must trigger disconnect");
+        assert!(
+            disconnect,
+            "oversized advertised length must trigger disconnect"
+        );
         assert!(got.is_empty(), "no datagram should be emitted");
     }
 
@@ -240,4 +243,3 @@ mod tests {
         assert_eq!(out, vec![b"abcdef".to_vec()]);
     }
 }
-

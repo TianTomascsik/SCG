@@ -96,7 +96,10 @@ impl SharedConfig {
 
         // Update stored mtime
         if let Ok(mtime) = fs::metadata(&self.config_path).and_then(|m| m.modified()) {
-            *self.last_modified.write().unwrap_or_else(|e| e.into_inner()) = mtime;
+            *self
+                .last_modified
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = mtime;
         }
 
         // Swap config atomically
@@ -150,11 +153,15 @@ where
                 if should_reload {
                     match shared.reload() {
                         Ok(diff) => {
-                            if !diff.added.is_empty() || !diff.removed.is_empty() {
+                            if !diff.added.is_empty()
+                                || !diff.removed.is_empty()
+                                || !diff.changed.is_empty()
+                            {
                                 info!(
-                                    "[gateway] Config reloaded: {} added, {} removed, {} unchanged",
+                                    "[gateway] Config reloaded: {} added, {} removed, {} changed, {} unchanged",
                                     diff.added.len(),
                                     diff.removed.len(),
+                                    diff.changed.len(),
                                     diff.unchanged.len()
                                 );
                                 for r in &diff.added {
@@ -162,6 +169,9 @@ where
                                 }
                                 for name in &diff.removed {
                                     debug!("[gateway]   - rule: \"{}\"", name);
+                                }
+                                for r in &diff.changed {
+                                    debug!("[gateway]   ~ rule: \"{}\"", r.name);
                                 }
                                 on_reload(diff);
                             } else {

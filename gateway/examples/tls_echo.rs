@@ -24,8 +24,7 @@ fn main() {
     println!("LISTENING {local}");
     let _ = std::io::stdout().flush();
 
-    let acceptor =
-        build_tls_acceptor(&TlsSecurityParams::default()).expect("build tls acceptor");
+    let acceptor = build_tls_acceptor(&TlsSecurityParams::default()).expect("build tls acceptor");
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,

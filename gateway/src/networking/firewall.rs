@@ -44,8 +44,11 @@ impl FirewallManager {
     /// Returns a `FirewallManager` that tracks what was created (for teardown),
     /// or an error string if setup fails.
     pub fn setup(config: &GatewayConfig) -> Result<Self, String> {
-        let rules_with_intercept: Vec<&RuleConfig> =
-            config.rules.iter().filter(|r| r.intercept.is_some()).collect();
+        let rules_with_intercept: Vec<&RuleConfig> = config
+            .rules
+            .iter()
+            .filter(|r| r.intercept.is_some())
+            .collect();
 
         if rules_with_intercept.is_empty() {
             return Ok(Self {
@@ -126,12 +129,12 @@ impl FirewallManager {
 
         // Ensure the jump from the parent chain exists.
         // ingress_redirect → PREROUTING; egress_redirect → OUTPUT.
-        let has_ingress = rules.iter().any(|r| {
-            r.intercept.as_ref().unwrap().mode == InterceptMode::IngressRedirect
-        });
-        let has_egress = rules.iter().any(|r| {
-            r.intercept.as_ref().unwrap().mode == InterceptMode::EgressRedirect
-        });
+        let has_ingress = rules
+            .iter()
+            .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::IngressRedirect);
+        let has_egress = rules
+            .iter()
+            .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::EgressRedirect);
 
         if has_ingress {
             Self::ensure_jump("iptables", "nat", "PREROUTING", CHAIN_ENCRYPT)?;
@@ -143,21 +146,41 @@ impl FirewallManager {
             // returns the caller's effective UID by value, takes no pointers, and never
             // sets errno; it has no preconditions and cannot cause undefined behaviour.
             let uid = unsafe { libc::geteuid() };
-            run_nft("iptables", &[
-                "-t", "nat", "-A", CHAIN_ENCRYPT,
-                "-m", "owner", "--uid-owner", &uid.to_string(),
-                "-j", "RETURN",
-            ])?;
+            run_nft(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    CHAIN_ENCRYPT,
+                    "-m",
+                    "owner",
+                    "--uid-owner",
+                    &uid.to_string(),
+                    "-j",
+                    "RETURN",
+                ],
+            )?;
 
             // IPv6: set up equivalent chain for egress (browsers use ::1 for localhost).
             Self::create_or_flush_chain("ip6tables", "nat", CHAIN_ENCRYPT)?;
             self.owns_encrypt_chain_v6 = true;
             Self::ensure_jump("ip6tables", "nat", "OUTPUT", CHAIN_ENCRYPT)?;
-            run_nft("ip6tables", &[
-                "-t", "nat", "-A", CHAIN_ENCRYPT,
-                "-m", "owner", "--uid-owner", &uid.to_string(),
-                "-j", "RETURN",
-            ])?;
+            run_nft(
+                "ip6tables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    CHAIN_ENCRYPT,
+                    "-m",
+                    "owner",
+                    "--uid-owner",
+                    &uid.to_string(),
+                    "-j",
+                    "RETURN",
+                ],
+            )?;
         }
 
         // Add per-rule REDIRECT entries.
@@ -172,10 +195,7 @@ impl FirewallManager {
 
             match ic.mode {
                 InterceptMode::IngressRedirect => {
-                    let mut args = vec![
-                        "-t", "nat", "-A", CHAIN_ENCRYPT,
-                        "-p", &proto,
-                    ];
+                    let mut args = vec!["-t", "nat", "-A", CHAIN_ENCRYPT, "-p", &proto];
                     let iface_owned;
                     if let Some(ref iface) = ic.in_interface {
                         iface_owned = iface.clone();
@@ -196,11 +216,8 @@ impl FirewallManager {
                     let dports = ic.match_dports.clone();
                     let port_str = listen_port.to_string();
                     for dst in &ic.match_dst {
-                        let mut args = vec![
-                            "-t", "nat", "-A", CHAIN_ENCRYPT,
-                            "-d", dst,
-                            "-p", &proto,
-                        ];
+                        let mut args =
+                            vec!["-t", "nat", "-A", CHAIN_ENCRYPT, "-d", dst, "-p", &proto];
                         if dports.contains(',') || dports.contains(':') {
                             args.extend_from_slice(&["-m", "multiport", "--dports", &dports]);
                         } else {
@@ -211,11 +228,8 @@ impl FirewallManager {
 
                         // IPv6 mirror: 127.0.0.1 → also cover ::1 via ip6tables.
                         if dst == "127.0.0.1" {
-                            let mut args6 = vec![
-                                "-t", "nat", "-A", CHAIN_ENCRYPT,
-                                "-d", "::1",
-                                "-p", &proto,
-                            ];
+                            let mut args6 =
+                                vec!["-t", "nat", "-A", CHAIN_ENCRYPT, "-d", "::1", "-p", &proto];
                             if dports.contains(',') || dports.contains(':') {
                                 args6.extend_from_slice(&["-m", "multiport", "--dports", &dports]);
                             } else {
@@ -255,9 +269,15 @@ impl FirewallManager {
 
         // Guard: let already-transparent connections bypass.
         run_iptables(&[
-            "-t", "mangle", "-A", CHAIN_DECRYPT,
-            "-m", "socket", "--transparent",
-            "-j", "RETURN",
+            "-t",
+            "mangle",
+            "-A",
+            CHAIN_DECRYPT,
+            "-m",
+            "socket",
+            "--transparent",
+            "-j",
+            "RETURN",
         ])?;
 
         // Exclude gateway's own listening ports from TPROXY (RETURN rules).
@@ -270,9 +290,16 @@ impl FirewallManager {
             let proto = Self::intercept_proto(rule, ic);
             let port_str = listen_port.to_string();
             run_iptables(&[
-                "-t", "mangle", "-A", CHAIN_DECRYPT,
-                "-p", &proto, "--dport", &port_str,
-                "-j", "RETURN",
+                "-t",
+                "mangle",
+                "-A",
+                CHAIN_DECRYPT,
+                "-p",
+                &proto,
+                "--dport",
+                &port_str,
+                "-j",
+                "RETURN",
             ])?;
         }
 
@@ -289,20 +316,19 @@ impl FirewallManager {
             let mark_spec = format!("{TPROXY_MARK}/{TPROXY_MARK}");
 
             for src in &ic.match_src {
-                let mut args = vec![
-                    "-t", "mangle", "-A", CHAIN_DECRYPT,
-                    "-s", src,
-                    "-p", &proto,
-                ];
+                let mut args = vec!["-t", "mangle", "-A", CHAIN_DECRYPT, "-s", src, "-p", &proto];
                 if dports.contains(',') || dports.contains(':') {
                     args.extend_from_slice(&["-m", "multiport", "--dports", &dports]);
                 } else {
                     args.extend_from_slice(&["--dport", &dports]);
                 }
                 args.extend_from_slice(&[
-                    "-j", "TPROXY",
-                    "--on-port", &port_str,
-                    "--tproxy-mark", &mark_spec,
+                    "-j",
+                    "TPROXY",
+                    "--on-port",
+                    &port_str,
+                    "--tproxy-mark",
+                    &mark_spec,
                 ]);
                 run_iptables(&args)?;
             }
@@ -327,7 +353,10 @@ impl FirewallManager {
             .map_err(|e| format!("Failed to run 'ip rule show': {}", e))?;
         let out = String::from_utf8_lossy(&existing.stdout);
         if !out.contains("fwmark") || !out.contains(&format!("lookup {TPROXY_TABLE}")) {
-            run_cmd("ip", &["rule", "add", "fwmark", TPROXY_MARK, "lookup", TPROXY_TABLE])?;
+            run_cmd(
+                "ip",
+                &["rule", "add", "fwmark", TPROXY_MARK, "lookup", TPROXY_TABLE],
+            )?;
         }
 
         // ip route add local default dev lo table 100
@@ -339,7 +368,16 @@ impl FirewallManager {
         if !route_out.contains("local default") {
             run_cmd(
                 "ip",
-                &["route", "add", "local", "default", "dev", "lo", "table", TPROXY_TABLE],
+                &[
+                    "route",
+                    "add",
+                    "local",
+                    "default",
+                    "dev",
+                    "lo",
+                    "table",
+                    TPROXY_TABLE,
+                ],
             )?;
         }
 
@@ -353,7 +391,16 @@ impl FirewallManager {
             .stderr(std::process::Stdio::null())
             .status();
         let _ = Command::new("ip")
-            .args(["route", "del", "local", "default", "dev", "lo", "table", TPROXY_TABLE])
+            .args([
+                "route",
+                "del",
+                "local",
+                "default",
+                "dev",
+                "lo",
+                "table",
+                TPROXY_TABLE,
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -483,8 +530,11 @@ pub struct IptablesCmd {
 /// Pure function for unit testing.
 pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
     let mut cmds = Vec::new();
-    let rules_with_intercept: Vec<&RuleConfig> =
-        config.rules.iter().filter(|r| r.intercept.is_some()).collect();
+    let rules_with_intercept: Vec<&RuleConfig> = config
+        .rules
+        .iter()
+        .filter(|r| r.intercept.is_some())
+        .collect();
 
     if rules_with_intercept.is_empty() {
         return cmds;
@@ -500,12 +550,12 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
         .iter()
         .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::Tproxy);
 
-    let has_ingress = rules_with_intercept.iter().any(|r| {
-        r.intercept.as_ref().unwrap().mode == InterceptMode::IngressRedirect
-    });
-    let has_egress = rules_with_intercept.iter().any(|r| {
-        r.intercept.as_ref().unwrap().mode == InterceptMode::EgressRedirect
-    });
+    let has_ingress = rules_with_intercept
+        .iter()
+        .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::IngressRedirect);
+    let has_egress = rules_with_intercept
+        .iter()
+        .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::EgressRedirect);
 
     if needs_encrypt {
         // Create/flush chain.
@@ -521,17 +571,31 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
             // sets errno; it has no preconditions and cannot cause undefined behaviour.
             let uid = unsafe { libc::geteuid() };
             cmds.push(ipt(&[
-                "-t", "nat", "-A", CHAIN_ENCRYPT,
-                "-m", "owner", "--uid-owner", &uid.to_string(),
-                "-j", "RETURN",
+                "-t",
+                "nat",
+                "-A",
+                CHAIN_ENCRYPT,
+                "-m",
+                "owner",
+                "--uid-owner",
+                &uid.to_string(),
+                "-j",
+                "RETURN",
             ]));
             // IPv6 equivalent for egress (browsers use ::1 for localhost).
             cmds.push(ip6t(&["-t", "nat", "-N", CHAIN_ENCRYPT]));
             cmds.push(ip6t(&["-t", "nat", "-A", "OUTPUT", "-j", CHAIN_ENCRYPT]));
             cmds.push(ip6t(&[
-                "-t", "nat", "-A", CHAIN_ENCRYPT,
-                "-m", "owner", "--uid-owner", &uid.to_string(),
-                "-j", "RETURN",
+                "-t",
+                "nat",
+                "-A",
+                CHAIN_ENCRYPT,
+                "-m",
+                "owner",
+                "--uid-owner",
+                &uid.to_string(),
+                "-j",
+                "RETURN",
             ]));
         }
 
@@ -560,9 +624,12 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
             match ic.mode {
                 InterceptMode::IngressRedirect => {
                     let mut args = vec![
-                        "-t".to_string(), "nat".to_string(),
-                        "-A".to_string(), CHAIN_ENCRYPT.to_string(),
-                        "-p".to_string(), proto.clone(),
+                        "-t".to_string(),
+                        "nat".to_string(),
+                        "-A".to_string(),
+                        CHAIN_ENCRYPT.to_string(),
+                        "-p".to_string(),
+                        proto.clone(),
                     ];
                     if let Some(ref iface) = ic.in_interface {
                         args.push("-i".to_string());
@@ -570,15 +637,19 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
                     }
                     if ic.match_dports.contains(',') || ic.match_dports.contains(':') {
                         args.extend([
-                            "-m".to_string(), "multiport".to_string(),
-                            "--dports".to_string(), ic.match_dports.clone(),
+                            "-m".to_string(),
+                            "multiport".to_string(),
+                            "--dports".to_string(),
+                            ic.match_dports.clone(),
                         ]);
                     } else {
                         args.extend(["--dport".to_string(), ic.match_dports.clone()]);
                     }
                     args.extend([
-                        "-j".to_string(), "REDIRECT".to_string(),
-                        "--to-port".to_string(), listen_port.clone(),
+                        "-j".to_string(),
+                        "REDIRECT".to_string(),
+                        "--to-port".to_string(),
+                        listen_port.clone(),
                     ]);
                     cmds.push(IptablesCmd {
                         program: "iptables".to_string(),
@@ -588,22 +659,30 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
                 InterceptMode::EgressRedirect => {
                     for dst in &ic.match_dst {
                         let mut args = vec![
-                            "-t".to_string(), "nat".to_string(),
-                            "-A".to_string(), CHAIN_ENCRYPT.to_string(),
-                            "-d".to_string(), dst.clone(),
-                            "-p".to_string(), proto.clone(),
+                            "-t".to_string(),
+                            "nat".to_string(),
+                            "-A".to_string(),
+                            CHAIN_ENCRYPT.to_string(),
+                            "-d".to_string(),
+                            dst.clone(),
+                            "-p".to_string(),
+                            proto.clone(),
                         ];
                         if ic.match_dports.contains(',') || ic.match_dports.contains(':') {
                             args.extend([
-                                "-m".to_string(), "multiport".to_string(),
-                                "--dports".to_string(), ic.match_dports.clone(),
+                                "-m".to_string(),
+                                "multiport".to_string(),
+                                "--dports".to_string(),
+                                ic.match_dports.clone(),
                             ]);
                         } else {
                             args.extend(["--dport".to_string(), ic.match_dports.clone()]);
                         }
                         args.extend([
-                            "-j".to_string(), "REDIRECT".to_string(),
-                            "--to-port".to_string(), listen_port.clone(),
+                            "-j".to_string(),
+                            "REDIRECT".to_string(),
+                            "--to-port".to_string(),
+                            listen_port.clone(),
                         ]);
                         cmds.push(IptablesCmd {
                             program: "iptables".to_string(),
@@ -613,22 +692,30 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
                         // IPv6 mirror: 127.0.0.1 → also cover ::1.
                         if dst == "127.0.0.1" {
                             let mut args6 = vec![
-                                "-t".to_string(), "nat".to_string(),
-                                "-A".to_string(), CHAIN_ENCRYPT.to_string(),
-                                "-d".to_string(), "::1".to_string(),
-                                "-p".to_string(), proto.clone(),
+                                "-t".to_string(),
+                                "nat".to_string(),
+                                "-A".to_string(),
+                                CHAIN_ENCRYPT.to_string(),
+                                "-d".to_string(),
+                                "::1".to_string(),
+                                "-p".to_string(),
+                                proto.clone(),
                             ];
                             if ic.match_dports.contains(',') || ic.match_dports.contains(':') {
                                 args6.extend([
-                                    "-m".to_string(), "multiport".to_string(),
-                                    "--dports".to_string(), ic.match_dports.clone(),
+                                    "-m".to_string(),
+                                    "multiport".to_string(),
+                                    "--dports".to_string(),
+                                    ic.match_dports.clone(),
                                 ]);
                             } else {
                                 args6.extend(["--dport".to_string(), ic.match_dports.clone()]);
                             }
                             args6.extend([
-                                "-j".to_string(), "REDIRECT".to_string(),
-                                "--to-port".to_string(), listen_port.clone(),
+                                "-j".to_string(),
+                                "REDIRECT".to_string(),
+                                "--to-port".to_string(),
+                                listen_port.clone(),
                             ]);
                             cmds.push(IptablesCmd {
                                 program: "ip6tables".to_string(),
@@ -647,30 +734,50 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
         cmds.push(IptablesCmd {
             program: "ip".to_string(),
             args: vec![
-                "rule".to_string(), "add".to_string(),
-                "fwmark".to_string(), TPROXY_MARK.to_string(),
-                "lookup".to_string(), TPROXY_TABLE.to_string(),
+                "rule".to_string(),
+                "add".to_string(),
+                "fwmark".to_string(),
+                TPROXY_MARK.to_string(),
+                "lookup".to_string(),
+                TPROXY_TABLE.to_string(),
             ],
         });
         cmds.push(IptablesCmd {
             program: "ip".to_string(),
             args: vec![
-                "route".to_string(), "add".to_string(),
-                "local".to_string(), "default".to_string(),
-                "dev".to_string(), "lo".to_string(),
-                "table".to_string(), TPROXY_TABLE.to_string(),
+                "route".to_string(),
+                "add".to_string(),
+                "local".to_string(),
+                "default".to_string(),
+                "dev".to_string(),
+                "lo".to_string(),
+                "table".to_string(),
+                TPROXY_TABLE.to_string(),
             ],
         });
 
         // Create/flush chain.
         cmds.push(ipt(&["-t", "mangle", "-N", CHAIN_DECRYPT]));
-        cmds.push(ipt(&["-t", "mangle", "-A", "PREROUTING", "-j", CHAIN_DECRYPT]));
+        cmds.push(ipt(&[
+            "-t",
+            "mangle",
+            "-A",
+            "PREROUTING",
+            "-j",
+            CHAIN_DECRYPT,
+        ]));
 
         // Transparent socket guard.
         cmds.push(ipt(&[
-            "-t", "mangle", "-A", CHAIN_DECRYPT,
-            "-m", "socket", "--transparent",
-            "-j", "RETURN",
+            "-t",
+            "mangle",
+            "-A",
+            CHAIN_DECRYPT,
+            "-m",
+            "socket",
+            "--transparent",
+            "-j",
+            "RETURN",
         ]));
 
         // RETURN for own listening ports.
@@ -694,9 +801,16 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
                 }
             };
             cmds.push(ipt(&[
-                "-t", "mangle", "-A", CHAIN_DECRYPT,
-                "-p", &proto, "--dport", &listen_port,
-                "-j", "RETURN",
+                "-t",
+                "mangle",
+                "-A",
+                CHAIN_DECRYPT,
+                "-p",
+                &proto,
+                "--dport",
+                &listen_port,
+                "-j",
+                "RETURN",
             ]));
         }
 
@@ -724,23 +838,32 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
 
             for src in &ic.match_src {
                 let mut args = vec![
-                    "-t".to_string(), "mangle".to_string(),
-                    "-A".to_string(), CHAIN_DECRYPT.to_string(),
-                    "-s".to_string(), src.clone(),
-                    "-p".to_string(), proto.clone(),
+                    "-t".to_string(),
+                    "mangle".to_string(),
+                    "-A".to_string(),
+                    CHAIN_DECRYPT.to_string(),
+                    "-s".to_string(),
+                    src.clone(),
+                    "-p".to_string(),
+                    proto.clone(),
                 ];
                 if ic.match_dports.contains(',') || ic.match_dports.contains(':') {
                     args.extend([
-                        "-m".to_string(), "multiport".to_string(),
-                        "--dports".to_string(), ic.match_dports.clone(),
+                        "-m".to_string(),
+                        "multiport".to_string(),
+                        "--dports".to_string(),
+                        ic.match_dports.clone(),
                     ]);
                 } else {
                     args.extend(["--dport".to_string(), ic.match_dports.clone()]);
                 }
                 args.extend([
-                    "-j".to_string(), "TPROXY".to_string(),
-                    "--on-port".to_string(), listen_port.clone(),
-                    "--tproxy-mark".to_string(), mark_spec.clone(),
+                    "-j".to_string(),
+                    "TPROXY".to_string(),
+                    "--on-port".to_string(),
+                    listen_port.clone(),
+                    "--tproxy-mark".to_string(),
+                    mark_spec.clone(),
                 ]);
                 cmds.push(IptablesCmd {
                     program: "iptables".to_string(),
@@ -807,10 +930,17 @@ mod tests {
         }));
         let cmds = plan_firewall_commands(&config);
         // Should have: create chain, jump from PREROUTING, then the REDIRECT rule.
-        assert!(cmds.len() >= 3, "expected >=3 commands, got {}: {:?}", cmds.len(), cmds);
+        assert!(
+            cmds.len() >= 3,
+            "expected >=3 commands, got {}: {:?}",
+            cmds.len(),
+            cmds
+        );
 
         // The REDIRECT rule should target port 8443.
-        let redirect = cmds.iter().find(|c| c.args.contains(&"REDIRECT".to_string()));
+        let redirect = cmds
+            .iter()
+            .find(|c| c.args.contains(&"REDIRECT".to_string()));
         assert!(redirect.is_some(), "no REDIRECT command found");
         let r = redirect.unwrap();
         assert!(r.args.contains(&"8443".to_string()));
@@ -835,8 +965,15 @@ mod tests {
         }));
         let cmds = plan_firewall_commands(&config);
         // Should have create chain + jump OUTPUT + owner RETURN + 2 REDIRECT rules.
-        let redirects: Vec<_> = cmds.iter().filter(|c| c.args.contains(&"REDIRECT".to_string())).collect();
-        assert_eq!(redirects.len(), 2, "expected 2 REDIRECT rules for 2 dst IPs");
+        let redirects: Vec<_> = cmds
+            .iter()
+            .filter(|c| c.args.contains(&"REDIRECT".to_string()))
+            .collect();
+        assert_eq!(
+            redirects.len(),
+            2,
+            "expected 2 REDIRECT rules for 2 dst IPs"
+        );
         // Both should use multiport.
         for r in &redirects {
             assert!(r.args.contains(&"multiport".to_string()));
@@ -870,8 +1007,15 @@ mod tests {
         let ip_cmds: Vec<_> = cmds.iter().filter(|c| c.program == "ip").collect();
         assert_eq!(ip_cmds.len(), 2, "expected ip rule + ip route");
 
-        let tproxy_rules: Vec<_> = cmds.iter().filter(|c| c.args.contains(&"TPROXY".to_string())).collect();
-        assert_eq!(tproxy_rules.len(), 2, "expected 2 TPROXY rules for 2 src IPs");
+        let tproxy_rules: Vec<_> = cmds
+            .iter()
+            .filter(|c| c.args.contains(&"TPROXY".to_string()))
+            .collect();
+        assert_eq!(
+            tproxy_rules.len(),
+            2,
+            "expected 2 TPROXY rules for 2 src IPs"
+        );
         for r in &tproxy_rules {
             assert!(r.args.contains(&"4000".to_string()));
             assert!(r.args.contains(&"1/1".to_string()));

@@ -239,12 +239,11 @@ pub(crate) fn handle_tcp_encrypt(
     let hs_start = Instant::now();
     let mut upstream: ProxyStream = match tls_mode {
         TlsMode::Tls => {
-            let connector = tls_connector.ok_or_else(|| {
-                io::Error::other("TLS connector was not initialised")
-            })?;
-            let ssl_stream = connector.connect(&sni, upstream_tcp).map_err(|e| {
-                io::Error::other(format!("TLS handshake: {}", e))
-            })?;
+            let connector = tls_connector
+                .ok_or_else(|| io::Error::other("TLS connector was not initialised"))?;
+            let ssl_stream = connector
+                .connect(&sni, upstream_tcp)
+                .map_err(|e| io::Error::other(format!("TLS handshake: {}", e)))?;
             info!(
                 "[{}] TLS handshake OK ({:.2} ms)",
                 rule_name,
@@ -253,14 +252,11 @@ pub(crate) fn handle_tcp_encrypt(
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let connector = tls_connector.ok_or_else(|| {
-                io::Error::other("kTLS connector was not initialised")
-            })?;
+            let connector = tls_connector
+                .ok_or_else(|| io::Error::other("kTLS connector was not initialised"))?;
             let mut ssl = connector
                 .configure()
-                .map_err(|e| {
-                    io::Error::other(format!("kTLS configure: {}", e))
-                })?
+                .map_err(|e| io::Error::other(format!("kTLS configure: {}", e)))?
                 .into_ssl(&sni)
                 .map_err(|e| io::Error::other(format!("kTLS SSL: {}", e)))?;
             ssl.set_connect_state();
@@ -270,12 +266,11 @@ pub(crate) fn handle_tcp_encrypt(
             unsafe {
                 enable_ktls_ssl(ssl.as_ptr());
             }
-            let mut session = KtlsSession::new(ssl, up_fd as libc::c_int).map_err(|e| {
-                io::Error::other(format!("kTLS session: {}", e))
-            })?;
-            session.connect().map_err(|e| {
-                io::Error::other(format!("kTLS handshake: {}", e))
-            })?;
+            let mut session = KtlsSession::new(ssl, up_fd as libc::c_int)
+                .map_err(|e| io::Error::other(format!("kTLS session: {}", e)))?;
+            session
+                .connect()
+                .map_err(|e| io::Error::other(format!("kTLS handshake: {}", e)))?;
 
             let ulp = get_tcp_ulp(&upstream_tcp).unwrap_or_default();
             let ktls_active = ulp.starts_with("tls");
@@ -722,7 +717,18 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
             'udp_fwd: loop {
                 match socket.recv_from(&mut udp_buf) {
                     Ok((n, src)) => {
-                        last_peer = Some(src);
+                        if !accept_source(&mut last_peer, src) {
+                            // A second client on this single-client encrypt
+                            // stream: ignore its datagram rather than
+                            // multiplexing it. The single TLS/ALE stream carries
+                            // no per-client identity, so multiplexing would route
+                            // reverse responses to the wrong client (CWE-200).
+                            debug!(
+                                "[{}] ignoring datagram from {} (stream pinned to {:?})",
+                                ctx.rule_name, src, last_peer
+                            );
+                            continue 'udp_fwd;
+                        }
                         conn_metrics.record_read(n);
                         // Frame the datagram (ALE DT or raw length-prefix) into
                         // the batch buffer.
@@ -793,4 +799,45 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
 
     ctx.metrics.merge_connection(&conn_metrics);
     ctx.metrics.connection_closed();
+}
+
+/// Pin a UDP-over-TLS encrypt stream to its first client.
+///
+/// Returns whether `src` is the bound client, binding it on the first call. A
+/// second, distinct source is rejected: the relay multiplexes all UDP clients
+/// over one TLS/ALE stream that carries no per-client identity, so accepting a
+/// second client would let reverse responses be delivered to the wrong client
+/// (cross-flow leak / injection — CWE-200). One client per encrypt stream is the
+/// safe behaviour; true multiplexing would require per-client tunnels.
+fn accept_source(bound: &mut Option<SocketAddr>, src: SocketAddr) -> bool {
+    match *bound {
+        None => {
+            *bound = Some(src);
+            true
+        }
+        Some(b) => b == src,
+    }
+}
+
+#[cfg(test)]
+mod single_client_tests {
+    use super::accept_source;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn first_source_binds_then_only_it_is_accepted() {
+        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let mut bound = None;
+        // First client binds and is accepted.
+        assert!(accept_source(&mut bound, a));
+        assert_eq!(bound, Some(a));
+        // The bound client keeps being accepted.
+        assert!(accept_source(&mut bound, a));
+        // A second client is rejected and does not steal the binding.
+        assert!(!accept_source(&mut bound, b));
+        assert_eq!(bound, Some(a));
+        // The original client still works afterwards.
+        assert!(accept_source(&mut bound, a));
+    }
 }

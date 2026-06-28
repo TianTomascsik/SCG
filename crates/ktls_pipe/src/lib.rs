@@ -370,10 +370,21 @@ pub fn build_server_acceptor(
     Ok(builder.build())
 }
 
+/// Build a kTLS-offload **client** connector.
+///
+/// Peer verification is intentionally `NONE`: kTLS only offloads the default
+/// AES-GCM, server-authentication-disabled path. Callers MUST only route a rule
+/// here when its parameters are kTLS-offloadable (default profile, `verify` =
+/// none, no PSK) — the gateway enforces this in
+/// `interfaces::endpoint::upstream_tls_mode`, which falls back to the userspace
+/// `Tls` connector (honouring `verify`/cert/CA) for any verification-requiring
+/// rule. Do not call this for a rule that requested peer verification.
 pub fn build_client_connector(
     version: Option<&str>,
 ) -> Result<SslConnector, openssl::error::ErrorStack> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
+    // SAFETY (security): NONE is correct only for the offloadable path; see the
+    // doc comment above. The caller (upstream_tls_mode) guarantees this.
     builder.set_verify(SslVerifyMode::NONE);
     // SAFETY: `builder.as_ptr()` returns the valid, non-null `SSL_CTX*` owned by
     // the live `builder` on the stack, so it outlives this call and is not

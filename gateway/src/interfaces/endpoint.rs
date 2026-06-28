@@ -34,6 +34,7 @@ use scg_ipc::token::CapabilityToken;
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::TcpStream;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,7 +59,10 @@ pub fn authenticate_peer(
     let cred = os::get_peer_cred(fd).map_err(|e| format!("SO_PEERCRED failed: {e}"))?;
 
     if !allowed_uids.contains(&cred.uid) {
-        return Err(format!("uid {} is not in the rule's allowed_uids", cred.uid));
+        return Err(format!(
+            "uid {} is not in the rule's allowed_uids",
+            cred.uid
+        ));
     }
     if cred.uid != owner_uid {
         return Err(format!(
@@ -66,8 +70,42 @@ pub fn authenticate_peer(
             cred.uid, owner_uid
         ));
     }
-    if !allowed_pids.is_empty() && !allowed_pids.contains(&cred.pid) {
-        return Err(format!("pid {} is not in the rule's allowed_pids", cred.pid));
+    if !allowed_pids.is_empty() {
+        if !allowed_pids.contains(&cred.pid) {
+            return Err(format!(
+                "pid {} is not in the rule's allowed_pids",
+                cred.pid
+            ));
+        }
+        // Pin the authorized PID against reuse (#43). SO_PEERCRED reports the
+        // connect-time PID, a value the kernel recycles once the process exits;
+        // a `pidfd` instead refers to the exact process. If the peer process is
+        // already gone we refuse rather than trust a credential whose PID may
+        // have been handed to a different process. Defense-in-depth only: the
+        // uid==owner_uid check above and the single-use token below remain the
+        // authoritative gates. Where pidfd_open is unsupported (older kernels)
+        // we fall back to the SO_PEERCRED pid check alone.
+        match os::pidfd_open(cred.pid) {
+            Ok(raw) => {
+                // SAFETY: `raw` is a fresh, owned pidfd just returned by
+                // pidfd_open; wrapping it in OwnedFd transfers ownership so the
+                // descriptor is closed when `_pidfd` is dropped at scope end.
+                let _pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                return Err(format!(
+                    "peer pid {} is no longer live (possible PID reuse)",
+                    cred.pid
+                ));
+            }
+            Err(e) => {
+                debug!(
+                    "pidfd liveness pin unavailable for pid {} ({e}); \
+                     falling back to SO_PEERCRED pid check",
+                    cred.pid
+                );
+            }
+        }
     }
 
     // Read the fixed-size HELLO under a timeout so a silent peer cannot wedge
@@ -104,14 +142,31 @@ pub fn authenticate_peer(
     Ok(cred)
 }
 
-/// Map a rule's effective security-provider name to the TLS transport mode used
-/// for the upstream leg of a local interface.
+/// Map a rule's effective security-provider name (plus its resolved security
+/// parameters) to the TLS transport mode used for the upstream leg of a local
+/// interface.
 ///
 /// The UDS/SHM tunnel is stream-oriented, so DTLS is not applicable; unknown or
 /// custom provider names fall back to userspace TLS.
-pub fn upstream_tls_mode(security_provider: &str) -> TlsMode {
+///
+/// kTLS only offloads the default AES-GCM, server-authentication-disabled path
+/// (see [`TlsSecurityParams::is_ktls_offloadable`]). A `ktls` rule that requests
+/// peer verification, a PSK, or a non-default profile is **not** offloadable, so
+/// it falls back to the userspace `Tls` path — which honours the rule's
+/// `verify`/cert/CA — rather than silently connecting through the kTLS connector
+/// with verification disabled. This mirrors the static-rule selection in
+/// `processing::start_single_rule`. If the parameters fail to parse, fall back to
+/// `Tls` too so the userspace path can surface the real error.
+pub fn upstream_tls_mode(
+    security_provider: &str,
+    provider_params: &HashMap<String, serde_json::Value>,
+    protocol_version: Option<&str>,
+) -> TlsMode {
     match security_provider {
-        "ktls" => TlsMode::Ktls,
+        "ktls" => match TlsSecurityParams::from_params(provider_params, protocol_version) {
+            Ok(p) if p.is_ktls_offloadable() => TlsMode::Ktls,
+            _ => TlsMode::Tls,
+        },
         _ => TlsMode::Tls,
     }
 }
@@ -142,7 +197,10 @@ pub fn connect_tls_upstream(
     tune_socket_buffers(up_fd, sock_buf_size);
     set_nodelay(up_fd, true);
     // Mark + prioritise the upstream (SCG → upstream) egress socket.
-    let up_is_v6 = upstream_tcp.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+    let up_is_v6 = upstream_tcp
+        .peer_addr()
+        .map(|a| a.is_ipv6())
+        .unwrap_or(false);
     apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
 
     // Honour the rule's configured TLS security parameters (verify mode,
@@ -169,9 +227,8 @@ pub fn connect_tls_upstream(
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let connector = ktls_client_connector(params.version.as_deref()).map_err(|e| {
-                io::Error::other(format!("kTLS connector: {e}"))
-            })?;
+            let connector = ktls_client_connector(params.version.as_deref())
+                .map_err(|e| io::Error::other(format!("kTLS connector: {e}")))?;
             let mut ssl = connector
                 .configure()
                 .map_err(|e| io::Error::other(format!("kTLS configure: {e}")))?
@@ -195,7 +252,10 @@ pub fn connect_tls_upstream(
                     hs_start.elapsed().as_secs_f64() * 1000.0
                 );
             } else {
-                warn!("[{label}] WARNING: kTLS not active.{}", ktls_privilege_hint());
+                warn!(
+                    "[{label}] WARNING: kTLS not active.{}",
+                    ktls_privilege_hint()
+                );
             }
             ProxyStream::Ktls {
                 session,
@@ -324,7 +384,10 @@ pub fn accept_tls_upstream(
                     hs_start.elapsed().as_secs_f64() * 1000.0
                 );
             } else {
-                warn!("[{label}] WARNING: kTLS not active.{}", ktls_privilege_hint());
+                warn!(
+                    "[{label}] WARNING: kTLS not active.{}",
+                    ktls_privilege_hint()
+                );
             }
             ProxyStream::Ktls {
                 session,
@@ -401,4 +464,63 @@ pub fn relay_uds_tls(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn params(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn ktls_offloadable_rule_stays_ktls() {
+        // Default profile + verify:none + no PSK is offloadable → kTLS.
+        let p = params(&[("verify", json!("none"))]);
+        assert_eq!(upstream_tls_mode("ktls", &p, Some("tls1.3")), TlsMode::Ktls);
+    }
+
+    #[test]
+    fn ktls_rule_requiring_verification_falls_back_to_userspace_tls() {
+        // A verify-requiring kTLS rule must NOT use the no-verify kTLS connector;
+        // it falls back to userspace TLS, which honours `verify`/cert/CA.
+        let server = params(&[("verify", json!("server"))]);
+        assert_eq!(
+            upstream_tls_mode("ktls", &server, Some("tls1.3")),
+            TlsMode::Tls
+        );
+
+        let mutual = params(&[("verify", json!("mutual"))]);
+        assert_eq!(
+            upstream_tls_mode("ktls", &mutual, Some("tls1.2")),
+            TlsMode::Tls
+        );
+
+        // A non-default profile (e.g. PKI ⇒ mutual) is likewise not offloadable.
+        let pki = params(&[("profile", json!("subset146-pki"))]);
+        assert_eq!(
+            upstream_tls_mode("ktls", &pki, Some("tls1.2")),
+            TlsMode::Tls
+        );
+    }
+
+    #[test]
+    fn ktls_rule_with_unparseable_params_falls_back_to_tls() {
+        // Default profile omitting `verify` is rejected by from_params
+        // (fail-secure); the mode resolver conservatively falls back to Tls so
+        // the userspace path surfaces the real error.
+        let p = params(&[]);
+        assert_eq!(upstream_tls_mode("ktls", &p, None), TlsMode::Tls);
+    }
+
+    #[test]
+    fn non_ktls_provider_is_userspace_tls() {
+        let p = params(&[("verify", json!("none"))]);
+        assert_eq!(upstream_tls_mode("tls", &p, Some("tls1.3")), TlsMode::Tls);
+    }
 }

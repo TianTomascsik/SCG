@@ -444,7 +444,7 @@ impl fmt::Display for InterceptMode {
 /// When present, the gateway will install iptables rules at startup to redirect
 /// matching traffic to this rule's listen port, and tear them down on shutdown.
 /// Requires `CAP_NET_ADMIN`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InterceptConfig {
     /// Interception mode (determines which iptables table/chain/target is used).
     pub mode: InterceptMode,
@@ -695,6 +695,36 @@ impl RuleConfig {
         }
     }
 
+    /// Whether a same-name rule differs from `other` in a way that requires the
+    /// listener to be torn down and recreated on hot-reload: security posture,
+    /// routing, framing, or QoS marking. Perf-only knobs (buffer/pipe sizes,
+    /// spin waits, BDP tuning) are intentionally excluded so a tuning tweak does
+    /// not drop live connections. Drives the `changed` bucket in [`GatewayConfig::diff`].
+    pub fn reload_differs(&self, other: &RuleConfig) -> bool {
+        self.direction != other.direction
+            || self.listen_addr != other.listen_addr
+            || self.listen_proto != other.listen_proto
+            || self.upstream_addr != other.upstream_addr
+            || self.upstream_proto != other.upstream_proto
+            || self.effective_security_provider() != other.effective_security_provider()
+            || self.effective_app_protocol() != other.effective_app_protocol()
+            || self.protocol_version != other.protocol_version
+            || self.transparent != other.transparent
+            || self.traffic_class != other.traffic_class
+            || self.dscp_tag != other.dscp_tag
+            || self.preserve_inbound_dscp != other.preserve_inbound_dscp
+            // provider_params carries verify/cert/CA/PSK/profile and the DTLS
+            // session limits — any change there is security-relevant.
+            || self.provider_params != other.provider_params
+            // Local-IPC authorization (uds/shm allow-lists) and transparent
+            // interception are security-relevant: a tightened allow-list or an
+            // intercept change must mark the rule "changed" so the reload
+            // re-applies it rather than silently keeping the old posture (#42).
+            || self.allowed_uids != other.allowed_uids
+            || self.allowed_pids != other.allowed_pids
+            || self.intercept != other.intercept
+    }
+
     /// Resolve the DSCP value (0..=63) to stamp on this rule's egress packets,
     /// or `None` to leave the kernel default. Precedence:
     ///
@@ -831,7 +861,6 @@ pub enum TrafficClass {
     Safety,
 }
 
-
 impl fmt::Display for TrafficClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -925,6 +954,14 @@ pub struct PolicyConfig {
     /// Whitelist entries — traffic matching any entry is allowed.
     #[serde(default)]
     pub whitelist: Vec<WhitelistEntry>,
+    /// When true, Safety-classified traffic must ALSO pass the whitelist /
+    /// default-deny instead of being unconditionally allowed. Default `false`
+    /// (fail-open) to preserve the railway-availability guarantee — a policy
+    /// misconfiguration must never silence safety-critical signalling.
+    /// High-security deployments opt in to confine Safety traffic. See the
+    /// `dtls`/policy notes in the gateway README.
+    #[serde(default)]
+    pub enforce_policy_on_safety: bool,
 }
 
 /// Policy default action.
@@ -936,7 +973,6 @@ pub enum PolicyAction {
     Allow,
     Deny,
 }
-
 
 fn default_policy_action() -> PolicyAction {
     PolicyAction::Allow
@@ -1199,7 +1235,7 @@ impl GatewayConfig {
             // load instead of at the first connection.
             {
                 let provider = rule.effective_security_provider();
-                if provider == "tls" || provider == "ktls" {
+                if provider == "tls" || provider == "ktls" || provider == "dtls" {
                     crate::security::tls_engine::params::TlsSecurityParams::from_params(
                         &rule.provider_params,
                         rule.protocol_version.as_deref(),
@@ -1428,20 +1464,19 @@ impl GatewayConfig {
             .rules
             .iter()
             .any(|r| r.effective_security_provider() == "ktls");
-        if has_ktls_rules
-            && fs::metadata("/proc/modules").is_ok() {
-                let modules = fs::read_to_string("/proc/modules").unwrap_or_default();
-                if !modules.contains("tls ") && !modules.contains("tls\t") {
-                    // Also check built-in via /proc/net/
-                    if fs::metadata("/proc/sys/net/tls").is_err() {
-                        warnings.push(
-                            "kTLS rules configured but kernel TLS module not loaded \
+        if has_ktls_rules && fs::metadata("/proc/modules").is_ok() {
+            let modules = fs::read_to_string("/proc/modules").unwrap_or_default();
+            if !modules.contains("tls ") && !modules.contains("tls\t") {
+                // Also check built-in via /proc/net/
+                if fs::metadata("/proc/sys/net/tls").is_err() {
+                    warnings.push(
+                        "kTLS rules configured but kernel TLS module not loaded \
                              (try: modprobe tls). kTLS will fall back to userspace TLS."
-                                .to_string(),
-                        );
-                    }
+                            .to_string(),
+                    );
                 }
             }
+        }
 
         // Check for kernel WireGuard prerequisites (module, `wg`/`ip` tools,
         // CAP_NET_ADMIN). Warn (not fail) so config can be validated on an
@@ -1659,6 +1694,91 @@ impl GatewayConfig {
             }
         }
 
+        // ── TLS/DTLS verification-posture warnings (advisory, never fatal) ──
+        // `verify: none` stays legal for back-compat, but unverified upstreams
+        // (MITM, CWE-295) and decrypt listeners that do not authenticate clients
+        // (CWE-306) are surfaced at --validate and startup so operators notice.
+        for rule in &self.rules {
+            let provider = rule.effective_security_provider();
+            if provider != "tls" && provider != "ktls" && provider != "dtls" {
+                continue;
+            }
+            let params = match crate::security::tls_engine::params::TlsSecurityParams::from_params(
+                &rule.provider_params,
+                rule.protocol_version.as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(_) => continue, // parse errors are reported by validate()
+            };
+            use crate::security::tls_engine::params::VerifyMode;
+            match rule.direction {
+                Direction::Encrypt => {
+                    if params.verify == VerifyMode::None
+                        && !upstream_is_loopback(&rule.upstream_addr)
+                    {
+                        warnings.push(format!(
+                            "Rule '{}': encrypt upstream '{}' is contacted without peer \
+                             verification (verify: none) — an on-path attacker can impersonate \
+                             it. Set verify: server (or mutual) with ca_path to authenticate it.",
+                            rule.name, rule.upstream_addr
+                        ));
+                    }
+                }
+                Direction::Decrypt => {
+                    if params.verify != VerifyMode::Mutual {
+                        warnings.push(format!(
+                            "Rule '{}': decrypt listener does not require client certificates \
+                             (verify != mutual) — the plaintext relayed upstream originates from \
+                             unauthenticated peers. Set verify: mutual to require client auth.",
+                            rule.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // ── Safety-classification scope warning (advisory) ──────────────────
+        // Safety traffic bypasses the policy whitelist by default (a railway
+        // availability requirement). Binding a `safety` traffic-rule to a wide /
+        // non-loopback source lets a spoofed source obtain the bypass, which is
+        // also the precondition for the overflow-thread DoS. Flag it so the
+        // operator scopes safety classification to trusted sources.
+        for (i, tr) in self.traffic_rules.iter().enumerate() {
+            if tr.traffic_class == TrafficClass::Safety && is_wide_untrusted_source(&tr.source) {
+                warnings.push(format!(
+                    "traffic_rules[{}] (app_id '{}'): classifies a wide/non-loopback source '{}' \
+                     as safety, which bypasses the policy whitelist by default. Scope safety \
+                     classification to trusted sources, or set policy.enforce_policy_on_safety.",
+                    i, tr.app_id, tr.source
+                ));
+            }
+        }
+
+        // ── Management-API TCP-bind posture warning (advisory) ──────────────
+        // The optional gRPC TCP bind carries no transport auth or encryption,
+        // and the read RPCs (Health/ListRules) are reachable unauthenticated
+        // over it (#41; ListRules is now gated by #40, but Health and the lack
+        // of transport encryption remain). Endpoint creation is still refused
+        // over TCP, but an operator should know they are exposing an
+        // unauthenticated control surface — especially on a non-loopback bind.
+        if let Some(tcp) = self.api.as_ref().and_then(|a| a.tcp_addr.as_ref()) {
+            let non_loopback = tcp
+                .parse::<std::net::SocketAddr>()
+                .map(|a| !a.ip().is_loopback())
+                .unwrap_or(true);
+            let scope = if non_loopback {
+                "a NON-LOOPBACK address, reachable by remote network clients"
+            } else {
+                "a loopback address"
+            };
+            warnings.push(format!(
+                "Management API TCP bind '{}' is enabled on {} with no transport \
+                 authentication or encryption (endpoint creation is still refused \
+                 over TCP). Prefer UDS-only, or place the bind behind mTLS/loopback.",
+                tcp, scope
+            ));
+        }
+
         (warnings, errors)
     }
 
@@ -1810,36 +1930,42 @@ impl GatewayConfig {
         info!("===================================");
     }
 
-    /// Diff two configs: return (added_rules, removed_rules, unchanged_rules).
-    /// Rules are matched by name.
+    /// Diff two configs into added / removed / changed / unchanged rule buckets.
+    ///
+    /// Rules are matched by name. A same-name rule whose security-relevant fields
+    /// changed (see [`RuleConfig::reload_differs`]) lands in `changed` and is
+    /// applied as a remove + add by the reload path, so an edit that switches the
+    /// security provider, retargets the upstream, or tightens posture is actually
+    /// re-applied (previously such edits were classified `unchanged` and silently
+    /// ignored — CWE-693).
     pub fn diff(&self, new: &GatewayConfig) -> ConfigDiff {
-        let old_names: Vec<&str> = self.rules.iter().map(|r| r.name.as_str()).collect();
-        let new_names: Vec<&str> = new.rules.iter().map(|r| r.name.as_str()).collect();
+        let old_by_name: std::collections::HashMap<&str, &RuleConfig> =
+            self.rules.iter().map(|r| (r.name.as_str(), r)).collect();
+        let new_names: std::collections::HashSet<&str> =
+            new.rules.iter().map(|r| r.name.as_str()).collect();
 
-        let added: Vec<RuleConfig> = new
-            .rules
-            .iter()
-            .filter(|r| !old_names.contains(&r.name.as_str()))
-            .cloned()
-            .collect();
+        let mut added = Vec::new();
+        let mut changed = Vec::new();
+        let mut unchanged = Vec::new();
+        for r in &new.rules {
+            match old_by_name.get(r.name.as_str()) {
+                None => added.push(r.clone()),
+                Some(old) if old.reload_differs(r) => changed.push(r.clone()),
+                Some(_) => unchanged.push(r.name.clone()),
+            }
+        }
 
         let removed: Vec<String> = self
             .rules
             .iter()
-            .filter(|r| !new_names.contains(&r.name.as_str()))
-            .map(|r| r.name.clone())
-            .collect();
-
-        let unchanged: Vec<String> = self
-            .rules
-            .iter()
-            .filter(|r| new_names.contains(&r.name.as_str()))
+            .filter(|r| !new_names.contains(r.name.as_str()))
             .map(|r| r.name.clone())
             .collect();
 
         ConfigDiff {
             added,
             removed,
+            changed,
             unchanged,
         }
     }
@@ -1848,9 +1974,59 @@ impl GatewayConfig {
 /// Result of diffing two configurations.
 #[derive(Debug)]
 pub struct ConfigDiff {
+    /// Rules present only in the new config (start them).
     pub added: Vec<RuleConfig>,
+    /// Names present only in the old config (stop them).
     pub removed: Vec<String>,
+    /// Same-name rules whose security-relevant fields changed (restart them).
+    pub changed: Vec<RuleConfig>,
+    /// Same-name rules with no security-relevant change (leave running).
     pub unchanged: Vec<String>,
+}
+
+/// Best-effort: does this `host:port` upstream point at loopback? Used only to
+/// decide whether to *warn* about an unverified upstream, so it is conservative
+/// — an unresolved hostname or `"auto"` (transparent, no static host) is treated
+/// as non-loopback and thus warned about.
+fn upstream_is_loopback(upstream_addr: &str) -> bool {
+    if upstream_addr == "auto" {
+        return false;
+    }
+    let host = match crate::security::tls_engine::params::host_of(upstream_addr) {
+        Some(h) => h,
+        None => return false,
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Heuristic for the safety-classification warning: a source pattern that is
+/// `any`, a CIDR wider than a single host, or a non-loopback literal is
+/// considered "wide/untrusted" and worth flagging. Loopback and single-host
+/// trusted literals are not flagged.
+fn is_wide_untrusted_source(source: &str) -> bool {
+    let s = source.trim();
+    if s.eq_ignore_ascii_case("any") || s == "*" {
+        return true;
+    }
+    // CIDR: wide unless it is a single-host prefix (/32 v4, /128 v6).
+    if let Some((_, prefix)) = s.split_once('/') {
+        return !matches!(prefix.trim(), "32" | "128");
+    }
+    // Bare host/IP[:port]: trusted only if it is a loopback literal.
+    let host = crate::security::tls_engine::params::host_of(s).unwrap_or_else(|| s.to_string());
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        // Unresolved hostname: treat as wide/untrusted (conservative).
+        Err(_) => true,
+    }
 }
 
 /// Decode a hex string to bytes, returning an error on odd length or non-hex
@@ -1952,6 +2128,177 @@ mod dscp_tests {
         .expect("deserialize config");
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("dscp_tag"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_covers_dtls_provider_params() {
+        // DTLS rules are now parsed at validate time (closing a gap where a bad
+        // DTLS param only failed at first connection). A zero session cap is
+        // rejected here.
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "dtls-bad",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:6000",
+                "listen_proto": "udp",
+                "upstream_addr": "127.0.0.1:6001",
+                "upstream_proto": "udp",
+                "security_provider": "dtls",
+                "protocol_version": "dtls1.2",
+                "verify": "none",
+                "max_sessions": 0
+            }]
+        }))
+        .expect("deserialize config");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("max_sessions"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_dtls_missing_verify() {
+        // Fail-secure: a default-profile DTLS rule must set `verify` explicitly.
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "dtls-noverify",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:6000",
+                "listen_proto": "udp",
+                "upstream_addr": "127.0.0.1:6001",
+                "upstream_proto": "udp",
+                "security_provider": "dtls",
+                "protocol_version": "dtls1.2"
+            }]
+        }))
+        .expect("deserialize config");
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("verify"), "unexpected error: {err}");
+    }
+
+    fn config_with_rule(extra: serde_json::Value) -> GatewayConfig {
+        let mut rule = serde_json::json!({
+            "name": "r",
+            "direction": "encrypt",
+            "listen_addr": "127.0.0.1:8080",
+            "upstream_addr": "backend:443",
+            "security_provider": "tls",
+            "verify": "none"
+        });
+        if let (Some(b), Some(e)) = (rule.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(serde_json::json!({ "rules": [rule] })).expect("deserialize config")
+    }
+
+    #[test]
+    fn diff_flags_changed_upstream_and_provider() {
+        let base = config_with_rule(serde_json::json!({}));
+
+        // Retargeted upstream → changed (not unchanged).
+        let new_upstream = config_with_rule(serde_json::json!({ "upstream_addr": "other:443" }));
+        let d = base.diff(&new_upstream);
+        assert_eq!(d.changed.len(), 1, "upstream change must be detected");
+        assert!(d.unchanged.is_empty() && d.added.is_empty() && d.removed.is_empty());
+
+        // Switched verify mode (provider_params) → changed.
+        let new_verify = config_with_rule(serde_json::json!({ "verify": "server" }));
+        let d = base.diff(&new_verify);
+        assert_eq!(d.changed.len(), 1, "verify-mode change must be detected");
+    }
+
+    #[test]
+    fn diff_ignores_perf_only_edits() {
+        let base = config_with_rule(serde_json::json!({}));
+        // A perf-only knob change must NOT restart the listener.
+        let tuned = config_with_rule(serde_json::json!({ "sock_buf_size": 1048576 }));
+        let d = base.diff(&tuned);
+        assert!(
+            d.changed.is_empty(),
+            "perf-only edit should not be a security-relevant change"
+        );
+        assert_eq!(d.unchanged, vec!["r".to_string()]);
+    }
+
+    #[test]
+    fn diff_tracks_added_and_removed() {
+        let base = config_with_rule(serde_json::json!({}));
+        let empty: GatewayConfig =
+            serde_json::from_value(serde_json::json!({ "rules": [] })).unwrap();
+        // Rule removed.
+        let d = base.diff(&empty);
+        assert_eq!(d.removed, vec!["r".to_string()]);
+        // Rule added.
+        let d = empty.diff(&base);
+        assert_eq!(d.added.len(), 1);
+        assert_eq!(d.added[0].name, "r");
+    }
+
+    fn warnings_of(cfg: &GatewayConfig) -> Vec<String> {
+        cfg.preflight_check().0
+    }
+
+    #[test]
+    fn preflight_warns_on_unverified_remote_encrypt() {
+        // encrypt + verify:none + non-loopback upstream → MITM warning.
+        let cfg = config_with_rule(serde_json::json!({ "upstream_addr": "backend:443" }));
+        assert!(
+            warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("without peer verification")),
+            "expected an unverified-upstream warning"
+        );
+    }
+
+    #[test]
+    fn preflight_silent_on_loopback_encrypt() {
+        // A loopback upstream is trusted — no MITM warning.
+        let cfg = config_with_rule(serde_json::json!({ "upstream_addr": "127.0.0.1:9000" }));
+        assert!(
+            !warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("without peer verification")),
+            "loopback upstream should not warn"
+        );
+    }
+
+    #[test]
+    fn preflight_warns_on_unauthenticated_decrypt() {
+        // decrypt + non-mutual verify → unauthenticated-client warning.
+        let cfg = config_with_rule(serde_json::json!({
+            "direction": "decrypt",
+            "verify": "server"
+        }));
+        assert!(
+            warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("does not require client certificates")),
+            "expected an unauthenticated-decrypt warning"
+        );
+    }
+
+    #[test]
+    fn preflight_silent_on_mutual_decrypt() {
+        let cfg = config_with_rule(serde_json::json!({
+            "direction": "decrypt",
+            "verify": "mutual"
+        }));
+        assert!(
+            !warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("does not require client certificates")),
+            "mutual decrypt should not warn"
+        );
+    }
+
+    #[test]
+    fn enforce_policy_on_safety_defaults_false() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [],
+            "policy": { "default_action": "deny" }
+        }))
+        .expect("deserialize config");
+        assert!(!cfg.policy.unwrap().enforce_policy_on_safety);
     }
 
     #[test]

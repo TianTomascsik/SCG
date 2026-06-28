@@ -57,7 +57,8 @@ impl TestPki {
         b.set_subject_name(&ca_name).unwrap();
         b.set_issuer_name(&ca_name).unwrap();
         b.set_pubkey(&ca_key).unwrap();
-        b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
         b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
             .unwrap();
         b.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
@@ -82,7 +83,8 @@ impl TestPki {
         b.set_subject_name(&name("localhost")).unwrap();
         b.set_issuer_name(ca_cert.subject_name()).unwrap();
         b.set_pubkey(&server_key).unwrap();
-        b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
         b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
             .unwrap();
         b.append_extension(BasicConstraints::new().build().unwrap())
@@ -115,7 +117,8 @@ impl TestPki {
         b.set_subject_name(&name("test-client")).unwrap();
         b.set_issuer_name(ca_cert.subject_name()).unwrap();
         b.set_pubkey(&client_key).unwrap();
-        b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
         b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
             .unwrap();
         b.append_extension(BasicConstraints::new().build().unwrap())

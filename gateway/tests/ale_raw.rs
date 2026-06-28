@@ -137,7 +137,14 @@ fn ale_udp_over_tls_round_trip() {
     let backend = PlainUdpEchoServer::start();
     let enc_listen = format!("127.0.0.1:{}", free_port());
     let dec_listen = format!("127.0.0.1:{}", free_port());
-    let config = chain_config(&tmp, &pki, &enc_listen, &dec_listen, &backend.addr, Some("ale"));
+    let config = chain_config(
+        &tmp,
+        &pki,
+        &enc_listen,
+        &dec_listen,
+        &backend.addr,
+        Some("ale"),
+    );
 
     run(&config, || {
         let echoed = udp_round_trip(&enc_listen, b"ale-datagram")
@@ -156,7 +163,14 @@ fn raw_udp_over_tls_round_trip() {
     let backend = PlainUdpEchoServer::start();
     let enc_listen = format!("127.0.0.1:{}", free_port());
     let dec_listen = format!("127.0.0.1:{}", free_port());
-    let config = chain_config(&tmp, &pki, &enc_listen, &dec_listen, &backend.addr, Some("raw"));
+    let config = chain_config(
+        &tmp,
+        &pki,
+        &enc_listen,
+        &dec_listen,
+        &backend.addr,
+        Some("raw"),
+    );
 
     run(&config, || {
         let echoed = udp_round_trip(&enc_listen, b"raw-datagram")
@@ -175,13 +189,23 @@ fn raw_preserves_large_datagram() {
     let backend = PlainUdpEchoServer::start();
     let enc_listen = format!("127.0.0.1:{}", free_port());
     let dec_listen = format!("127.0.0.1:{}", free_port());
-    let config = chain_config(&tmp, &pki, &enc_listen, &dec_listen, &backend.addr, Some("raw"));
+    let config = chain_config(
+        &tmp,
+        &pki,
+        &enc_listen,
+        &dec_listen,
+        &backend.addr,
+        Some("raw"),
+    );
 
     let payload: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
     run(&config, || {
         let echoed = udp_round_trip(&enc_listen, &payload)
             .expect("a large raw-framed datagram should round-trip intact");
-        assert_eq!(echoed, payload, "raw framing must preserve the datagram verbatim");
+        assert_eq!(
+            echoed, payload,
+            "raw framing must preserve the datagram verbatim"
+        );
     });
     let _ = std::fs::remove_dir_all(&tmp);
 }

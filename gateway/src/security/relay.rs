@@ -273,10 +273,9 @@ pub fn relay_tls_to_udp(
                 }
             }
             // Flush batched frames to TLS in a single write
-            if !batch_buf.is_empty()
-                && write_all_nb_proxy(tls_stream, &batch_buf).is_err() {
-                    return Ok(());
-                }
+            if !batch_buf.is_empty() && write_all_nb_proxy(tls_stream, &batch_buf).is_err() {
+                return Ok(());
+            }
         }
     }
 

@@ -17,6 +17,9 @@ struct CompiledWhitelistEntry {
 pub struct PolicyManager {
     default_action: PolicyAction,
     entries: Vec<CompiledWhitelistEntry>,
+    /// When true, Safety traffic is also subject to the whitelist/default-deny
+    /// instead of being unconditionally allowed (opt-in; default false).
+    enforce_policy_on_safety: bool,
 }
 
 impl PolicyManager {
@@ -40,25 +43,30 @@ impl PolicyManager {
                 Self {
                     default_action: cfg.default_action,
                     entries,
+                    enforce_policy_on_safety: cfg.enforce_policy_on_safety,
                 }
             }
             None => Self {
                 default_action: PolicyAction::Deny,
                 entries: Vec::new(),
+                enforce_policy_on_safety: false,
             },
         }
     }
 
     /// Check if a flow is allowed by the policy.
-    /// Safety traffic is always allowed regardless of policy.
+    ///
+    /// Safety traffic is allowed unconditionally by default (fail-open for
+    /// railway availability); set `enforce_policy_on_safety` to also subject it
+    /// to the whitelist/default-deny.
     pub fn check_allowed(
         &self,
         src: &SocketAddr,
         dst: &SocketAddr,
         traffic_class: TrafficClass,
     ) -> bool {
-        // Safety traffic always passes
-        if traffic_class == TrafficClass::Safety {
+        // Safety traffic passes unconditionally unless enforcement is opted in.
+        if traffic_class == TrafficClass::Safety && !self.enforce_policy_on_safety {
             return true;
         }
 
@@ -83,6 +91,7 @@ impl PolicyManager {
         let new = PolicyManager::new(config);
         self.default_action = new.default_action;
         self.entries = new.entries;
+        self.enforce_policy_on_safety = new.enforce_policy_on_safety;
     }
 }
 
@@ -111,12 +120,18 @@ mod tests {
         ));
     }
 
+    /// Build a `PolicyConfig` for tests with the safety-enforcement opt-in off.
+    fn policy(default_action: PolicyAction, whitelist: Vec<WhitelistEntry>) -> PolicyConfig {
+        PolicyConfig {
+            default_action,
+            whitelist,
+            enforce_policy_on_safety: false,
+        }
+    }
+
     #[test]
     fn test_safety_always_allowed() {
-        let cfg = PolicyConfig {
-            default_action: PolicyAction::Deny,
-            whitelist: vec![],
-        };
+        let cfg = policy(PolicyAction::Deny, vec![]);
         let pm = PolicyManager::new(Some(&cfg));
         // Normal traffic denied
         assert!(!pm.check_allowed(
@@ -133,14 +148,47 @@ mod tests {
     }
 
     #[test]
-    fn test_whitelist_match() {
+    fn safety_enforced_when_opted_in() {
+        // With the opt-in, Safety traffic is subject to the whitelist/default-deny.
+        let cfg = PolicyConfig {
+            default_action: PolicyAction::Deny,
+            whitelist: vec![],
+            enforce_policy_on_safety: true,
+        };
+        let pm = PolicyManager::new(Some(&cfg));
+        // Safety is now DENIED by default-deny.
+        assert!(!pm.check_allowed(
+            &addr("10.0.0.1:1234"),
+            &addr("10.0.0.2:443"),
+            TrafficClass::Safety
+        ));
+
+        // A whitelisted safety flow still passes under enforcement.
         let cfg = PolicyConfig {
             default_action: PolicyAction::Deny,
             whitelist: vec![WhitelistEntry {
+                source: "10.0.0.0/8".into(),
+                destination: "any".into(),
+            }],
+            enforce_policy_on_safety: true,
+        };
+        let pm = PolicyManager::new(Some(&cfg));
+        assert!(pm.check_allowed(
+            &addr("10.0.0.1:1234"),
+            &addr("10.0.0.2:443"),
+            TrafficClass::Safety
+        ));
+    }
+
+    #[test]
+    fn test_whitelist_match() {
+        let cfg = policy(
+            PolicyAction::Deny,
+            vec![WhitelistEntry {
                 source: "127.0.0.0/8".into(),
                 destination: "any".into(),
             }],
-        };
+        );
         let pm = PolicyManager::new(Some(&cfg));
         assert!(pm.check_allowed(
             &addr("127.0.0.1:5000"),
@@ -156,13 +204,13 @@ mod tests {
 
     #[test]
     fn test_deny_default_no_match() {
-        let cfg = PolicyConfig {
-            default_action: PolicyAction::Deny,
-            whitelist: vec![WhitelistEntry {
+        let cfg = policy(
+            PolicyAction::Deny,
+            vec![WhitelistEntry {
                 source: "192.168.0.0/16".into(),
                 destination: "any".into(),
             }],
-        };
+        );
         let pm = PolicyManager::new(Some(&cfg));
         assert!(!pm.check_allowed(
             &addr("10.0.0.1:1234"),
@@ -173,10 +221,7 @@ mod tests {
 
     #[test]
     fn test_allow_default_empty_whitelist() {
-        let cfg = PolicyConfig {
-            default_action: PolicyAction::Allow,
-            whitelist: vec![],
-        };
+        let cfg = policy(PolicyAction::Allow, vec![]);
         let pm = PolicyManager::new(Some(&cfg));
         assert!(pm.check_allowed(
             &addr("10.0.0.1:1234"),
@@ -187,10 +232,7 @@ mod tests {
 
     #[test]
     fn test_reload() {
-        let cfg1 = PolicyConfig {
-            default_action: PolicyAction::Allow,
-            whitelist: vec![],
-        };
+        let cfg1 = policy(PolicyAction::Allow, vec![]);
         let mut pm = PolicyManager::new(Some(&cfg1));
         assert!(pm.check_allowed(
             &addr("10.0.0.1:1234"),
@@ -198,10 +240,7 @@ mod tests {
             TrafficClass::Normal
         ));
 
-        let cfg2 = PolicyConfig {
-            default_action: PolicyAction::Deny,
-            whitelist: vec![],
-        };
+        let cfg2 = policy(PolicyAction::Deny, vec![]);
         pm.reload(Some(&cfg2));
         assert!(!pm.check_allowed(
             &addr("10.0.0.1:1234"),

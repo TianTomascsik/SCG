@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
-    let out = PathBuf::from(&crate_dir).join("include").join("scg_client.h");
+    let out = PathBuf::from(&crate_dir)
+        .join("include")
+        .join("scg_client.h");
 
     let config = cbindgen::Config::from_root_or_default(&crate_dir);
     match cbindgen::Builder::new()

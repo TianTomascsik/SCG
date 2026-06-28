@@ -232,9 +232,8 @@ pub(crate) fn handle_tcp_decrypt(
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let mut ssl = Ssl::new(acceptor.context()).map_err(|e| {
-                io::Error::other(format!("kTLS SSL new: {}", e))
-            })?;
+            let mut ssl = Ssl::new(acceptor.context())
+                .map_err(|e| io::Error::other(format!("kTLS SSL new: {}", e)))?;
             ssl.set_accept_state();
             // SAFETY: `ssl.as_ptr()` yields the raw `SSL*` of the locally owned,
             // freshly created `ssl` (still alive and not moved for this call);
@@ -242,9 +241,8 @@ pub(crate) fn handle_tcp_decrypt(
             unsafe {
                 enable_ktls_ssl(ssl.as_ptr());
             }
-            let mut session = KtlsSession::new(ssl, fd as libc::c_int).map_err(|e| {
-                io::Error::other(format!("kTLS session: {}", e))
-            })?;
+            let mut session = KtlsSession::new(ssl, fd as libc::c_int)
+                .map_err(|e| io::Error::other(format!("kTLS session: {}", e)))?;
             session
                 .accept()
                 .map_err(|e| io::Error::other(format!("kTLS accept: {}", e)))?;
@@ -282,15 +280,13 @@ pub(crate) fn handle_tcp_decrypt(
 
     // ── Connect to upstream (plain) ──────────────────────────────────────────
     match upstream_proto {
-        Proto::Uds | Proto::Shm => {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "upstream protocol {} is not valid on the TLS decrypt path",
-                    upstream_proto
-                ),
-            ))
-        }
+        Proto::Uds | Proto::Shm => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "upstream protocol {} is not valid on the TLS decrypt path",
+                upstream_proto
+            ),
+        )),
         Proto::Tcp => {
             let upstream = connect_with_retry(
                 upstream_addr,
@@ -444,9 +440,7 @@ pub(crate) fn handle_tcp_decrypt(
                 let au2_data = au2_info.encode(&[]);
                 ale_writer
                     .write_alepkt(&mut tls_stream, ALE_PKT_AU2, &au2_data)
-                    .map_err(|e| {
-                        io::Error::other(format!("ALE AU2 send: {}", e))
-                    })?;
+                    .map_err(|e| io::Error::other(format!("ALE AU2 send: {}", e)))?;
 
                 info!("[{}] ALE handshake complete (responder)", rule_name);
             }

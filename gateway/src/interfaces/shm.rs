@@ -49,6 +49,7 @@ use scg_ipc::token::CapabilityToken;
 
 use log::{debug, error, info, warn};
 
+use std::collections::HashMap;
 use std::io::{self};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -56,7 +57,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 /// Everything a SHM endpoint thread needs to authenticate a client, hand it the
 /// ring descriptors, and relay framed traffic.
@@ -258,7 +258,10 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
     // descriptors. The eventfds stay open for the relay.
     seg.close_memfds();
 
-    debug!("[{}] SHM descriptors delivered; connecting upstream", task.label);
+    debug!(
+        "[{}] SHM descriptors delivered; connecting upstream",
+        task.label
+    );
 
     let tls = match task.direction {
         Direction::Encrypt => connect_tls_upstream(
@@ -389,7 +392,10 @@ fn relay(
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        e.to_string(),
+                                    ))
                                 }
                             }
                         }
@@ -423,9 +429,7 @@ fn push_g2c(
             }
             Ok(None) => {
                 if shutdown.load(Ordering::Relaxed) {
-                    return Err(io::Error::other(
-                        "shutdown while gateway->client ring full",
-                    ));
+                    return Err(io::Error::other("shutdown while gateway->client ring full"));
                 }
                 // Nudge the client in case it is waiting, then back off.
                 seg.signal_g2c(true);
@@ -496,22 +500,21 @@ impl ShmSegment {
         let page = page_size();
 
         // Resolve geometry and the control-page size for the chosen ring kind.
-        let (ring_kind, capacity, segment_size, cap_c2g, cap_g2c, ctl_len) =
-            match task.ring_kind {
-                ShmRingKind::ByteStream => {
-                    let c2g = round_up(task.cap_c2g.max(page), page);
-                    let g2c = round_up(task.cap_g2c.max(page), page);
-                    let ctl = round_up(SHM_CONTROL_SIZE, page);
-                    (SHM_RING_BYTESTREAM, 0u32, 0u32, c2g, g2c, ctl)
-                }
-                ShmRingKind::Slot => {
-                    let cap = (task.num_segments.max(2)).next_power_of_two();
-                    let seg_sz = round_up(task.segment_size.max(segment_size_for(0)), CACHE_LINE);
-                    let data = round_up(ring_data_bytes(cap, seg_sz).max(page), page);
-                    let ctl = round_up(slot_control_size(cap).max(page), page);
-                    (SHM_RING_SLOT, cap as u32, seg_sz as u32, data, data, ctl)
-                }
-            };
+        let (ring_kind, capacity, segment_size, cap_c2g, cap_g2c, ctl_len) = match task.ring_kind {
+            ShmRingKind::ByteStream => {
+                let c2g = round_up(task.cap_c2g.max(page), page);
+                let g2c = round_up(task.cap_g2c.max(page), page);
+                let ctl = round_up(SHM_CONTROL_SIZE, page);
+                (SHM_RING_BYTESTREAM, 0u32, 0u32, c2g, g2c, ctl)
+            }
+            ShmRingKind::Slot => {
+                let cap = (task.num_segments.max(2)).next_power_of_two();
+                let seg_sz = round_up(task.segment_size.max(segment_size_for(0)), CACHE_LINE);
+                let data = round_up(ring_data_bytes(cap, seg_sz).max(page), page);
+                let ctl = round_up(slot_control_size(cap).max(page), page);
+                (SHM_RING_SLOT, cap as u32, seg_sz as u32, data, data, ctl)
+            }
+        };
 
         let g2c_notify = match (task.ring_kind, task.g2c_notify) {
             (ShmRingKind::Slot, ShmNotify::Futex) => SHM_NOTIFY_FUTEX,
@@ -756,9 +759,21 @@ fn poll_relay(
     timeout_ms: i32,
 ) -> io::Result<(bool, bool, bool)> {
     let mut fds = [
-        libc::pollfd { fd: tls_fd, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: evt_fd, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: ctl_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: tls_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: evt_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: ctl_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     let timeout = if tls_pending { 0 } else { timeout_ms };
 
@@ -778,8 +793,8 @@ fn poll_relay(
         break;
     }
 
-    let tls_ready = tls_pending
-        || (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0;
+    let tls_ready =
+        tls_pending || (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0;
     let evt_ready = (fds[1].revents & libc::POLLIN) != 0;
     // The client never sends on the control socket after the handshake, so any
     // readiness there means it closed (POLLHUP) or errored.
@@ -789,7 +804,11 @@ fn poll_relay(
 
 /// Poll a single fd for readability with a timeout; retries on `EINTR`.
 fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     loop {
         // SAFETY: `pfd` is a live, fully initialised `pollfd` on the stack, so the
         // pointer is valid for a single-element array (count `1`); `poll` only

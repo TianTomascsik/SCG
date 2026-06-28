@@ -21,7 +21,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::pki::TestPki;
-use common::{connect_tcp_with_retry, free_port, load_single_rule, run_rules, temp_dir, PlainEchoServer};
+use common::{
+    connect_tcp_with_retry, free_port, load_single_rule, run_rules, temp_dir, PlainEchoServer,
+};
 
 use gateway::management::config::GatewayConfig;
 use gateway::security::tls_engine::params::openssl_supports_null_cipher;
@@ -133,10 +135,7 @@ fn ktls_integrity_only_rejected_at_config_load() {
         "protocol_version": "tls1.2",
         "profile": "integrity-only"
     }"#;
-    let json = format!(
-        r#"{{ "rules": [{rule}] }}"#,
-        rule = rule,
-    );
+    let json = format!(r#"{{ "rules": [{rule}] }}"#, rule = rule,);
     let path = tmp.join("gw.json");
     std::fs::write(&path, json).unwrap();
 

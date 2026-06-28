@@ -58,7 +58,10 @@ fn uds_and_shm_round_trip_through_gateway() {
             .expect("UDS recv")
             .expect("UDS round-trip timed out");
         assert_eq!(msg.0, 7, "UDS traffic id should be preserved");
-        assert_eq!(&msg.1, b"hello-over-uds", "UDS payload should echo verbatim");
+        assert_eq!(
+            &msg.1, b"hello-over-uds",
+            "UDS payload should echo verbatim"
+        );
 
         client.close().expect("UDS close");
     }

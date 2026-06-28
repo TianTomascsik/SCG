@@ -466,6 +466,10 @@ fn run_plain_udp_relay(ctx: &RuleContext, upstream: &str) -> Result<(), String> 
     let mut rev_buf = vec![0u8; UDP_BUF_SIZE];
     let mut last_client: Option<SocketAddr> = None;
 
+    // Resolve the (single, fixed) upstream once for the per-datagram policy
+    // gate (#38). The WG relay forwards every datagram to this one destination.
+    let policy_dst: Option<SocketAddr> = upstream_sock.peer_addr().ok();
+
     ctx.metrics.connection_opened();
     info!(
         "[{}] WireGuard relay up: {} <-> {} (kernel-encrypted)",
@@ -487,7 +491,26 @@ fn run_plain_udp_relay(ctx: &RuleContext, upstream: &str) -> Result<(), String> 
             loop {
                 match recvmsg_from_with_dscp(listen_fd, &mut fwd_buf) {
                     Ok((n, peer, _dscp)) => {
-                        last_client = Some(peer);
+                        // Pin the relay to its first source (#39). WireGuard is a
+                        // single logical gateway-to-gateway flow; a second source
+                        // would be forwarded and, worse, receive the first
+                        // client's reverse replies via `last_client` (cross-flow
+                        // leak — CWE-200, the class fixed for UDP-over-TLS in #7).
+                        if !accept_source(&mut last_client, peer) {
+                            debug!(
+                                "[{}] ignoring datagram from {} (relay pinned to {:?})",
+                                ctx.rule_name, peer, last_client
+                            );
+                            continue;
+                        }
+                        // Default-deny / whitelist gate, uniform with every other
+                        // relay direction (#38). Without it the WG provider would
+                        // silently bypass the configured policy whitelist.
+                        if let Some(dst) = policy_dst {
+                            if !ctx.classify_and_check_policy(&peer, &dst) {
+                                continue; // policy denied -- drop
+                            }
+                        }
                         apply_geo_delay(ctx.simulated_delay_ms);
                         if let Err(e) = upstream_sock.send(&fwd_buf[..n]) {
                             if e.kind() != io::ErrorKind::WouldBlock {
@@ -584,6 +607,24 @@ pub(crate) fn run_wireguard_decrypt_relay(ctx: &RuleContext) -> Result<(), Strin
     run_wireguard_relay(ctx)
 }
 
+/// Pin the WireGuard plaintext relay to its first source address.
+///
+/// Returns whether `src` is the bound source, binding it on the first call. The
+/// relay carries a single logical gateway-to-gateway flow and keeps one return
+/// address (`last_client`); accepting a second source would forward its
+/// datagrams and let the first client's reverse replies be delivered to it
+/// (cross-flow leak — CWE-200). Mirrors the UDP-over-TLS guard (`accept_source`
+/// in `tls_engine::encrypt`) hardened in register #7; see #39.
+fn accept_source(bound: &mut Option<SocketAddr>, src: SocketAddr) -> bool {
+    match *bound {
+        None => {
+            *bound = Some(src);
+            true
+        }
+        Some(b) => b == src,
+    }
+}
+
 // =============================================================================
 //                                  Tests
 // =============================================================================
@@ -607,6 +648,22 @@ mod tests {
         p.insert("tunnel_local_ip".into(), json!("10.0.0.1/32"));
         p.insert("peer_allowed_ips".into(), json!("10.0.0.2/32"));
         p
+    }
+
+    #[test]
+    fn accept_source_pins_first_and_rejects_others() {
+        let a: SocketAddr = "10.0.0.2:1000".parse().unwrap();
+        let b: SocketAddr = "10.0.0.3:1000".parse().unwrap();
+        let mut bound: Option<SocketAddr> = None;
+        // First source binds and is accepted.
+        assert!(accept_source(&mut bound, a));
+        assert_eq!(bound, Some(a));
+        // Same source keeps being accepted.
+        assert!(accept_source(&mut bound, a));
+        // A distinct second source is rejected (no cross-flow, #39).
+        assert!(!accept_source(&mut bound, b));
+        // The return address stays pinned to the first source.
+        assert_eq!(bound, Some(a));
     }
 
     #[test]

@@ -514,7 +514,7 @@ pub fn bind_tcp_listener(addr: &str, transparent: bool, rule_name: &str) -> Opti
             }
         }
     } else {
-        match TcpListener::bind(addr) {
+        match bind_retry_addr_in_use(|| TcpListener::bind(addr)) {
             Ok(l) => {
                 info!("[{}] TCP listener on {}", rule_name, addr);
                 Some(l)
@@ -525,6 +525,26 @@ pub fn bind_tcp_listener(addr: &str, transparent: bool, rule_name: &str) -> Opti
             }
         }
     }
+}
+
+/// Retry a bind briefly while it fails with `AddrInUse`, so a hot-reload restart
+/// of a changed rule can rebind a port the previous (non-`SO_REUSEADDR`) listener
+/// is still releasing. Other errors fail immediately. ~2 s total before giving up.
+fn bind_retry_addr_in_use<T, F: Fn() -> io::Result<T>>(bind: F) -> io::Result<T> {
+    const ATTEMPTS: u32 = 20;
+    const DELAY: Duration = Duration::from_millis(100);
+    let mut last: Option<io::Error> = None;
+    for _ in 0..ATTEMPTS {
+        match bind() {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                last = Some(e);
+                std::thread::sleep(DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "bind retries exhausted")))
 }
 
 /// Bind a UDP socket, optionally with TPROXY transparent mode.
@@ -542,7 +562,7 @@ pub fn bind_udp_socket(addr: &str, transparent: bool, rule_name: &str) -> Option
             }
         }
     } else {
-        match UdpSocket::bind(addr) {
+        match bind_retry_addr_in_use(|| UdpSocket::bind(addr)) {
             Ok(s) => {
                 info!("[{}] UDP socket on {}", rule_name, addr);
                 Some(s)

@@ -48,7 +48,9 @@ impl EventFd {
         // successful `eventfd(2)` (the `fd < 0` error path returned above) and
         // is not owned by anything else, so transferring sole ownership to the
         // new `OwnedFd` upholds its single-owner invariant.
-        Ok(EventFd { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
+        Ok(EventFd {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
     }
 
     /// Wrap an already-owned eventfd descriptor (e.g. one received over a
@@ -58,7 +60,9 @@ impl EventFd {
     /// `fd` must be a valid, owned eventfd descriptor that nothing else will
     /// close.
     pub unsafe fn from_raw_fd(fd: RawFd) -> EventFd {
-        EventFd { fd: OwnedFd::from_raw_fd(fd) }
+        EventFd {
+            fd: OwnedFd::from_raw_fd(fd),
+        }
     }
 
     /// Signal the eventfd, incrementing its counter by one (wakes one poller).
@@ -69,9 +73,8 @@ impl EventFd {
             // pointer/len pair points to a fully-initialised local `u64` (`val`)
             // that lives for the duration of the call and matches the 8-byte
             // length passed. The return value is checked below.
-            let ret = unsafe {
-                libc::write(self.fd.as_raw_fd(), &val as *const u64 as *const c_void, 8)
-            };
+            let ret =
+                unsafe { libc::write(self.fd.as_raw_fd(), &val as *const u64 as *const c_void, 8) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -97,9 +100,8 @@ impl EventFd {
             // `u64` (`val`) that lives for the duration of the call and is large
             // enough for the 8 bytes the kernel writes. The return value is
             // checked below.
-            let ret = unsafe {
-                libc::read(self.fd.as_raw_fd(), &mut val as *mut u64 as *mut c_void, 8)
-            };
+            let ret =
+                unsafe { libc::read(self.fd.as_raw_fd(), &mut val as *mut u64 as *mut c_void, 8) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -133,12 +135,18 @@ impl From<OwnedFd> for EventFd {
 ///
 /// Spurious wakeups are possible; callers must re-check their condition. A
 /// `None` timeout blocks indefinitely.
-pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Option<std::time::Duration>) -> io::Result<()> {
+pub fn futex_wait(
+    word: &AtomicU32,
+    expected: u32,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
     let ts = timeout.map(|d| libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: d.subsec_nanos() as _,
     });
-    let ts_ptr = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
+    let ts_ptr = ts
+        .as_ref()
+        .map_or(std::ptr::null(), |t| t as *const libc::timespec);
 
     // SAFETY: `word.as_ptr()` is a valid, properly-aligned pointer to a live
     // `AtomicU32` borrowed for the duration of this call, which is exactly the

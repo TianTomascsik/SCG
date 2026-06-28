@@ -266,9 +266,10 @@ pub fn create_transparent_udp_socket(addr: &str) -> io::Result<UdpSocket> {
         unsafe {
             libc::close(fd);
         }
-        return Err(io::Error::other(
-            format!("IP_RECVORIGDSTADDR failed: {}", e),
-        ));
+        return Err(io::Error::other(format!(
+            "IP_RECVORIGDSTADDR failed: {}",
+            e
+        )));
     }
 
     let sa = match sock_addr {

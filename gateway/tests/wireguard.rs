@@ -67,7 +67,18 @@ fn udp_round_trip(gateway: &str, payload: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Write a multi-rule config to `tmp/gw.json`, then load + validate it.
 fn load_rules(tmp: &Path, rules: &[String]) -> GatewayConfig {
-    let json = format!(r#"{{ "rules": [{}] }}"#, rules.join(","));
+    load_rules_with_policy(tmp, rules, None)
+}
+
+/// Build a config from `rules`, optionally embedding a `policy` block. With no
+/// policy the gateway is deny-by-default (`PolicyManager::new(None)`), so a
+/// round-trip test must pass an allow policy to exercise the WireGuard relay's
+/// policy gate (#38) in its allow path; omitting it exercises the deny path.
+fn load_rules_with_policy(tmp: &Path, rules: &[String], policy: Option<&str>) -> GatewayConfig {
+    let policy_field = policy
+        .map(|p| format!(r#""policy": {p}, "#))
+        .unwrap_or_default();
+    let json = format!(r#"{{ {policy_field}"rules": [{}] }}"#, rules.join(","));
     let path = tmp.join("gw.json");
     std::fs::write(&path, json).unwrap();
     GatewayConfig::load(path.to_str().unwrap()).expect("config validates")
@@ -163,11 +174,72 @@ fn wireguard_relay_round_trip_external_interface() {
         false,
     );
 
-    let config = load_rules(&tmp, &[encrypt, decrypt]);
+    // Allow policy so the relay's policy gate (#38) admits normal-class traffic.
+    let config = load_rules_with_policy(
+        &tmp,
+        &[encrypt, decrypt],
+        Some(r#"{ "default_action": "allow" }"#),
+    );
     run(&config, || {
         let echoed = udp_round_trip(&enc_listen, b"wg-relay-payload")
             .expect("datagram should round-trip through the WireGuard relay pair");
         assert_eq!(echoed, b"wg-relay-payload");
+    });
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The WireGuard plaintext relay must enforce the policy whitelist / default-deny
+/// like every other relay direction (#38). Under the deny-by-default policy
+/// (no `policy` block) a `normal`-class datagram must NOT round-trip.
+#[test]
+fn wireguard_relay_policy_denied_is_not_forwarded() {
+    let tmp = temp_dir("wg-deny");
+    let echo = PlainUdpEchoServer::start();
+
+    let p_enc = free_port();
+    let p_dec = free_port();
+    let wg_a = free_port();
+    let wg_b = free_port();
+    let enc_listen = format!("127.0.0.1:{p_enc}");
+    let dec_listen = format!("127.0.0.1:{p_dec}");
+
+    let encrypt = wg_rule(
+        "wg-enc-d",
+        "encrypt",
+        &enc_listen,
+        &dec_listen,
+        "wg-deny-a",
+        A_PRIV,
+        B_PUB,
+        wg_a,
+        &format!("127.0.0.1:{wg_b}"),
+        "10.0.0.1/32",
+        "10.0.0.2/32",
+        false,
+    );
+    let decrypt = wg_rule(
+        "wg-dec-d",
+        "decrypt",
+        &dec_listen,
+        &echo.addr,
+        "wg-deny-b",
+        B_PRIV,
+        A_PUB,
+        wg_b,
+        &format!("127.0.0.1:{wg_a}"),
+        "10.0.0.2/32",
+        "10.0.0.1/32",
+        false,
+    );
+
+    // No policy block => deny-by-default; the normal-class flow is dropped at
+    // the gate and never reaches the echo backend.
+    let config = load_rules(&tmp, &[encrypt, decrypt]);
+    run(&config, || {
+        assert!(
+            udp_round_trip(&enc_listen, b"denied-payload").is_err(),
+            "policy-denied WireGuard traffic must not round-trip (#38)"
+        );
     });
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -82,7 +82,14 @@ pub fn load_with_warnings(
     merge::apply_templates(&mut merged);
 
     // ── Integrity (fail-closed, before trusting any mapped content) ──────────
-    verify_integrity(dir, &defaults_path, &user_path, &schema_path, &merged, pubkey_override)?;
+    verify_integrity(
+        dir,
+        &defaults_path,
+        &user_path,
+        &schema_path,
+        &merged,
+        pubkey_override,
+    )?;
 
     // ── Map connections → rules ─────────────────────────────────────────────
     let MappedRules { rules, warnings } = mapping::map_connections_to_rules(&merged)?;
@@ -152,10 +159,14 @@ fn verify_integrity(
     pubkey_override: Option<&Path>,
 ) -> Result<(), String> {
     let pubkey_path = resolve_pubkey(dir, pubkey_override)?;
-    let pubkey_pem = fs::read(&pubkey_path)
-        .map_err(|e| format!("[integrity] cannot read public key {}: {e}", pubkey_path.display()))?;
-    let pubkey = integrity::load_ed25519_public_pem(&pubkey_pem)
-        .map_err(|e| format!("[integrity] {e}"))?;
+    let pubkey_pem = fs::read(&pubkey_path).map_err(|e| {
+        format!(
+            "[integrity] cannot read public key {}: {e}",
+            pubkey_path.display()
+        )
+    })?;
+    let pubkey =
+        integrity::load_ed25519_public_pem(&pubkey_pem).map_err(|e| format!("[integrity] {e}"))?;
 
     let suffix = sig_suffix(merged);
     for cfg in [defaults_path, user_path] {
@@ -168,8 +179,12 @@ fn verify_integrity(
         .pointer("/runtime/config_manager/schema_sha256")
         .and_then(|v| v.as_str())
         .ok_or("[integrity] runtime.config_manager.schema_sha256 is missing")?;
-    let schema_bytes = fs::read(schema_path)
-        .map_err(|e| format!("[integrity] cannot read schema {}: {e}", schema_path.display()))?;
+    let schema_bytes = fs::read(schema_path).map_err(|e| {
+        format!(
+            "[integrity] cannot read schema {}: {e}",
+            schema_path.display()
+        )
+    })?;
     let actual = integrity::sha256_hex(&schema_bytes).map_err(|e| format!("[integrity] {e}"))?;
     if !pinned.eq_ignore_ascii_case(&actual) {
         return Err(format!(
@@ -206,7 +221,11 @@ mod tests {
         let mut signer = Signer::new_without_digest(key).unwrap();
         let sig = signer.sign_oneshot_to_vec(&data).unwrap();
         let b64 = openssl::base64::encode_block(&sig);
-        fs::write(integrity::sig_path_for(path, integrity::DEFAULT_SIG_SUFFIX), b64).unwrap();
+        fs::write(
+            integrity::sig_path_for(path, integrity::DEFAULT_SIG_SUFFIX),
+            b64,
+        )
+        .unwrap();
     }
 
     /// A minimal, self-consistent signed fixture: schema, defaults (with the
@@ -218,7 +237,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // Schema content is opaque to the Rust loader (only its hash matters).
-        let schema = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
+        let schema =
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
         let schema_path = dir.join(SCHEMA_FILE);
         fs::write(&schema_path, schema).unwrap();
         let schema_hash = integrity::sha256_hex(schema.as_bytes()).unwrap();
@@ -285,7 +305,11 @@ mod tests {
 
         let defaults_path = dir.join(DEFAULTS_FILE);
         let user_path = dir.join(USER_FILE);
-        fs::write(&defaults_path, serde_json::to_vec_pretty(&defaults).unwrap()).unwrap();
+        fs::write(
+            &defaults_path,
+            serde_json::to_vec_pretty(&defaults).unwrap(),
+        )
+        .unwrap();
         fs::write(&user_path, serde_json::to_vec_pretty(&user).unwrap()).unwrap();
 
         let key = PKey::generate_ed25519().unwrap();
@@ -319,7 +343,11 @@ mod tests {
             Some("peer.example")
         );
 
-        let transp = config.rules.iter().find(|r| r.name == "c-transparent").unwrap();
+        let transp = config
+            .rules
+            .iter()
+            .find(|r| r.name == "c-transparent")
+            .unwrap();
         assert!(transp.transparent);
         assert_eq!(transp.upstream_addr, "auto");
 
@@ -405,7 +433,11 @@ mod tests {
             "expected a multi-path warning, got: {warnings:?}"
         );
         // The integrity-only connection maps its primary (lowest-priority) path.
-        let integ = config.rules.iter().find(|r| r.name == "c-integrity").unwrap();
+        let integ = config
+            .rules
+            .iter()
+            .find(|r| r.name == "c-integrity")
+            .unwrap();
         assert_eq!(integ.upstream_addr, "h1.example:443");
     }
 

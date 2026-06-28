@@ -16,6 +16,17 @@
       "protocol_version": "tls1.2"
     },
     {
+      "name": "web-encrypt-tls-verified",
+      "direction": "encrypt",
+      "listen_addr": "0.0.0.0:8081",
+      "listen_proto": "tcp",
+      "upstream_addr": "backend:443",
+      "security_provider": "tls",
+      "verify": "server",
+      "ca_path": "/etc/scg/ca.pem",
+      "protocol_version": "tls1.3"
+    },
+    {
       "name": "web-decrypt-tls",
       "direction": "decrypt",
       "listen_addr": "0.0.0.0:8443",
@@ -62,7 +73,10 @@
       "listen_addr": "0.0.0.0:6000",
       "listen_proto": "udp",
       "upstream_addr": "collector:6000",
-      "security_provider": "dtls"
+      "security_provider": "dtls",
+      "verify": "none",
+      "max_sessions": 1024,
+      "idle_ttl_secs": 60
     },
     {
       "name": "sensor-decrypt-dtls",
@@ -70,7 +84,8 @@
       "listen_addr": "0.0.0.0:6001",
       "listen_proto": "udp",
       "upstream_addr": "localhost:6000",
-      "security_provider": "dtls"
+      "security_provider": "dtls",
+      "verify": "none"
     },
     {
       "name": "wg-encrypt-REQUIRES-CAP_NET_ADMIN-and-wireguard-module",
@@ -229,7 +244,8 @@
     "whitelist": [
       { "source": "127.0.0.0/8", "destination": "any" },
       { "source": "10.0.0.0/8", "destination": "any" }
-    ]
+    ],
+    "enforce_policy_on_safety": false
   },
   "cache": {
     "max_entries": 10000,

@@ -20,6 +20,8 @@
 //! | `psk_hex` | string | PSK key as hex (for `subset146-psk`) |
 //! | `cipher_list` | string | Advanced override for TLS ≤ 1.2 cipher list |
 //! | `ciphersuites` | string | Advanced override for TLS 1.3 ciphersuites |
+//! | `max_sessions` | integer | DTLS only: max concurrent peer sessions (admission control) |
+//! | `idle_ttl_secs` | integer | DTLS only: idle session eviction timeout (seconds) |
 //!
 //! `protocol_version` (a first-class rule field) selects the protocol version
 //! (`tls1.2`/`tls1.3`/`dtls1.0`/`dtls1.2`).
@@ -27,6 +29,14 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Default ceiling on concurrent DTLS sessions for a DTLS encrypt relay. Bounds
+/// memory/socket/handshake-CPU growth under a source-address-spoofing flood.
+pub const DEFAULT_DTLS_MAX_SESSIONS: usize = 1024;
+
+/// Default idle timeout (seconds) after which a DTLS session is evicted so a
+/// flood of short-lived peers cannot pin resources indefinitely.
+pub const DEFAULT_DTLS_IDLE_TTL_SECS: u64 = 60;
 
 /// Peer-verification policy for a TLS/DTLS rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +123,13 @@ pub struct TlsSecurityParams {
     /// reconnects; leaving it `false` forces a full handshake on every
     /// connection. Default: `false` (opt-in).
     pub resumption: bool,
+    /// Maximum concurrent DTLS sessions (distinct peer addresses) a DTLS encrypt
+    /// relay will hold. Admission control against source-spoofing floods; the
+    /// userspace TLS path ignores it. Default: [`DEFAULT_DTLS_MAX_SESSIONS`].
+    pub max_sessions: usize,
+    /// Idle time (seconds) after which an inactive DTLS session is evicted to
+    /// reclaim its socket/buffers. Default: [`DEFAULT_DTLS_IDLE_TTL_SECS`].
+    pub idle_ttl_secs: u64,
 }
 
 impl std::fmt::Debug for TlsSecurityParams {
@@ -128,11 +145,16 @@ impl std::fmt::Debug for TlsSecurityParams {
             .field("key_path", &self.key_path)
             .field("ca_path", &self.ca_path)
             .field("server_name", &self.server_name)
-            .field("psk_identity", &self.psk_identity.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "psk_identity",
+                &self.psk_identity.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("psk_key", &self.psk_key.as_ref().map(|_| "[REDACTED]"))
             .field("cipher_list", &self.cipher_list)
             .field("ciphersuites", &self.ciphersuites)
             .field("resumption", &self.resumption)
+            .field("max_sessions", &self.max_sessions)
+            .field("idle_ttl_secs", &self.idle_ttl_secs)
             .finish()
     }
 }
@@ -152,6 +174,8 @@ impl Default for TlsSecurityParams {
             cipher_list: None,
             ciphersuites: None,
             resumption: false,
+            max_sessions: DEFAULT_DTLS_MAX_SESSIONS,
+            idle_ttl_secs: DEFAULT_DTLS_IDLE_TTL_SECS,
         }
     }
 }
@@ -229,6 +253,28 @@ impl TlsSecurityParams {
             None => false,
         };
 
+        // DTLS admission-control knobs (ignored by the userspace TLS path).
+        // Accept a JSON number or a numeric string, like `resumption`.
+        let max_sessions = match params.get("max_sessions") {
+            Some(v) => {
+                let n = v
+                    .as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| "max_sessions must be a positive integer".to_string())?;
+                usize::try_from(n).map_err(|_| "max_sessions is too large".to_string())?
+            }
+            None => DEFAULT_DTLS_MAX_SESSIONS,
+        };
+        let idle_ttl_secs = match params.get("idle_ttl_secs") {
+            Some(v) => v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                .filter(|&n| n > 0)
+                .ok_or_else(|| "idle_ttl_secs must be a positive integer".to_string())?,
+            None => DEFAULT_DTLS_IDLE_TTL_SECS,
+        };
+
         let parsed = TlsSecurityParams {
             version: protocol_version.map(str::to_string),
             profile,
@@ -242,6 +288,8 @@ impl TlsSecurityParams {
             cipher_list,
             ciphersuites,
             resumption,
+            max_sessions,
+            idle_ttl_secs,
         };
         parsed.validate()?;
         Ok(parsed)
@@ -347,7 +395,7 @@ impl TlsSecurityParams {
 }
 
 /// Extract the host portion of a `HOST:PORT` string (handles IPv6 `[::1]:port`).
-fn host_of(addr: &str) -> Option<String> {
+pub(crate) fn host_of(addr: &str) -> Option<String> {
     let addr = addr.trim();
     if addr.is_empty() || addr == "auto" {
         return None;
@@ -431,10 +479,16 @@ mod secret_redaction_tests {
             "psk_identity leaked into Debug output: {s}"
         );
         // 0xde == 222 decimal — the byte rendering a derived Debug would emit.
-        assert!(!s.contains("222"), "psk_key bytes leaked into Debug output: {s}");
+        assert!(
+            !s.contains("222"),
+            "psk_key bytes leaked into Debug output: {s}"
+        );
         assert!(s.contains("REDACTED"), "expected redaction marker: {s}");
         // Presence is still conveyed.
-        assert!(s.contains("psk_key: Some"), "presence should be visible: {s}");
+        assert!(
+            s.contains("psk_key: Some"),
+            "presence should be visible: {s}"
+        );
     }
 
     #[test]
@@ -519,6 +573,35 @@ mod tests {
     fn resumption_rejects_non_boolean() {
         let m = params_from(&[("verify", json!("none")), ("resumption", json!("maybe"))]);
         assert!(TlsSecurityParams::from_params(&m, None).is_err());
+    }
+
+    #[test]
+    fn session_limits_default_when_absent() {
+        let m = params_from(&[("verify", json!("none"))]);
+        let p = TlsSecurityParams::from_params(&m, None).unwrap();
+        assert_eq!(p.max_sessions, DEFAULT_DTLS_MAX_SESSIONS);
+        assert_eq!(p.idle_ttl_secs, DEFAULT_DTLS_IDLE_TTL_SECS);
+    }
+
+    #[test]
+    fn session_limits_accept_number_and_string() {
+        let m = params_from(&[
+            ("verify", json!("none")),
+            ("max_sessions", json!(32)),
+            ("idle_ttl_secs", json!("90")),
+        ]);
+        let p = TlsSecurityParams::from_params(&m, None).unwrap();
+        assert_eq!(p.max_sessions, 32);
+        assert_eq!(p.idle_ttl_secs, 90);
+    }
+
+    #[test]
+    fn session_limits_reject_zero_and_junk() {
+        let zero = params_from(&[("verify", json!("none")), ("max_sessions", json!(0))]);
+        assert!(TlsSecurityParams::from_params(&zero, None).is_err());
+
+        let junk = params_from(&[("verify", json!("none")), ("idle_ttl_secs", json!("soon"))]);
+        assert!(TlsSecurityParams::from_params(&junk, None).is_err());
     }
 
     #[test]

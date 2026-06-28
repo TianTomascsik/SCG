@@ -58,8 +58,12 @@ pub fn encode_into(out: &mut Vec<u8>, traffic_id: u32, data: &[u8]) {
 pub fn write_frame<W: Write>(w: &mut W, traffic_id: u32, data: &[u8]) -> io::Result<()> {
     // Checked conversion: a payload larger than u32::MAX cannot be represented in
     // the length field, so reject it rather than truncate (corrupting the frame).
-    let len = u32::try_from(data.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame payload exceeds u32::MAX"))?;
+    let len = u32::try_from(data.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame payload exceeds u32::MAX",
+        )
+    })?;
     let hdr = encode_header(len, traffic_id);
     w.write_all(&hdr)?;
     w.write_all(data)?;
@@ -76,7 +80,10 @@ pub fn read_frame<R: Read>(r: &mut R, max_len: usize) -> io::Result<Option<(u32,
     match read_full_or_eof(r, &mut hdr)? {
         ReadOutcome::Eof => return Ok(None),
         ReadOutcome::Partial => {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated frame header"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated frame header",
+            ));
         }
         ReadOutcome::Full => {}
     }
@@ -111,7 +118,11 @@ fn read_full_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadOutcom
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
-                return Ok(if filled == 0 { ReadOutcome::Eof } else { ReadOutcome::Partial });
+                return Ok(if filled == 0 {
+                    ReadOutcome::Eof
+                } else {
+                    ReadOutcome::Partial
+                });
             }
             Ok(n) => filled += n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -238,19 +249,27 @@ mod tests {
         write_frame(&mut buf, 1, &[0xAB; 1000]).unwrap();
 
         let mut cur = Cursor::new(buf);
-        let (tid, data) = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN).unwrap().unwrap();
+        let (tid, data) = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .unwrap();
         assert_eq!(tid, 7);
         assert_eq!(data, b"hello");
 
-        let (tid, data) = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN).unwrap().unwrap();
+        let (tid, data) = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .unwrap();
         assert_eq!(tid, 42);
         assert!(data.is_empty());
 
-        let (tid, data) = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN).unwrap().unwrap();
+        let (tid, data) = read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .unwrap();
         assert_eq!(tid, 1);
         assert_eq!(data.len(), 1000);
 
-        assert!(read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN).unwrap().is_none());
+        assert!(read_frame(&mut cur, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

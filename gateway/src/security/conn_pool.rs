@@ -18,7 +18,7 @@ use crate::networking::socket_manager::apply_safety_priority;
 use log::{debug, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -27,6 +27,13 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// pool, so safety relays always have dedicated capacity even on low-CPU hosts
 /// where `default_size()` would otherwise be tiny.
 const SAFETY_MIN_WORKERS: usize = 2;
+
+/// Ceiling on concurrently-live overflow threads for a safety pool. Bounds the
+/// blast radius of a connection storm: without it, every job submitted while
+/// the base workers are busy spawns a fresh OS thread, so a flood can exhaust
+/// thread/stack/scheduler resources. Over-cap jobs queue on the base workers
+/// instead of spawning. Sized for bursty storms without unbounded growth.
+const DEFAULT_MAX_OVERFLOW: usize = 64;
 
 /// An elastic thread pool for connection handling.
 ///
@@ -43,6 +50,11 @@ const SAFETY_MIN_WORKERS: usize = 2;
 pub struct ConnectionPool {
     sender: mpsc::Sender<Job>,
     idle_count: Arc<AtomicUsize>,
+    /// Live overflow threads (spawned beyond the base workers). Bounded by
+    /// `max_overflow`; decremented when each overflow thread exits.
+    overflow_count: Arc<AtomicUsize>,
+    /// Maximum concurrently-live overflow threads (0 = no overflow allowed).
+    max_overflow: usize,
     name_prefix: String,
     class: TrafficClass,
     _workers: Vec<thread::JoinHandle<()>>,
@@ -56,9 +68,26 @@ impl ConnectionPool {
 
     /// Create a new pool for the given traffic `class`.
     ///
-    /// `Safety` pools reserve at least [`SAFETY_MIN_WORKERS`] base workers and
-    /// elevate the scheduling priority of every worker thread.
+    /// `Safety` pools reserve at least `SAFETY_MIN_WORKERS` base workers,
+    /// elevate the scheduling priority of every worker thread, and may spawn up
+    /// to `DEFAULT_MAX_OVERFLOW` overflow threads. Normal pools never overflow.
     pub fn new_for_class(size: usize, name_prefix: &str, class: TrafficClass) -> Self {
+        let max_overflow = if class == TrafficClass::Safety {
+            DEFAULT_MAX_OVERFLOW
+        } else {
+            0
+        };
+        Self::new_for_class_with_overflow(size, name_prefix, class, max_overflow)
+    }
+
+    /// Create a pool with an explicit overflow ceiling (used by tests to assert
+    /// the bound; production callers go through [`Self::new_for_class`]).
+    fn new_for_class_with_overflow(
+        size: usize,
+        name_prefix: &str,
+        class: TrafficClass,
+        max_overflow: usize,
+    ) -> Self {
         let size = if class == TrafficClass::Safety {
             size.max(SAFETY_MIN_WORKERS)
         } else {
@@ -101,6 +130,8 @@ impl ConnectionPool {
         ConnectionPool {
             sender,
             idle_count,
+            overflow_count: Arc::new(AtomicUsize::new(0)),
+            max_overflow,
             name_prefix: name_prefix.to_owned(),
             class,
             _workers: workers,
@@ -125,23 +156,74 @@ impl ConnectionPool {
             return self.queue_job(Box::new(f));
         }
 
-        // Slow path: all base workers busy → spawn overflow thread
+        // Slow path: all base workers busy → bounded overflow.
+        // Reserve a slot without exceeding the cap (lock-free CAS). Doing the
+        // bump *before* spawning guarantees the live-thread count can never
+        // exceed `max_overflow`, even under concurrent submitters.
+        let mut cur = self.overflow_count.load(Ordering::Acquire);
+        loop {
+            if cur >= self.max_overflow {
+                // Cap reached: queue on the base workers rather than spawning
+                // unbounded threads. The job is not dropped — it runs when a
+                // worker frees up — and safety capacity is preserved.
+                warn!(
+                    "{}: overflow cap {} reached; queueing job",
+                    self.name_prefix, self.max_overflow
+                );
+                return self.queue_job(Box::new(f));
+            }
+            match self.overflow_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+
         let prefix = self.name_prefix.clone();
         let class = self.class;
+        let counter = self.overflow_count.clone();
+        // Hold the job in a shared slot the overflow thread takes from. If the
+        // spawn fails the closure (and its clone of `pending`) is dropped having
+        // never run, so the caller can recover the job here and queue it for a
+        // base worker — never dropping it (the previous code sent an empty
+        // closure, silently losing the job on spawn failure).
+        let pending: Arc<Mutex<Option<Job>>> = Arc::new(Mutex::new(Some(Box::new(f))));
+        let pending_thread = pending.clone();
         match thread::Builder::new()
             .name(format!("{}-overflow", prefix))
             .spawn(move || {
+                // Release the reserved slot on *every* exit path, including an
+                // unwinding relay closure, so the counter stays balanced.
+                struct SlotGuard(Arc<AtomicUsize>);
+                impl Drop for SlotGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                let _slot = SlotGuard(counter);
                 // Overflow threads inherit the pool's class priority too.
                 apply_safety_priority(class);
                 debug!("pool overflow thread started");
-                f();
+                let job = pending_thread.lock().ok().and_then(|mut g| g.take());
+                if let Some(job) = job {
+                    job();
+                }
             }) {
             Ok(_) => true,
             Err(e) => {
+                // Spawn failed: release the reservation and queue the recovered
+                // job for the base workers rather than dropping it.
+                self.overflow_count.fetch_sub(1, Ordering::AcqRel);
                 warn!("connection pool: failed to spawn overflow thread: {}", e);
-                // Last resort: queue it anyway — it will run when a worker is freed
-                let _ = self.sender.send(Box::new(|| {}));
-                false
+                let job = pending.lock().ok().and_then(|mut g| g.take());
+                match job {
+                    Some(job) => self.queue_job(job),
+                    None => false,
+                }
             }
         }
     }
@@ -274,6 +356,96 @@ mod tests {
         );
 
         for tx in release_txs {
+            let _ = tx.send(());
+        }
+    }
+
+    #[test]
+    fn safety_pool_caps_overflow_threads() {
+        // max_overflow = 1: the first over-capacity safety job spawns an overflow
+        // thread; the next is *queued* (not spawned, not dropped) and runs when a
+        // base worker frees up. Live overflow threads never exceed the cap.
+        let pool = ConnectionPool::new_for_class_with_overflow(
+            2,
+            "test-safety-cap",
+            TrafficClass::Safety,
+            1,
+        );
+        let worker_count = pool._workers.len();
+        for _ in 0..200 {
+            if pool.idle_count.load(Ordering::SeqCst) >= worker_count {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Saturate every base worker with a blocking job.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut base_release = Vec::new();
+        for _ in 0..worker_count {
+            let started = started_tx.clone();
+            let (rel_tx, rel_rx) = std::sync::mpsc::channel::<()>();
+            base_release.push(rel_tx);
+            assert!(pool.execute(move || {
+                started.send(()).unwrap();
+                rel_rx.recv().unwrap();
+            }));
+        }
+        drop(started_tx);
+        for _ in 0..worker_count {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        // First over-capacity job → one overflow thread (which blocks).
+        let (ov_rel_tx, ov_rel_rx) = std::sync::mpsc::channel::<()>();
+        let ov_started = Arc::new(AtomicBool::new(false));
+        let ovs = ov_started.clone();
+        assert!(pool.execute(move || {
+            ovs.store(true, Ordering::SeqCst);
+            ov_rel_rx.recv().unwrap();
+        }));
+        for _ in 0..200 {
+            if ov_started.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ov_started.load(Ordering::SeqCst),
+            "first overflow job should start"
+        );
+        assert_eq!(pool.overflow_count.load(Ordering::SeqCst), 1);
+
+        // Second over-capacity job → cap reached → queued, must not start yet.
+        let queued_ran = Arc::new(AtomicBool::new(false));
+        let qr = queued_ran.clone();
+        assert!(pool.execute(move || qr.store(true, Ordering::SeqCst)));
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !queued_ran.load(Ordering::SeqCst),
+            "over-cap job must queue, not spawn another overflow thread"
+        );
+        assert!(
+            pool.overflow_count.load(Ordering::SeqCst) <= 1,
+            "live overflow threads must never exceed the cap"
+        );
+
+        // Free a base worker → the queued job runs (proving it was not dropped).
+        base_release.pop().unwrap().send(()).unwrap();
+        for _ in 0..200 {
+            if queued_ran.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            queued_ran.load(Ordering::SeqCst),
+            "queued over-cap job must eventually run on a freed base worker"
+        );
+
+        // Release the remaining blocked jobs.
+        let _ = ov_rel_tx.send(());
+        for tx in base_release {
             let _ = tx.send(());
         }
     }

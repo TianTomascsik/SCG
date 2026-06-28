@@ -60,7 +60,9 @@ fn map_traffic_class(v: i32) -> Result<TrafficClass, Status> {
     match v {
         0 => Ok(TrafficClass::Normal),
         1 => Ok(TrafficClass::Safety),
-        _ => Err(Status::invalid_argument(format!("unknown traffic_class {v}"))),
+        _ => Err(Status::invalid_argument(format!(
+            "unknown traffic_class {v}"
+        ))),
     }
 }
 
@@ -83,9 +85,13 @@ impl ManagementApi for ManagementService {
         let req = request.into_inner();
         let class = map_traffic_class(req.traffic_class)?;
         let direction = map_direction(req.direction)?;
-        let created =
-            self.manager
-                .create_uds(caller, &req.app_id, class, direction, req.ring_capacity as usize)?;
+        let created = self.manager.create_uds(
+            caller,
+            &req.app_id,
+            class,
+            direction,
+            req.ring_capacity as usize,
+        )?;
         Ok(Response::new(UdsEndpointResponse {
             socket_path: created.socket_path,
             token: created.token,
@@ -101,9 +107,13 @@ impl ManagementApi for ManagementService {
         let req = request.into_inner();
         let class = map_traffic_class(req.traffic_class)?;
         let direction = map_direction(req.direction)?;
-        let created =
-            self.manager
-                .create_shm(caller, &req.app_id, class, direction, req.ring_capacity as usize)?;
+        let created = self.manager.create_shm(
+            caller,
+            &req.app_id,
+            class,
+            direction,
+            req.ring_capacity as usize,
+        )?;
         Ok(Response::new(ShmEndpointResponse {
             token: created.token,
             endpoint_id: created.endpoint_id,
@@ -136,8 +146,13 @@ impl ManagementApi for ManagementService {
 
     async fn list_rules(
         &self,
-        _request: Request<ListRulesRequest>,
+        request: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
+        // ListRules discloses the full rule topology (names, app_ids, classes,
+        // listen/upstream protos). Require the same peer-authenticated UDS
+        // connection as the mutating RPCs so it is not readable over the
+        // optional, unauthenticated TCP bind (#40).
+        let _ = caller_cred(&request)?;
         Ok(Response::new(ListRulesResponse {
             rules: self.manager.list_rules(),
         }))

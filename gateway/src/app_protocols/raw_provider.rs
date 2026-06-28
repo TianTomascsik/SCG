@@ -105,7 +105,7 @@ mod tests {
         let provider = RawProtocolProvider;
         let mut session = provider.create_session();
         let hdr = u32::MAX.to_le_bytes(); // ~4 GiB advertised length
-        // DeframeResult is not Debug, so match instead of unwrap_err().
+                                          // DeframeResult is not Debug, so match instead of unwrap_err().
         match session.deframe(&hdr) {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
             Ok(_) => panic!("expected oversized datagram to be rejected"),

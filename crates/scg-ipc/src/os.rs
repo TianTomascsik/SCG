@@ -94,12 +94,18 @@ fn fill_random_urandom(buf: &mut [u8]) -> io::Result<()> {
 /// The returned descriptor is created with `MFD_CLOEXEC | MFD_ALLOW_SEALING`
 /// so that the gateway can later seal it read-only before sharing it.
 pub fn memfd_create(name: &str) -> io::Result<RawFd> {
-    let cname =
-        CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memfd name contains NUL"))?;
+    let cname = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "memfd name contains NUL"))?;
     // SAFETY: `cname.as_ptr()` is a valid NUL-terminated C string that outlives
     // the call (`cname` is still owned here); the flag bits are a valid
     // `memfd_create` mask and the returned descriptor is checked below.
-    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING) };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            cname.as_ptr(),
+            MFD_CLOEXEC | MFD_ALLOW_SEALING,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -205,22 +211,41 @@ impl Drop for Mapping {
 /// `mmap` a descriptor `MAP_SHARED` with the requested protection.
 pub fn mmap_shared(fd: RawFd, len: usize, prot: MapProt) -> io::Result<Mapping> {
     if len == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "mmap length must be non-zero"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mmap length must be non-zero",
+        ));
     }
     // SAFETY: a null hint lets the kernel choose the address; `len` is non-zero
     // (checked above); `prot.bits()` is a valid protection mask and `fd` is the
     // descriptor to map. The returned address is validated against `MAP_FAILED`
     // below before being wrapped in an owning `Mapping`.
-    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, prot.bits(), libc::MAP_SHARED, fd, 0) };
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            prot.bits(),
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    Ok(Mapping { ptr: ptr as *mut u8, len })
+    Ok(Mapping {
+        ptr: ptr as *mut u8,
+        len,
+    })
 }
 
 /// Read the peer credentials of a connected `AF_UNIX` stream socket.
 pub fn get_peer_cred(fd: RawFd) -> io::Result<PeerCred> {
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: `fd` is a connected socket descriptor supplied by the caller; the
     // option buffer points to the live, fully-initialised `cred` and `len`
@@ -238,7 +263,11 @@ pub fn get_peer_cred(fd: RawFd) -> io::Result<PeerCred> {
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(PeerCred { pid: cred.pid, uid: cred.uid, gid: cred.gid })
+    Ok(PeerCred {
+        pid: cred.pid,
+        uid: cred.uid,
+        gid: cred.gid,
+    })
 }
 
 /// Open a `pidfd` for the given process so the peer's liveness/identity can be
@@ -422,7 +451,9 @@ pub fn recv_with_fds(sock: RawFd, payload: &mut [u8]) -> io::Result<ReceivedFds>
 
     // SAFETY: `CMSG_SPACE` is a pure size computation over its scalar argument;
     // it dereferences no pointers.
-    let cmsg_space = unsafe { libc::CMSG_SPACE((MAX_PASSED_FDS * std::mem::size_of::<RawFd>()) as u32) } as usize;
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE((MAX_PASSED_FDS * std::mem::size_of::<RawFd>()) as u32) }
+            as usize;
     let mut cmsg_buf = vec![0u8; cmsg_space];
 
     // SAFETY: `libc::msghdr` is a plain C struct of integers and pointers for

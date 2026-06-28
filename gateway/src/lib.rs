@@ -44,9 +44,9 @@ use security::providers::ktls_provider::KtlsProvider;
 use security::providers::routing_provider::RoutingProvider;
 use security::providers::tls_provider::TlsProvider;
 use security::providers::wireguard_provider::WireguardProvider;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::path::{Path, PathBuf};
 
 /// Run the gateway runtime.
 ///
@@ -339,8 +339,11 @@ pub fn run(
     );
     let api_cfg = config.api.clone().unwrap_or_default();
     let mgmt_handle = if api_cfg.enabled {
-        match api::grpc::start_management_server(interface_manager.clone(), api_cfg, shutdown.clone())
-        {
+        match api::grpc::start_management_server(
+            interface_manager.clone(),
+            api_cfg,
+            shutdown.clone(),
+        ) {
             Ok(h) => Some(h),
             Err(e) => {
                 error!("Failed to start management API: {}", e);
@@ -364,6 +367,7 @@ pub fn run(
     let watcher_registry = registry.clone();
     let watcher_pipeline = pipeline.clone();
     let watcher_lifecycle_tx = lifecycle_tx.clone();
+    let watcher_interface_manager = interface_manager.clone();
 
     let _watcher_handle = spawn_config_watcher(shared_config, watcher_shutdown, move |diff| {
         // Stop removed rules
@@ -376,6 +380,12 @@ pub fn run(
 
         // Notify lifecycle orchestrator of config change
         let current_config = watcher_config.read();
+        // Re-apply UDS/SHM authorization from the new config so a tightened
+        // (or relaxed) allowed_uids/allowed_pids takes effect without a process
+        // restart. The InterfaceManager is otherwise built once at startup and
+        // would keep the stale allow-lists (#42). Cheap (a few templates) and
+        // safe to run on every reload.
+        watcher_interface_manager.reload_from_config(&current_config);
         let _ = watcher_lifecycle_tx.send(LifecycleEvent::ConfigChanged {
             diff: current_config.diff(&current_config), // Pass a fresh diff for the orchestrator
             new_policy: current_config.policy.clone(),
@@ -393,6 +403,44 @@ pub fn run(
                 watcher_pipeline.clone(),
             );
             // Note: handle is detached (thread runs independently)
+        }
+
+        // Restart changed rules: a same-name rule whose security/routing/framing
+        // fields changed must be torn down and recreated, otherwise the edit is
+        // silently ignored and traffic keeps running under the old posture
+        // (CWE-693). Stop the old listener, then start the new one;
+        // `start_single_rule` re-registers a fresh shutdown flag by name, and the
+        // listener bind retries briefly while the old socket is released.
+        for rule in &diff.changed {
+            if let Some(flag) = watcher_rule_shutdowns.lock().unwrap().get(&rule.name) {
+                flag.store(true, Ordering::SeqCst);
+            }
+            info!("Reloading changed rule: \"{}\"", rule.name);
+            let _handle = processing::start_single_rule(
+                rule,
+                &current_config,
+                watcher_global_shutdown.clone(),
+                watcher_rule_shutdowns.clone(),
+                watcher_registry.clone(),
+                watcher_pipeline.clone(),
+            );
+        }
+
+        // Firewall/iptables intercept rules are installed at startup only and are
+        // NOT reconciled here (the listener restart above does not touch the
+        // kernel chains). Warn loudly so an operator who edited an `intercept`
+        // block does not assume the new interception posture is live (#45).
+        if diff
+            .added
+            .iter()
+            .chain(diff.changed.iter())
+            .any(|r| r.intercept.is_some())
+        {
+            warn!(
+                "Config reload affected a rule with a transparent-intercept block; \
+                 firewall/iptables rules are applied at startup only and are NOT \
+                 hot-reloaded — RESTART the gateway for intercept changes to take effect."
+            );
         }
     });
 
@@ -431,12 +479,23 @@ pub fn run(
         })
         .ok();
 
+    // Block until a global shutdown is signaled (Ctrl-C / SIGTERM). The gateway's
+    // lifetime is governed by this flag, NOT by the original per-rule handles
+    // finishing: hot-reload adds/removes/restarts rules, and a restarted rule
+    // runs on a fresh (detached) thread while its original handle finishes. If we
+    // joined the original handles here, restarting or removing the *last* rule
+    // would end the wait and terminate the whole gateway. Waiting on the global
+    // flag keeps the gateway alive across reloads (this also covers the
+    // on-demand-interfaces-only case, where `handles` is empty).
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Shutdown signaled: drain the original listener threads and the management
+    // server best-effort (the watchdog force-exits if any thread hangs).
     for handle in handles {
         let _ = handle.join();
     }
-
-    // If only on-demand interfaces are configured (no static listeners above),
-    // block on the management server so the gateway stays alive until shutdown.
     if let Some(h) = mgmt_handle {
         let _ = h.join();
     }
@@ -516,7 +575,10 @@ fn write_stderr(msg: &[u8]) {
 }
 
 fn print_usage(prog: &str, registry: &ProviderRegistry) {
-    eprintln!("Usage: {} (--config PATH | --config-dir DIR) [OPTIONS]", prog);
+    eprintln!(
+        "Usage: {} (--config PATH | --config-dir DIR) [OPTIONS]",
+        prog
+    );
     eprintln!();
     eprintln!("  Transparent encryption proxy gateway with extensible provider architecture");
     eprintln!();
@@ -527,7 +589,9 @@ fn print_usage(prog: &str, registry: &ProviderRegistry) {
     eprintln!("  --config-pubkey PATH Ed25519 signing public key (trust anchor) for");
     eprintln!("                       --config-dir; defaults to DIR/trust/config-signing.pub.pem");
     eprintln!("  --validate           Validate config and environment, then exit");
-    eprintln!("  --log-level LVL      Set log level: error, warn, info, debug, trace (default: info)");
+    eprintln!(
+        "  --log-level LVL      Set log level: error, warn, info, debug, trace (default: info)"
+    );
     eprintln!("  --watch              Enable config hot-reload via file watching");
     eprintln!("  --log-stdout         Copy log output to stdout (for journald/containers)");
     eprintln!("  --help               Show this help");

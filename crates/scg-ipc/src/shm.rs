@@ -230,7 +230,8 @@ impl RingProducer {
         let mut off = (write % self.cap as u64) as usize;
         off = self.write_wrapping(off, &header);
         self.write_wrapping(off, data);
-        ix.write_idx.store(write.wrapping_add(total as u64), Ordering::Release);
+        ix.write_idx
+            .store(write.wrapping_add(total as u64), Ordering::Release);
         Ok(true)
     }
 
@@ -316,8 +317,10 @@ impl RingConsumer {
 
         let mut payload = vec![0u8; len];
         self.read_wrapping(next_off, &mut payload);
-        ix.read_idx
-            .store(read.wrapping_add((FRAME_HEADER_LEN + len) as u64), Ordering::Release);
+        ix.read_idx.store(
+            read.wrapping_add((FRAME_HEADER_LEN + len) as u64),
+            Ordering::Release,
+        );
         Some((traffic_id, payload))
     }
 
@@ -359,8 +362,10 @@ impl RingConsumer {
             self.read_wrapping_ptr(next_off, dst.as_mut_ptr(), len);
             dst.set_len(len);
         }
-        ix.read_idx
-            .store(read.wrapping_add((FRAME_HEADER_LEN + len) as u64), Ordering::Release);
+        ix.read_idx.store(
+            read.wrapping_add((FRAME_HEADER_LEN + len) as u64),
+            Ordering::Release,
+        );
         Some(traffic_id)
     }
 
@@ -400,8 +405,10 @@ impl RingConsumer {
         unsafe {
             self.read_wrapping_ptr(next_off, out.as_mut_ptr(), n);
         }
-        ix.read_idx
-            .store(read.wrapping_add((FRAME_HEADER_LEN + len) as u64), Ordering::Release);
+        ix.read_idx.store(
+            read.wrapping_add((FRAME_HEADER_LEN + len) as u64),
+            Ordering::Release,
+        );
         Some((traffic_id, n))
     }
 
@@ -718,7 +725,10 @@ mod tests {
         // writable `cap`-byte allocation; both outlive the handle and this test is
         // the sole producer of the ring.
         let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
-        assert_eq!(producer.try_push(1, &[0u8; 64]).unwrap_err(), ShmError::FrameTooLarge);
+        assert_eq!(
+            producer.try_push(1, &[0u8; 64]).unwrap_err(),
+            ShmError::FrameTooLarge
+        );
     }
 
     #[test]

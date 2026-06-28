@@ -55,12 +55,8 @@ pub fn apply_templates(merged: &mut Value) {
     let tmpl_mode;
     let app_class: HashMap<String, Value>;
     {
-        let conn_defaults = merged
-            .get("defaults")
-            .and_then(|d| d.get("connection"));
-        let prot_defaults = merged
-            .get("defaults")
-            .and_then(|d| d.get("protection"));
+        let conn_defaults = merged.get("defaults").and_then(|d| d.get("connection"));
+        let prot_defaults = merged.get("defaults").and_then(|d| d.get("protection"));
 
         tmpl_enabled = conn_defaults
             .and_then(|c| c.get("enabled"))
@@ -102,10 +98,7 @@ pub fn apply_templates(merged: &mut Value) {
             .unwrap_or_default();
     }
 
-    let Some(connections) = merged
-        .get_mut("connections")
-        .and_then(|c| c.as_array_mut())
-    else {
+    let Some(connections) = merged.get_mut("connections").and_then(|c| c.as_array_mut()) else {
         return;
     };
 
@@ -152,9 +145,7 @@ pub fn apply_templates(merged: &mut Value) {
                     p.entry("priority").or_insert_with(|| Value::from(0));
                 }
                 if let Some(egress) = p.get_mut("egress").and_then(|e| e.as_object_mut()) {
-                    egress
-                        .entry("source")
-                        .or_insert_with(|| tmpl_src.clone());
+                    egress.entry("source").or_insert_with(|| tmpl_src.clone());
                 }
                 if !p.contains_key("routing") {
                     let mut routing = Map::new();

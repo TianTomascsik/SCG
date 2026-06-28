@@ -24,7 +24,7 @@ use scg_ipc::shm_slot::{
     client_slot_rings, slot_control_size, PushOutcome, SlotConsumer, SlotProducer,
 };
 use scg_ipc::{
-    EventFd, CapabilityToken, Hello, Role, SHM_FD_CONTROL, SHM_FD_DATA_C2G, SHM_FD_DATA_G2C,
+    CapabilityToken, EventFd, Hello, Role, SHM_FD_CONTROL, SHM_FD_DATA_C2G, SHM_FD_DATA_G2C,
     SHM_FD_EVT_C2G, SHM_FD_EVT_G2C, SHM_OFFER_LEN,
 };
 

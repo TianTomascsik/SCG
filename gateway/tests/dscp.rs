@@ -49,13 +49,7 @@ fn wait_udp_dscp(sink: &DscpUdpSink) -> Option<u8> {
 /// Build a DTLS **decrypt** rule (gateway is the DTLS server). `qos` carries the
 /// optional per-rule QoS fields, e.g. `,"dscp_tag":10` or
 /// `,"preserve_inbound_dscp":true`.
-fn dtls_decrypt_rule(
-    name: &str,
-    listen: &str,
-    upstream: &str,
-    pki: &TestPki,
-    qos: &str,
-) -> String {
+fn dtls_decrypt_rule(name: &str, listen: &str, upstream: &str, pki: &TestPki, qos: &str) -> String {
     format!(
         r#"{{
             "name": "{name}",
@@ -163,7 +157,12 @@ fn dtls_explicit_tag_case(tag: &str, listen_host: &str, sink_bind: &str, client_
 
 #[test]
 fn dtls_decrypt_explicit_tag_ipv4() {
-    dtls_explicit_tag_case("dscp-dtls-tag-v4", "127.0.0.1", "127.0.0.1:0", "127.0.0.1:0");
+    dtls_explicit_tag_case(
+        "dscp-dtls-tag-v4",
+        "127.0.0.1",
+        "127.0.0.1:0",
+        "127.0.0.1:0",
+    );
 }
 
 #[test]
@@ -212,7 +211,12 @@ fn dtls_preserve_case(tag: &str, listen_host: &str, sink_bind: &str, client_bind
 
 #[test]
 fn dtls_decrypt_preserves_inbound_ipv4() {
-    dtls_preserve_case("dscp-dtls-pres-v4", "127.0.0.1", "127.0.0.1:0", "127.0.0.1:0");
+    dtls_preserve_case(
+        "dscp-dtls-pres-v4",
+        "127.0.0.1",
+        "127.0.0.1:0",
+        "127.0.0.1:0",
+    );
 }
 
 #[test]
@@ -320,6 +324,9 @@ fn dscp_tag_out_of_range_is_rejected() {
     let path = tmp.join("gw.json");
     std::fs::write(&path, json).unwrap();
     let res = GatewayConfig::load(path.to_str().unwrap());
-    assert!(res.is_err(), "dscp_tag > 63 must be rejected at config load");
+    assert!(
+        res.is_err(),
+        "dscp_tag > 63 must be rejected at config load"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -66,8 +66,7 @@ impl EchoServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
         let handle = std::thread::spawn(move || {
-            let acceptor =
-                build_tls_acceptor(&params).expect("build tls acceptor");
+            let acceptor = build_tls_acceptor(&params).expect("build tls acceptor");
             while !sd.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
@@ -304,7 +303,11 @@ pub fn run_rules(config: &GatewayConfig) -> (Vec<JoinHandle<()>>, Arc<AtomicBool
     let shutdown = Arc::new(AtomicBool::new(false));
     let pipeline = Arc::new(PipelineComponents {
         traffic_analyzer: None,
-        policy_manager: Arc::new(RwLock::new(PolicyManager::new(None))),
+        // Honor the config's policy block exactly as the real gateway does
+        // (lib.rs builds `PolicyManager::new(config.policy.as_ref())`). With no
+        // `policy` block this is `None` => deny-by-default, unchanged for
+        // existing tests; a test that sets a policy now sees it applied.
+        policy_manager: Arc::new(RwLock::new(PolicyManager::new(config.policy.as_ref()))),
     });
     let (handles, _rule_shutdowns) =
         start_rules(config, shutdown.clone(), built_in_registry(), pipeline);
@@ -325,10 +328,7 @@ pub fn connect_tcp_with_retry(addr: &str, attempts: usize) -> Option<TcpStream> 
 
 /// Write a single-rule gateway config to `tmp/gw.json`, then load + validate it.
 pub fn load_single_rule(tmp: &Path, rule: &str) -> GatewayConfig {
-    let json = format!(
-        r#"{{ "rules": [{rule}] }}"#,
-        rule = rule,
-    );
+    let json = format!(r#"{{ "rules": [{rule}] }}"#, rule = rule,);
     let path = tmp.join("gw.json");
     std::fs::write(&path, json).unwrap();
     GatewayConfig::load(path.to_str().unwrap()).expect("config validates")

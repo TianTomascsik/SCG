@@ -275,7 +275,8 @@ impl SlotProducer {
         }
 
         // Publish: mark the slot READY, then advance our own position.
-        self.seq_at(idx).store(pos.wrapping_add(1), Ordering::Release);
+        self.seq_at(idx)
+            .store(pos.wrapping_add(1), Ordering::Release);
         hdr.write_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
         Ok(PushOutcome::Pushed { was_empty })
     }
@@ -495,12 +496,7 @@ impl SlotConsumer {
 /// # Safety
 /// `base` must point at a writable control mapping of at least
 /// [`ring_control_bytes`] bytes for `capacity`, not concurrently accessed.
-unsafe fn init_ring_control(
-    base: *mut u8,
-    capacity: usize,
-    segment_size: usize,
-    flags: u32,
-) {
+unsafe fn init_ring_control(base: *mut u8, capacity: usize, segment_size: usize, flags: u32) {
     let hdr = base as *mut SlotRingHeader;
     std::ptr::write(
         hdr,
@@ -706,14 +702,12 @@ mod tests {
         // SAFETY: `hdr`/`seq` point into the live, initialised control allocation and
         // `data.ptr` maps `capacity * segment_size` writable bytes, all outliving the
         // returned handle; this test is the sole producer.
-        let producer =
-            unsafe { SlotProducer::new(hdr, seq, data.ptr, capacity, segment_size) };
+        let producer = unsafe { SlotProducer::new(hdr, seq, data.ptr, capacity, segment_size) };
         // SAFETY: `hdr`/`seq` point into the live, initialised control allocation and
         // `data.ptr` maps `capacity * segment_size` readable bytes, all outliving the
         // returned handle; this test is the sole consumer.
-        let consumer = unsafe {
-            SlotConsumer::new(hdr, seq, data.ptr as *const u8, capacity, segment_size)
-        };
+        let consumer =
+            unsafe { SlotConsumer::new(hdr, seq, data.ptr as *const u8, capacity, segment_size) };
         let _ = control.len;
         let _ = data.len;
         (control, data, producer, consumer)

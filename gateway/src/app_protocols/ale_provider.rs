@@ -132,9 +132,7 @@ impl FramingSession for AleSession {
                                 self.writer
                                     .write_alepkt(&mut buf, ALE_PKT_AU2, &au2_data)
                                     .map_err(|e| {
-                                        io::Error::other(
-                                            format!("ALE AU2 send: {}", e),
-                                        )
+                                        io::Error::other(format!("ALE AU2 send: {}", e))
                                     })?;
                                 stream.write_all(&buf)?;
                                 debug!("  ALE handshake complete (responder)");

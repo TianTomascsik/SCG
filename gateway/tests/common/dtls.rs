@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -83,14 +83,16 @@ impl DtlsEchoServer {
     ) -> DtlsEchoServer {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap().to_string();
-        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
 
         let (v, ciphers) = version_and_ciphers(version);
         let cert = X509::from_pem(&std::fs::read(cert).unwrap()).unwrap();
         let key = PKey::private_key_from_pem(&std::fs::read(key).unwrap()).unwrap();
         let client_ca = client_ca.map(|p| p.to_path_buf());
 
-        let mut builder = openssl::ssl::SslAcceptor::mozilla_intermediate(SslMethod::dtls()).unwrap();
+        let mut builder =
+            openssl::ssl::SslAcceptor::mozilla_intermediate(SslMethod::dtls()).unwrap();
         builder.set_certificate(&cert).unwrap();
         builder.set_private_key(&key).unwrap();
         builder.check_private_key().unwrap();
@@ -174,6 +176,7 @@ impl Drop for DtlsEchoServer {
 pub struct PlainUdpEchoServer {
     pub addr: String,
     shutdown: Arc<AtomicBool>,
+    received: Arc<AtomicUsize>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -181,14 +184,18 @@ impl PlainUdpEchoServer {
     pub fn start() -> PlainUdpEchoServer {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap().to_string();
-        sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(AtomicUsize::new(0));
         let sd = shutdown.clone();
+        let rx = received.clone();
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 2048];
             while !sd.load(Ordering::Relaxed) {
                 match sock.recv_from(&mut buf) {
                     Ok((n, peer)) => {
+                        rx.fetch_add(1, Ordering::SeqCst);
                         let _ = sock.send_to(&buf[..n], peer);
                     }
                     Err(_) => continue,
@@ -198,8 +205,15 @@ impl PlainUdpEchoServer {
         PlainUdpEchoServer {
             addr,
             shutdown,
+            received,
             handle: Some(handle),
         }
+    }
+
+    /// Number of datagrams this backend has received so far. A policy-denied
+    /// decrypt flow must never reach the backend, so this stays `0`.
+    pub fn received(&self) -> usize {
+        self.received.load(Ordering::SeqCst)
     }
 }
 
@@ -273,19 +287,24 @@ pub fn dtls_client_round_trip_opts(
     }
 
     let (v, ciphers) = version_and_ciphers(opts.version);
-    let mut builder = SslConnector::builder(SslMethod::dtls())
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut builder =
+        SslConnector::builder(SslMethod::dtls()).map_err(|e| io::Error::other(e.to_string()))?;
     builder.set_verify(SslVerifyMode::NONE);
     pin(&mut builder, v);
     builder
         .set_cipher_list(ciphers)
         .map_err(|e| io::Error::other(e.to_string()))?;
     if let Some((cert, key)) = opts.client_identity {
-        let cert = X509::from_pem(&std::fs::read(cert)?).map_err(|e| io::Error::other(e.to_string()))?;
-        let key =
-            PKey::private_key_from_pem(&std::fs::read(key)?).map_err(|e| io::Error::other(e.to_string()))?;
-        builder.set_certificate(&cert).map_err(|e| io::Error::other(e.to_string()))?;
-        builder.set_private_key(&key).map_err(|e| io::Error::other(e.to_string()))?;
+        let cert =
+            X509::from_pem(&std::fs::read(cert)?).map_err(|e| io::Error::other(e.to_string()))?;
+        let key = PKey::private_key_from_pem(&std::fs::read(key)?)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        builder
+            .set_certificate(&cert)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        builder
+            .set_private_key(&key)
+            .map_err(|e| io::Error::other(e.to_string()))?;
     }
     let connector = builder.build();
 
