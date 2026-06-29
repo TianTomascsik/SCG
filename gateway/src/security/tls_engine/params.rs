@@ -343,19 +343,23 @@ impl TlsSecurityParams {
     /// Whether this configuration can be offloaded to kernel TLS.
     ///
     /// kTLS offloads only the post-handshake AES-GCM record layer, which is
-    /// independent of *how* the peer was authenticated: `build_acceptor` /
-    /// `build_connector` apply the same `apply_*_verify` (CA trust, mutual client
-    /// cert) to the kTLS context as to userspace, and peer auth completes during
-    /// the handshake *before* kTLS activates. So server- and mutual-verified TLS
-    /// are offloadable; only a non-`Default` profile (subset146 — non-GCM / PSK
-    /// cipher policy) or a PSK handshake (no AES-GCM record path) is not.
+    /// independent of *how* the peer was authenticated — verify mode, PKI mutual
+    /// cert, and PSK are all handshake concerns that complete before kTLS
+    /// activates (`build_acceptor`/`build_connector` apply `apply_*_verify` +
+    /// `apply_psk_*` to the kTLS context identically to userspace). So the
+    /// `Default` profile and both Subset-146 ETCS profiles — all AES-256-GCM —
+    /// are offloadable. Only `IntegrityOnly` (NULL-encryption ciphers, no AES-GCM
+    /// record path) is not.
     ///
     /// This is *static* eligibility only. The relay must still gate the zero-copy
     /// splice path on **runtime** activation (`ktls_active`), never on this flag,
     /// or a silent kTLS-enable failure would relay cleartext — see
     /// `tls_engine::{decrypt,encrypt}` and TRA register #56.
     pub fn is_ktls_offloadable(&self) -> bool {
-        self.profile == TlsProfile::Default && self.psk_key.is_none()
+        matches!(
+            self.profile,
+            TlsProfile::Default | TlsProfile::Subset146Pki | TlsProfile::Subset146Psk
+        )
     }
 
     /// The SNI / verification hostname to present on the connector. Falls back
@@ -637,10 +641,23 @@ mod tests {
         let p = TlsSecurityParams::from_params(&m, Some("tls1.2")).unwrap();
         assert_eq!(p.profile, TlsProfile::Subset146Pki);
         assert_eq!(p.verify, VerifyMode::Mutual);
-        assert!(!p.is_ktls_offloadable());
+        // subset146-pki negotiates ECDHE-ECDSA-AES256-GCM, so its record layer is
+        // kTLS-offloadable; mutual ECDSA auth is a handshake concern (TRA #56 guard
+        // covers any runtime activation failure).
+        assert!(p.is_ktls_offloadable());
         let (list, suites) = p.cipher_policy();
         assert!(list.unwrap().contains("ECDHE-ECDSA-AES256-GCM-SHA384"));
         assert!(suites.unwrap().contains("TLS_AES_256_GCM_SHA384"));
+    }
+
+    #[test]
+    fn integrity_only_profile_is_not_ktls_offloadable() {
+        // integrity-only uses NULL-encryption ciphers (no AES-GCM record path),
+        // so it must stay on the userspace engine.
+        let m = params_from(&[("profile", json!("integrity-only"))]);
+        let p = TlsSecurityParams::from_params(&m, Some("tls1.2")).unwrap();
+        assert_eq!(p.profile, TlsProfile::IntegrityOnly);
+        assert!(!p.is_ktls_offloadable());
     }
 
     #[test]
@@ -659,7 +676,9 @@ mod tests {
         ]);
         let p = TlsSecurityParams::from_params(&m, Some("tls1.2")).unwrap();
         assert_eq!(p.psk_key.as_ref().unwrap().len(), 16);
-        assert!(!p.is_ktls_offloadable());
+        // subset146-psk negotiates DHE-PSK-AES256-GCM: the PSK only authenticates
+        // the handshake; the AES-256-GCM record layer is kTLS-offloadable.
+        assert!(p.is_ktls_offloadable());
     }
 
     #[test]

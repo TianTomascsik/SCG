@@ -36,6 +36,27 @@ pub struct ConnectionMetrics {
 }
 
 impl ConnectionMetrics {
+    /// Create a connection counter with no link to rule-level aggregates.
+    ///
+    /// Used by the dynamically-created local interfaces (UDS/SHM), which have no
+    /// long-lived [`RuleMetrics`] to attach to. Byte/message counters are still
+    /// recorded locally (for the per-connection throughput log and the splice
+    /// relay's `record_*` calls); they simply do not roll up into a rule total.
+    pub fn standalone(direction: &str, tls_mode: &str) -> Self {
+        Self {
+            direction: direction.to_string(),
+            tls_mode: tls_mode.to_string(),
+            start: Instant::now(),
+            bytes_in: 0,
+            bytes_out: 0,
+            msgs_relayed: 0,
+            rule_metrics: None,
+            pending_bytes_in: 0,
+            pending_bytes_out: 0,
+            pending_msgs: 0,
+        }
+    }
+
     /// Create with a live link to rule-level metrics (updated in real time).
     pub fn with_rule_metrics(
         direction: &str,

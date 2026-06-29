@@ -10,7 +10,7 @@ use crate::networking::connector::{connect_with_retry, sleep_with_shutdown_check
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
     bind_tcp_listener, bind_udp_socket, poll_two_fds, set_nodelay, set_nonblocking_fd,
-    tune_socket_buffers,
+    tune_socket_buffers, MmsgRecvBuf, MmsgSendBuf, UDP_MMSG_BATCH,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::{
@@ -391,9 +391,12 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
     );
     ctx.metrics.connection_opened();
 
-    let mut udp_buf = vec![0u8; UDP_BUF_SIZE];
     let mut tls_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut last_peer: Option<SocketAddr> = None;
+    // Batched UDP I/O: one `recvmmsg`/`sendmmsg` per drain amortises the
+    // per-datagram syscall on the client-facing leg.
+    let mut udp_rx = MmsgRecvBuf::new(UDP_MMSG_BATCH, UDP_BUF_SIZE);
+    let mut udp_tx = MmsgSendBuf::new();
 
     // Set non-blocking for poll-based bidirectional I/O
     socket.set_nonblocking(true).ok();
@@ -714,37 +717,42 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
             continue;
         }
 
-        // Forward: UDP -> TLS (encrypt and tunnel with ALE framing)
-        // Drain all pending UDP datagrams into a batch buffer, then flush once
+        // Forward: UDP -> TLS (encrypt and tunnel with ALE framing).
+        // Drain pending UDP datagrams in batched `recvmmsg` reads into a batch
+        // buffer, then flush once. The single-client source pin is re-checked
+        // PER datagram in the batch (TRA #7/#39): the kernel returns each
+        // datagram's source in the `recvmmsg` batch, and a second source on this
+        // identity-less single TLS/ALE stream is dropped, never multiplexed.
         if udp_ready {
             batch_buf.clear();
             'udp_fwd: loop {
-                match socket.recv_from(&mut udp_buf) {
-                    Ok((n, src)) => {
-                        if !accept_source(&mut last_peer, src) {
-                            // A second client on this single-client encrypt
-                            // stream: ignore its datagram rather than
-                            // multiplexing it. The single TLS/ALE stream carries
-                            // no per-client identity, so multiplexing would route
-                            // reverse responses to the wrong client (CWE-200).
-                            debug!(
-                                "[{}] ignoring datagram from {} (stream pinned to {:?})",
-                                ctx.rule_name, src, last_peer
-                            );
-                            continue 'udp_fwd;
-                        }
-                        conn_metrics.record_read(n);
-                        // Frame the datagram (ALE DT or raw length-prefix) into
-                        // the batch buffer.
-                        framing.frame_into(&udp_buf[..n], &mut batch_buf);
-                        conn_metrics.record_relay(n);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break 'udp_fwd,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                let count = match udp_rx.recv(udp_fd_raw) {
+                    Ok(0) => break 'udp_fwd,
+                    Ok(c) => c,
                     Err(e) => {
                         error!("[{}] UDP recv error: {}", ctx.rule_name, e);
                         break 'udp_fwd;
                     }
+                };
+                for i in 0..count {
+                    let (src, payload) = udp_rx.get(i);
+                    match src {
+                        Some(s) if accept_source(&mut last_peer, s) => {}
+                        Some(s) => {
+                            // Second client on this single-client encrypt stream:
+                            // ignore rather than multiplex (would route reverse
+                            // responses to the wrong client — CWE-200, #7/#39).
+                            debug!(
+                                "[{}] ignoring datagram from {} (stream pinned to {:?})",
+                                ctx.rule_name, s, last_peer
+                            );
+                            continue;
+                        }
+                        None => continue, // unrecognised source address family
+                    }
+                    conn_metrics.record_read(payload.len());
+                    framing.frame_into(payload, &mut batch_buf);
+                    conn_metrics.record_relay(payload.len());
                 }
             }
             // Flush all accumulated ALE frames in a single TLS write
@@ -756,7 +764,10 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
             }
         }
 
-        // Reverse: TLS -> UDP (deframe ALE/raw, send user data as datagrams back to client)
+        // Reverse: TLS -> UDP (deframe ALE/raw, send user data as datagrams back
+        // to the pinned client in one `sendmmsg` per TLS read). Datagrams are
+        // staged only when a client is pinned; with no peer yet they are dropped
+        // (metrics still recorded), exactly as the prior `if let Some(peer)` did.
         if tls_ready {
             'tls_read: loop {
                 match tls.read(&mut tls_buf) {
@@ -764,13 +775,18 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                     Ok(n) => {
                         let disconnect =
                             framing.deframe_each(&ctx.rule_name, &tls_buf[..n], |datagram| {
-                                if let Some(peer) = last_peer {
-                                    let _ = socket.send_to(datagram, peer);
+                                if last_peer.is_some() {
+                                    udp_tx.push(datagram);
                                 }
                                 let data_len = datagram.len();
                                 conn_metrics.record_read(data_len);
                                 conn_metrics.record_relay(data_len);
                             });
+                        if let Some(peer) = last_peer {
+                            if !udp_tx.is_empty() {
+                                let _ = udp_tx.flush(udp_fd_raw, Some(peer));
+                            }
+                        }
                         if disconnect {
                             break 'tls_read;
                         }

@@ -7,12 +7,14 @@
 //! so a UDS client on one gateway can interoperate with a SHM client on a peer
 //! gateway: both sides see the same length-prefixed frame stream inside TLS.
 
-use crate::management::config::{QosPolicy, TlsMode};
+use crate::management::config::{PerfKnobs, QosPolicy, TlsMode};
+use crate::management::telemetry::ConnectionMetrics;
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, bind_tcp_listener, poll_two_fds, set_nodelay,
     set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
+use crate::security::relay::relay_bidirectional_splice;
 use crate::security::tls_engine::params::TlsSecurityParams;
 use crate::security::tls_engine::{
     build_tls_acceptor, build_tls_connector, write_all_nb_proxy, ProxyStream,
@@ -149,14 +151,15 @@ pub fn authenticate_peer(
 /// The UDS/SHM tunnel is stream-oriented, so DTLS is not applicable; unknown or
 /// custom provider names fall back to userspace TLS.
 ///
-/// kTLS only offloads the default AES-GCM, server-authentication-disabled path
-/// (see [`TlsSecurityParams::is_ktls_offloadable`]). A `ktls` rule that requests
-/// peer verification, a PSK, or a non-default profile is **not** offloadable, so
-/// it falls back to the userspace `Tls` path — which honours the rule's
-/// `verify`/cert/CA — rather than silently connecting through the kTLS connector
-/// with verification disabled. This mirrors the static-rule selection in
-/// `processing::start_single_rule`. If the parameters fail to parse, fall back to
-/// `Tls` too so the userspace path can surface the real error.
+/// kTLS offloads the AES-GCM record layer; how the peer is authenticated (verify
+/// mode, PKI mutual cert, or PSK) is a handshake concern that completes before
+/// kTLS activates, and the kTLS context applies the same verification/PSK setup as
+/// userspace (see [`TlsSecurityParams::is_ktls_offloadable`]). So verified TLS and
+/// the Subset-146 ETCS profiles stay on the kTLS path; only `integrity-only`
+/// (NULL-encryption ciphers, no AES-GCM record layer) falls back to userspace
+/// `Tls`. The relay separately guards the zero-copy splice on **runtime** kTLS
+/// activation (TRA #56). If the parameters fail to parse, fall back to `Tls` so the
+/// userspace path can surface the real error.
 pub fn upstream_tls_mode(
     security_provider: &str,
     provider_params: &HashMap<String, serde_json::Value>,
@@ -176,6 +179,7 @@ pub fn upstream_tls_mode(
 ///
 /// This mirrors the upstream-connect logic of the TCP encrypt path so the local
 /// interfaces behave identically to the static encrypt rules.
+#[allow(clippy::too_many_arguments)]
 pub fn connect_tls_upstream(
     label: &str,
     upstream_addr: &str,
@@ -399,29 +403,74 @@ pub fn accept_tls_upstream(
     Ok(proxy)
 }
 
+/// Whether the UDS relay may use the zero-copy `splice(2)` fast-path.
+///
+/// Splicing the UDS socket straight to the upstream fd (and back) is correct
+/// **only** when the upstream is kTLS *and* kTLS actually activated at runtime:
+/// the raw fd then carries plaintext and the kernel performs the record-layer
+/// crypto, exactly like the TCP encrypt path. If kTLS was requested but did not
+/// activate (`ulp_active == false`), the fd carries ciphertext and we MUST relay
+/// through the userspace SSL session instead — otherwise we would splice
+/// cleartext onto the wire (TRA #56). Userspace TLS (`is_ktls == false`) likewise
+/// has no spliceable plaintext fd.
+///
+/// Kept as a pure predicate so the TRA #56 guard is unit-testable without a live
+/// socket.
+#[inline]
+fn should_splice_upstream(is_ktls: bool, ulp_active: bool) -> bool {
+    is_ktls && ulp_active
+}
+
 /// Full-duplex byte-pipe relay between an authenticated local UDS client and a
 /// TLS/kTLS upstream.
 ///
 /// The `[len][traffic_id][data]` frame stream is carried transparently; for a
-/// stream socket the gateway does not need to parse frames. A single-threaded
-/// `poll()` loop drives both directions, mirroring the TCP relay design and
-/// avoiding concurrent read+write on the (non-thread-safe) `SslStream`.
+/// stream socket the gateway does not need to parse frames. When the upstream is
+/// an active kTLS socket the relay delegates to the same zero-copy
+/// [`relay_bidirectional_splice`] used by the TCP encrypt path — moving bytes
+/// entirely in kernel space (UDS ↔ pipe ↔ kTLS), so a local interface reaches
+/// the same throughput as kTLS-over-TCP. Otherwise it falls back to a
+/// single-threaded userspace `poll()` loop, which both covers userspace TLS and
+/// avoids concurrent read+write on the (non-thread-safe) `SslStream`.
 pub fn relay_uds_tls(
     label: &str,
     mut plain: UnixStream,
     tls: &mut ProxyStream,
+    conn_metrics: &mut ConnectionMetrics,
+    perf: PerfKnobs,
+    delay_ms: u64,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let tls_fd = tls.raw_fd();
     let plain_fd = plain.as_raw_fd();
 
+    // Zero-copy fast-path: an active kTLS upstream means the kernel does the
+    // crypto, so the UDS bytes can be spliced through a pipe to the upstream fd
+    // (and back) with no userspace copies. Gated on *runtime* kTLS activation,
+    // never on the requested mode alone (TRA #56).
+    let is_ktls = matches!(tls, ProxyStream::Ktls { .. });
+    if should_splice_upstream(is_ktls, tls.ktls_active()) {
+        debug!("[{label}] UDS relay: zero-copy splice (kTLS upstream active)");
+        return relay_bidirectional_splice(
+            plain_fd,
+            tls_fd,
+            conn_metrics,
+            shutdown,
+            delay_ms,
+            perf.pipe_size,
+            perf.busy_poll_us,
+            perf.bdp_adaptive,
+            perf.bdp_queue_budget_us,
+        );
+    }
+
     set_nonblocking_fd(tls_fd);
     plain.set_nonblocking(true)?;
     set_nodelay(tls_fd, true);
 
-    debug!("[{label}] relay started (local client <-> TLS upstream)");
+    debug!("[{label}] UDS relay: userspace poll loop (local client <-> TLS upstream)");
 
-    let mut buf = vec![0u8; RELAY_BUF_SIZE];
+    let mut buf = vec![0u8; perf.relay_buf_size.max(RELAY_BUF_SIZE)];
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -439,7 +488,11 @@ pub fn relay_uds_tls(
             loop {
                 match tls.read(&mut buf) {
                     Ok(0) => return Ok(()),
-                    Ok(n) => write_all_nb(&mut plain, &buf[..n])?,
+                    Ok(n) => {
+                        write_all_nb(&mut plain, &buf[..n])?;
+                        conn_metrics.record_read(n);
+                        conn_metrics.record_relay(n);
+                    }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
@@ -455,7 +508,11 @@ pub fn relay_uds_tls(
             loop {
                 match plain.read(&mut buf) {
                     Ok(0) => return Ok(()),
-                    Ok(n) => write_all_nb_proxy(tls, &buf[..n])?,
+                    Ok(n) => {
+                        write_all_nb_proxy(tls, &buf[..n])?;
+                        conn_metrics.record_read(n);
+                        conn_metrics.record_relay(n);
+                    }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
@@ -506,12 +563,35 @@ mod tests {
     }
 
     #[test]
-    fn ktls_rule_with_non_default_profile_falls_back_to_userspace_tls() {
-        // A non-Default profile (PKI ⇒ mutual, with a non-GCM / PSK cipher
-        // policy) is not kTLS-offloadable and falls back to the userspace engine.
+    fn ktls_subset146_etcs_profiles_stay_ktls() {
+        // The Subset-146 ETCS profiles negotiate AES-256-GCM, so their record
+        // layer is kTLS-offloadable; PKI mutual / PSK auth is handshake-only and
+        // the relay's #56 guard covers any runtime activation failure.
         let pki = params(&[("profile", json!("subset146-pki"))]);
         assert_eq!(
             upstream_tls_mode("ktls", &pki, Some("tls1.2")),
+            TlsMode::Ktls
+        );
+
+        let psk = params(&[
+            ("profile", json!("subset146-psk")),
+            ("verify", json!("none")),
+            ("psk_identity", json!("c1")),
+            ("psk_hex", json!("00112233445566778899aabbccddeeff")),
+        ]);
+        assert_eq!(
+            upstream_tls_mode("ktls", &psk, Some("tls1.2")),
+            TlsMode::Ktls
+        );
+    }
+
+    #[test]
+    fn ktls_integrity_only_falls_back_to_userspace_tls() {
+        // integrity-only uses NULL-encryption ciphers (no AES-GCM record layer),
+        // so it is not kTLS-offloadable and falls back to the userspace engine.
+        let integ = params(&[("profile", json!("integrity-only"))]);
+        assert_eq!(
+            upstream_tls_mode("ktls", &integ, Some("tls1.2")),
             TlsMode::Tls
         );
     }
@@ -529,5 +609,16 @@ mod tests {
     fn non_ktls_provider_is_userspace_tls() {
         let p = params(&[("verify", json!("none"))]);
         assert_eq!(upstream_tls_mode("tls", &p, Some("tls1.3")), TlsMode::Tls);
+    }
+
+    #[test]
+    fn splice_only_when_ktls_and_runtime_active() {
+        // The TRA #56 guard: splice iff the upstream is kTLS AND kTLS actually
+        // activated (ULP=tls). Every other combination must fall back to the
+        // userspace SSL relay so ciphertext is never spliced onto the wire.
+        assert!(should_splice_upstream(true, true)); // kTLS + active → splice
+        assert!(!should_splice_upstream(true, false)); // kTLS requested, not active
+        assert!(!should_splice_upstream(false, true)); // userspace TLS
+        assert!(!should_splice_upstream(false, false)); // userspace TLS, nothing active
     }
 }

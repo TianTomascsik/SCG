@@ -9,7 +9,8 @@
 use crate::interfaces::endpoint::{
     accept_tls_upstream, authenticate_peer, connect_tls_upstream, relay_uds_tls,
 };
-use crate::management::config::{Direction, QosPolicy, TlsMode};
+use crate::management::config::{Direction, PerfKnobs, QosPolicy, TlsMode};
+use crate::management::telemetry::ConnectionMetrics;
 use crate::networking::socket_manager::apply_safety_priority;
 
 use scg_ipc::os::{self, PeerCred};
@@ -45,6 +46,9 @@ pub struct UdsEndpointTask {
     pub provider_params: HashMap<String, serde_json::Value>,
     /// Socket buffer tuning size.
     pub sock_buf_size: usize,
+    /// Resolved low-level relay knobs (splice pipe size, busy-poll window, …)
+    /// for the upstream leg, mirroring the static TCP encrypt path.
+    pub perf: PerfKnobs,
     /// Resolved egress QoS policy (DSCP + SO_PRIORITY) for the upstream leg.
     pub qos: QosPolicy,
     /// uids permitted to connect (from the rule's `allowed_uids`).
@@ -210,11 +214,37 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
         }
     };
 
-    if let Err(e) = relay_uds_tls(&task.label, stream, &mut tls, &task.shutdown) {
+    let direction = match task.direction {
+        Direction::Encrypt => "encrypt",
+        Direction::Decrypt => "decrypt",
+    };
+    let mut conn_metrics = ConnectionMetrics::standalone(direction, &task.tls_mode.to_string());
+
+    // Local interfaces apply no geo-delay (loopback IPC bridged to the upstream),
+    // so `delay_ms` is 0 — preserving the userspace relay's prior behaviour.
+    if let Err(e) = relay_uds_tls(
+        &task.label,
+        stream,
+        &mut tls,
+        &mut conn_metrics,
+        task.perf,
+        0,
+        &task.shutdown,
+    ) {
         if e.kind() != std::io::ErrorKind::UnexpectedEof {
             warn!("[{}] relay ended with error: {e}", task.label);
         }
     }
+
+    let elapsed = conn_metrics.elapsed_secs();
+    info!(
+        "[{}] UDS relay done: {:.3}s, {} msgs, {:.2} Mib in / {:.2} Mib out",
+        task.label,
+        elapsed,
+        conn_metrics.msgs_relayed,
+        conn_metrics.bytes_in as f64 * 8.0 / 1e6,
+        conn_metrics.bytes_out as f64 * 8.0 / 1e6,
+    );
 }
 
 /// Poll a single fd for readability with a timeout (ms). Returns `true` if the

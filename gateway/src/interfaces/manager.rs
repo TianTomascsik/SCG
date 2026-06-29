@@ -16,7 +16,8 @@ use crate::interfaces::endpoint::upstream_tls_mode;
 use crate::interfaces::shm::{run_shm_endpoint, ShmEndpointTask};
 use crate::interfaces::uds::{run_uds_endpoint, UdsEndpointTask};
 use crate::management::config::{
-    Direction, GatewayConfig, Proto, QosPolicy, ShmNotify, ShmRingKind, TlsMode, TrafficClass,
+    Direction, GatewayConfig, PerfKnobs, Proto, QosPolicy, ShmNotify, ShmRingKind, TlsMode,
+    TrafficClass,
 };
 
 use scg_ipc::handshake::SHM_NOTIFY_EVENTFD;
@@ -107,8 +108,11 @@ struct EndpointTemplate {
     qos: QosPolicy,
     /// Default per-direction ring capacity for SHM endpoints (bytes).
     ring_capacity: usize,
-    /// Resolved SHM ring busy-poll window (microseconds) from the perf profile.
-    spin_wait_us: u64,
+    /// Resolved low-level relay knobs (splice pipe size, busy-poll window, SHM
+    /// ring spin-wait, …) from the perf profile + rule overrides. Carried so the
+    /// UDS endpoint can drive the same zero-copy splice relay as the static TCP
+    /// encrypt path when its upstream is kTLS.
+    perf: PerfKnobs,
     /// SHM ring data structure (byte-stream or fixed-slot).
     ring_kind: ShmRingKind,
     /// Slot ring only: bytes per segment.
@@ -306,9 +310,7 @@ impl InterfaceManager {
                     allowed_pids: Arc::new(rule.allowed_pids.clone()),
                     qos: rule.qos(),
                     ring_capacity: api.shm_ring_capacity,
-                    spin_wait_us: rule
-                        .perf_knobs(config.perf_profile, config.sock_buf_size)
-                        .spin_wait_us,
+                    perf: rule.perf_knobs(config.perf_profile, config.sock_buf_size),
                     ring_kind: api.shm_ring_kind,
                     segment_size: api.shm_segment_size,
                     num_segments: api.shm_num_segments,
@@ -462,6 +464,7 @@ impl InterfaceManager {
             protocol_version: template.protocol_version.clone(),
             provider_params: template.provider_params.clone(),
             sock_buf_size: self.sock_buf_size,
+            perf: template.perf,
             qos: template.qos,
             allowed_uids: template.allowed_uids.clone(),
             allowed_pids: template.allowed_pids.clone(),
@@ -609,7 +612,7 @@ impl InterfaceManager {
             qos: template.qos,
             cap_c2g: cap,
             cap_g2c: cap,
-            spin_wait_us: template.spin_wait_us,
+            spin_wait_us: template.perf.spin_wait_us,
             ring_kind: template.ring_kind,
             segment_size: template.segment_size,
             num_segments: template.num_segments,

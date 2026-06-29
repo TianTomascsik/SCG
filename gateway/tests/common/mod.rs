@@ -54,6 +54,21 @@ impl EchoServer {
         EchoServer::start_with_params(TlsSecurityParams::default())
     }
 
+    /// Like [`EchoServer::start`] but pins TLS 1.3, so it can terminate the kTLS
+    /// client connector (which negotiates TLS 1.3 `TLS_AES_128_GCM_SHA256` — an
+    /// offload-capable cipher) used to drive the splice fast-path.
+    pub fn start_tls13() -> EchoServer {
+        // NB: `TlsSecurityParams::is_tls13()` matches the exact string "tls1.3"
+        // (the gateway acceptor's version key), whereas the kTLS *connector*
+        // accepts the rule's "1.3" — so the two legs are pinned with their
+        // respective spellings of TLS 1.3.
+        let params = TlsSecurityParams {
+            version: Some("tls1.3".to_string()),
+            ..TlsSecurityParams::default()
+        };
+        EchoServer::start_with_params(params)
+    }
+
     /// Like [`EchoServer::start`] but with explicit TLS security parameters
     /// (file identity, `verify = mutual` for client-cert enforcement, etc.).
     pub fn start_with_params(params: TlsSecurityParams) -> EchoServer {
@@ -206,11 +221,33 @@ pub fn temp_dir(tag: &str) -> PathBuf {
 }
 
 /// Build a gateway config with one UDS and one SHM rule, both bound to the same
-/// `app-test` app id, encrypting toward the supplied echo upstream. `uid` must
-/// be the caller's effective uid so the local interface authorises it.
+/// `app-test` app id, encrypting toward the supplied echo upstream over a
+/// userspace-TLS upstream. `uid` must be the caller's effective uid so the local
+/// interface authorises it.
 pub fn build_config(echo_addr: &str, uid: u32, tmp: &Path) -> GatewayConfig {
+    build_config_provider(echo_addr, uid, tmp, "tls")
+}
+
+/// Like [`build_config`] but with an explicit `security_provider` for the
+/// upstream leg (`"tls"` for userspace, `"ktls"` to drive the kTLS / zero-copy
+/// splice path). Both rules share the provider.
+pub fn build_config_provider(
+    echo_addr: &str,
+    uid: u32,
+    tmp: &Path,
+    provider: &str,
+) -> GatewayConfig {
     let mgmt_sock = tmp.join("mgmt.sock");
     let runtime_dir = tmp.join("run");
+    // kTLS pins min=max to the negotiated version and offload-capable ciphers; pin
+    // TLS 1.3 (TLS_AES_128_GCM_SHA256) so the upstream handshake against the
+    // userspace echo server succeeds *and* the kernel `tls` ULP activates,
+    // exercising the splice fast-path.
+    let proto_ver = if provider == "ktls" {
+        r#""protocol_version": "1.3","#
+    } else {
+        ""
+    };
     let json = format!(
         r#"{{
             "rules": [
@@ -221,7 +258,8 @@ pub fn build_config(echo_addr: &str, uid: u32, tmp: &Path) -> GatewayConfig {
                     "listen_proto": "uds",
                     "upstream_addr": "{echo}",
                     "upstream_proto": "tcp",
-                    "security_provider": "tls",
+                    "security_provider": "{provider}",
+                    {proto_ver}
                     "verify": "none",
                     "traffic_class": "safety",
                     "app_id": "app-test",
@@ -234,7 +272,8 @@ pub fn build_config(echo_addr: &str, uid: u32, tmp: &Path) -> GatewayConfig {
                     "listen_proto": "shm",
                     "upstream_addr": "{echo}",
                     "upstream_proto": "tcp",
-                    "security_provider": "tls",
+                    "security_provider": "{provider}",
+                    {proto_ver}
                     "verify": "none",
                     "traffic_class": "safety",
                     "app_id": "app-test",
@@ -249,6 +288,8 @@ pub fn build_config(echo_addr: &str, uid: u32, tmp: &Path) -> GatewayConfig {
             }}
         }}"#,
         echo = echo_addr,
+        provider = provider,
+        proto_ver = proto_ver,
         uid = uid,
         mgmt = mgmt_sock.display(),
         run = runtime_dir.display(),

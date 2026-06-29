@@ -3,7 +3,7 @@
 use super::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::networking::socket_manager::{
     poll_two_fds, poll_two_fds_with_spin, set_nonblocking_fd, set_quickack, tune_socket_buffers,
-    write_all_nb, TcpCorkGuard,
+    write_all_nb, MmsgRecvBuf, MmsgSendBuf, TcpCorkGuard, UDP_MMSG_BATCH,
 };
 use crate::security::udp_framing::UdpFraming;
 
@@ -214,7 +214,10 @@ pub fn relay_tls_to_udp(
 
     // One-time connection-setup buffers; zero-init cost is negligible (not hot path).
     let mut tls_buf = vec![0u8; RELAY_BUF_SIZE];
-    let mut udp_buf = vec![0u8; UDP_BUF_SIZE];
+    // Batched UDP I/O: one `recvmmsg`/`sendmmsg` per drain amortises the
+    // per-datagram syscall, the limiter on the plaintext-UDP leg toward 10 Gib/s.
+    let mut udp_rx = MmsgRecvBuf::new(UDP_MMSG_BATCH, UDP_BUF_SIZE);
+    let mut udp_tx = MmsgSendBuf::new();
 
     let mut batch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
@@ -229,20 +232,26 @@ pub fn relay_tls_to_udp(
             continue;
         }
 
-        // Forward: TLS → UDP (read ALE frames, send user data as datagrams)
+        // Forward: TLS → UDP (read ALE frames, send user data as datagrams).
+        // Datagrams are staged and flushed with one `sendmmsg` per TLS read to
+        // amortise the per-datagram `send` syscall. `upstream` is connected, so
+        // the flush destination is `None`.
         if a_ready {
             'tls_read: loop {
                 match tls_stream.read(&mut tls_buf) {
                     Ok(0) => return Ok(()),
                     Ok(n) => {
+                        apply_geo_delay(delay_ms);
                         let disconnect =
                             framing.deframe_each(rule_name, &tls_buf[..n], |datagram| {
-                                apply_geo_delay(delay_ms);
-                                let _ = upstream.send(datagram);
+                                udp_tx.push(datagram);
                                 let data_len = datagram.len();
                                 conn_metrics.record_read(data_len);
                                 conn_metrics.record_relay(data_len);
                             });
+                        if !udp_tx.is_empty() {
+                            let _ = udp_tx.flush(udp_fd, None);
+                        }
                         if disconnect {
                             return Ok(());
                         }
@@ -257,19 +266,22 @@ pub fn relay_tls_to_udp(
             }
         }
 
-        // Reverse: UDP → TLS (receive datagrams, frame ALE/raw, batched)
+        // Reverse: UDP → TLS (receive datagrams in batches, frame ALE/raw, one
+        // TLS write). `upstream` is connected, so every datagram is from the
+        // pinned peer — no per-source check needed here.
         if b_ready {
             batch_buf.clear();
             'udp_read: loop {
-                match upstream.recv(&mut udp_buf) {
-                    Ok(n) => {
-                        framing.frame_into(&udp_buf[..n], &mut batch_buf);
-                        conn_metrics.record_read(n);
-                        conn_metrics.record_relay(n);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break 'udp_read,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                let count = match udp_rx.recv(udp_fd) {
+                    Ok(0) => break 'udp_read,
+                    Ok(c) => c,
                     Err(_) => return Ok(()),
+                };
+                for i in 0..count {
+                    let (_src, payload) = udp_rx.get(i);
+                    framing.frame_into(payload, &mut batch_buf);
+                    conn_metrics.record_read(payload.len());
+                    conn_metrics.record_relay(payload.len());
                 }
             }
             // Flush batched frames to TLS in a single write

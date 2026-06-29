@@ -447,6 +447,280 @@ fn sockaddr_storage_to_socketaddr(storage: &libc::sockaddr_storage) -> Option<So
     }
 }
 
+/// Fill a `sockaddr_storage` from a Rust [`SocketAddr`], returning the address
+/// length the kernel expects (`msg_namelen`). The inverse of
+/// [`sockaddr_storage_to_socketaddr`].
+fn fill_sockaddr_storage(
+    addr: SocketAddr,
+    storage: &mut libc::sockaddr_storage,
+) -> libc::socklen_t {
+    match addr {
+        SocketAddr::V4(a) => {
+            // SAFETY: `sockaddr_storage` is large enough and suitably aligned for
+            // `sockaddr_in`; we write only the `sockaddr_in` fields through the
+            // reborrowed pointer and return that struct's size as the length.
+            let sin = unsafe { &mut *(storage as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = a.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(a.ip().octets()),
+            };
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(a) => {
+            // SAFETY: as above for `sockaddr_in6`.
+            let sin6 = unsafe { &mut *(storage as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_flowinfo = a.flowinfo();
+            sin6.sin6_scope_id = a.scope_id();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: a.ip().octets(),
+            };
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    }
+}
+
+/// Largest datagram batch drained/flushed in a single `recvmmsg`/`sendmmsg`.
+/// Amortises the per-datagram syscall on the UDP relay legs; matches SESHAT's
+/// harness batch so a single connection can be driven and absorbed at the same
+/// granularity.
+pub const UDP_MMSG_BATCH: usize = 32;
+
+/// Reusable receive state for batched UDP reads via `recvmmsg(2)`.
+///
+/// Owns `batch` fixed-size slots, so the buffers are allocated once per relay
+/// connection (setup cost, not hot path); each [`recv`](MmsgRecvBuf::recv) fills
+/// up to `batch` datagrams in one syscall. After a successful `recv` returning
+/// `n`, the i-th datagram (`0 <= i < n`) is read with [`get`](MmsgRecvBuf::get),
+/// which yields its source address (for the single-client source pin — TRA
+/// #7/#39) and payload slice (length bounded by the slot, so a kernel-reported
+/// `msg_len` can never index out of the allocation — TRA #16).
+pub struct MmsgRecvBuf {
+    batch: usize,
+    slot_len: usize,
+    data: Vec<u8>,
+    names: Vec<libc::sockaddr_storage>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    lens: Vec<usize>,
+}
+
+impl MmsgRecvBuf {
+    /// Allocate a batch buffer holding `batch` slots of `slot_len` bytes each.
+    pub fn new(batch: usize, slot_len: usize) -> Self {
+        let batch = batch.max(1);
+        let slot_len = slot_len.max(1);
+        Self {
+            batch,
+            slot_len,
+            data: vec![0u8; batch * slot_len],
+            // SAFETY: `sockaddr_storage`/`mmsghdr` are plain-old-data C structs for
+            // which an all-zero bit pattern is valid; every field used is set in
+            // `recv` before the syscall.
+            names: vec![unsafe { std::mem::zeroed() }; batch],
+            iovecs: vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                batch
+            ],
+            msgs: vec![unsafe { std::mem::zeroed() }; batch],
+            lens: vec![0usize; batch],
+        }
+    }
+
+    /// Receive up to `batch` datagrams in one `recvmmsg`. Returns the count, or
+    /// `0` on `WouldBlock`/`TimedOut`/`EINTR` so the caller's drain loop treats it
+    /// as "no more data", exactly like the per-datagram `recv_from` it replaces.
+    pub fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
+        let batch = self.batch;
+        let slot_len = self.slot_len;
+        let data_ptr = self.data.as_mut_ptr();
+        let names_ptr = self.names.as_mut_ptr();
+        let iov_ptr = self.iovecs.as_mut_ptr();
+        for i in 0..batch {
+            // SAFETY: `i < batch`; `data` holds `batch * slot_len` bytes so the
+            // slot `[i*slot_len, (i+1)*slot_len)` is in bounds, and `iov_ptr`/
+            // `names_ptr` index live `Vec`s of length `batch`. Each `mmsghdr`
+            // points at its own slot and name buffer, all owned by `self` and
+            // alive for the `recvmmsg` below.
+            unsafe {
+                *iov_ptr.add(i) = libc::iovec {
+                    iov_base: data_ptr.add(i * slot_len) as *mut libc::c_void,
+                    iov_len: slot_len,
+                };
+                let hdr = &mut (*self.msgs.as_mut_ptr().add(i)).msg_hdr;
+                *hdr = std::mem::zeroed();
+                hdr.msg_name = names_ptr.add(i) as *mut libc::c_void;
+                hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                hdr.msg_iov = iov_ptr.add(i);
+                hdr.msg_iovlen = 1;
+                (*self.msgs.as_mut_ptr().add(i)).msg_len = 0;
+            }
+        }
+
+        // SAFETY: `self.msgs` is a live array of `batch` initialised `mmsghdr`
+        // whose `name`/`iov` buffers (`names`, `data`) outlive the call; `batch`
+        // matches the array length; flags `0`, NULL timeout. The return is checked
+        // below before any `msg_len` is read.
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                batch as libc::c_uint,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            return match e.kind() {
+                io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::Interrupted => Ok(0),
+                _ => Err(e),
+            };
+        }
+        let n = (ret as usize).min(batch);
+        for i in 0..n {
+            // Clamp the kernel-reported length to the slot capacity: a received
+            // datagram never exceeds the slot it was read into, and clamping makes
+            // the later slice index infallible (no narrowing, no overflow — #16).
+            self.lens[i] = (self.msgs[i].msg_len as usize).min(slot_len);
+        }
+        Ok(n)
+    }
+
+    /// Source address + payload of the `i`-th datagram from the last `recv`.
+    /// `i` must be `< n` where `n` is that `recv`'s return value.
+    pub fn get(&self, i: usize) -> (Option<SocketAddr>, &[u8]) {
+        let len = self.lens[i].min(self.slot_len);
+        let off = i * self.slot_len;
+        let payload = &self.data[off..off + len];
+        (sockaddr_storage_to_socketaddr(&self.names[i]), payload)
+    }
+}
+
+/// Reusable send state for batched UDP writes via `sendmmsg(2)`.
+///
+/// Datagrams are staged (copied) into a contiguous buffer with [`push`](Self::push),
+/// then flushed in one syscall with [`flush`](Self::flush). The copy is needed because the framer
+/// hands out transient borrowed slices (an ALE reassembly buffer reused per
+/// frame); copying post-decrypt plaintext is far cheaper than a syscall per
+/// datagram.
+pub struct MmsgSendBuf {
+    staging: Vec<u8>,
+    spans: Vec<(usize, usize)>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+}
+
+impl Default for MmsgSendBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MmsgSendBuf {
+    pub fn new() -> Self {
+        Self {
+            staging: Vec::with_capacity(UDP_MMSG_BATCH * 2048),
+            spans: Vec::with_capacity(UDP_MMSG_BATCH),
+            iovecs: Vec::with_capacity(UDP_MMSG_BATCH),
+            msgs: Vec::with_capacity(UDP_MMSG_BATCH),
+        }
+    }
+
+    /// Stage one datagram (copied) for the next [`flush`](Self::flush).
+    pub fn push(&mut self, datagram: &[u8]) {
+        let off = self.staging.len();
+        self.staging.extend_from_slice(datagram);
+        self.spans.push((off, datagram.len()));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    fn clear(&mut self) {
+        self.staging.clear();
+        self.spans.clear();
+    }
+
+    /// Send all staged datagrams in one `sendmmsg`, then clear the buffer.
+    /// `dst = Some(addr)` for an unconnected socket; `None` for a connected one.
+    /// Returns the number of datagrams the kernel accepted. `WouldBlock`/`EINTR`
+    /// map to `Ok(0)` — a momentarily full `SO_SNDBUF` drops the batch rather than
+    /// aborting the relay, matching the best-effort single `send` it replaces.
+    pub fn flush(&mut self, fd: RawFd, dst: Option<SocketAddr>) -> io::Result<usize> {
+        if self.spans.is_empty() {
+            return Ok(0);
+        }
+        let n = self.spans.len();
+        let base = self.staging.as_ptr();
+
+        // Destination address shared by every message (NULL for connected sockets).
+        // SAFETY: zeroed `sockaddr_storage` is valid POD; `fill_sockaddr_storage`
+        // initialises exactly the address family written.
+        let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let (name_ptr, name_len) = match dst {
+            Some(addr) => {
+                let len = fill_sockaddr_storage(addr, &mut name);
+                (&mut name as *mut _ as *mut libc::c_void, len)
+            }
+            None => (std::ptr::null_mut(), 0),
+        };
+
+        self.iovecs.clear();
+        for &(off, len) in &self.spans {
+            // SAFETY: `off + len <= staging.len()` by construction in `push`, so
+            // the slice `[off, off+len)` is within the live `staging` allocation.
+            self.iovecs.push(libc::iovec {
+                iov_base: unsafe { base.add(off) } as *mut libc::c_void,
+                iov_len: len,
+            });
+        }
+        let iov_ptr = self.iovecs.as_mut_ptr();
+        self.msgs.clear();
+        for i in 0..n {
+            // SAFETY: `libc::msghdr` POD; all used fields set here. `iov_ptr.add(i)`
+            // indexes the live `iovecs` (length `n`); `name`/`staging` outlive the
+            // syscall below.
+            let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_name = name_ptr;
+            hdr.msg_namelen = name_len;
+            hdr.msg_iov = unsafe { iov_ptr.add(i) };
+            hdr.msg_iovlen = 1;
+            self.msgs.push(libc::mmsghdr {
+                msg_hdr: hdr,
+                msg_len: 0,
+            });
+        }
+
+        // SAFETY: `self.msgs` is a live array of `n` initialised `mmsghdr` whose
+        // iov/name buffers outlive the call; `n` matches the array length; flags 0.
+        let ret = unsafe { libc::sendmmsg(fd, self.msgs.as_mut_ptr(), n as libc::c_uint, 0) };
+        let result = if ret < 0 {
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(0),
+                _ => Err(e),
+            }
+        } else {
+            Ok(ret as usize)
+        };
+        self.clear();
+        result
+    }
+}
+
 /// Apply egress DiffServ marking + scheduling priority to a socket in one call.
 ///
 /// * `dscp = None` leaves the kernel default DS field untouched.
@@ -733,6 +1007,110 @@ mod tests {
         };
         assert_eq!(ret, 0, "getsockopt failed: {}", io::Error::last_os_error());
         val
+    }
+
+    /// `recvmmsg` must surface each datagram's own source address — the basis for
+    /// the per-datagram single-client source pin (TRA #7/#39). Two distinct
+    /// senders into one unconnected socket must come back tagged with their
+    /// respective sources and verbatim payloads.
+    #[test]
+    fn mmsg_recv_reports_per_datagram_source_and_payload() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.send_to(b"a0", rx_addr).unwrap();
+        a.send_to(b"a1", rx_addr).unwrap();
+        b.send_to(b"b0", rx_addr).unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        let mut buf = MmsgRecvBuf::new(8, 2048);
+        // Collect up to 3 datagrams across a few drain iterations (loopback
+        // delivery is immediate but not strictly synchronous).
+        let mut got: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+        for _ in 0..100 {
+            let n = buf.recv(rx.as_raw_fd()).unwrap();
+            for i in 0..n {
+                let (src, payload) = buf.get(i);
+                got.push((src.expect("ipv4 source"), payload.to_vec()));
+            }
+            if got.len() >= 3 {
+                break;
+            }
+        }
+        assert_eq!(got.len(), 3, "all three datagrams received");
+        let from_a: Vec<&[u8]> = got
+            .iter()
+            .filter(|(s, _)| *s == a_addr)
+            .map(|(_, p)| p.as_slice())
+            .collect();
+        let from_b: Vec<&[u8]> = got
+            .iter()
+            .filter(|(s, _)| *s == b_addr)
+            .map(|(_, p)| p.as_slice())
+            .collect();
+        assert_eq!(from_a, vec![b"a0".as_ref(), b"a1".as_ref()]);
+        assert_eq!(from_b, vec![b"b0".as_ref()]);
+    }
+
+    /// A datagram larger than the slot must be clamped to the slot length — never
+    /// indexed out of the allocation (TRA #16 / no narrowing).
+    #[test]
+    fn mmsg_recv_clamps_oversized_datagram_to_slot() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(&[0xABu8; 1000], rx_addr).unwrap();
+
+        let mut buf = MmsgRecvBuf::new(4, 16);
+        let mut len = 0;
+        for _ in 0..100 {
+            let n = buf.recv(rx.as_raw_fd()).unwrap();
+            if n > 0 {
+                len = buf.get(0).1.len();
+                break;
+            }
+        }
+        assert_eq!(len, 16, "oversized datagram clamped to the 16-byte slot");
+    }
+
+    /// `sendmmsg` must deliver every staged datagram to the connected peer in
+    /// order.
+    #[test]
+    fn mmsg_send_batch_delivers_all() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx_addr).unwrap();
+
+        let mut sb = MmsgSendBuf::new();
+        sb.push(b"one");
+        sb.push(b"two");
+        sb.push(b"three");
+        assert_eq!(sb.len(), 3);
+        let sent = sb.flush(tx.as_raw_fd(), None).unwrap();
+        assert_eq!(sent, 3, "all three datagrams accepted by the kernel");
+        assert!(sb.is_empty(), "flush clears the staging buffer");
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut scratch = [0u8; 64];
+        for _ in 0..100 {
+            if let Ok(n) = rx.recv(&mut scratch) {
+                seen.push(scratch[..n].to_vec());
+            }
+            if seen.len() >= 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
     }
 
     #[test]

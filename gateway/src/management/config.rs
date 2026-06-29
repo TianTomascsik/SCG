@@ -162,7 +162,11 @@ fn default_runtime_dir() -> String {
 }
 
 fn default_shm_ring_capacity() -> usize {
-    1024 * 1024 // 1 MiB
+    // 4 MiB per direction. At ~10 Gib/s a 1 MiB ring drains in <1 ms, so the
+    // gateway→client backpressure (`RING_FULL_BACKOFF` spin) throttles large
+    // bursts; 4 MiB keeps the ring from filling on a single-connection
+    // throughput run while staying bounded (8 MiB per SHM endpoint).
+    4 * 1024 * 1024
 }
 
 fn default_shm_segment_size() -> usize {
@@ -217,12 +221,12 @@ fn default_prefer_ktls() -> bool {
 /// Two complementary, mutually-exclusive adjustments are made to the
 /// `configured` provider so the gateway always runs the best safe engine:
 ///
-/// * a `ktls` rule whose parameters are **not** offloadable (a non-default
-///   profile or a PSK handshake — both lacking the AES-GCM record path) is
-///   downgraded to userspace `tls`. Peer verification (server/mutual) does NOT
-///   downgrade: kTLS offloads the post-handshake record layer regardless of how
-///   the peer was authenticated, and the relay guards splice on runtime
-///   activation (see `is_ktls_offloadable` and TRA #56),
+/// * a `ktls` rule whose parameters are **not** offloadable (the `integrity-only`
+///   profile — NULL-encryption ciphers, no AES-GCM record layer) is downgraded to
+///   userspace `tls`. Neither peer verification (server/mutual) nor the Subset-146
+///   ETCS profiles (PKI mutual / PSK, both AES-256-GCM) downgrade: kTLS offloads the
+///   post-handshake record layer regardless of how the peer was authenticated, and
+///   the relay guards splice on runtime activation (see `is_ktls_offloadable`, #56),
 /// * a userspace `tls` rule whose parameters **are** offloadable is upgraded to
 ///   `ktls` when `prefer_ktls` is set and the kernel exposes the `tls` ULP
 ///   (`kernel_ktls`), making the zero-copy fast path the default.

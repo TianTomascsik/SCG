@@ -379,16 +379,30 @@ fn relay(
         }
 
         // gateway -> client: read TLS bytes, reassemble frames, push into g2c.
+        // Frames are pushed without a per-frame wakeup; a single `signal_g2c`
+        // fires after each TLS read drains, so the client gets one eventfd/futex
+        // wake per batch instead of one syscall per frame. This is exactly
+        // equivalent to the old per-frame signalling: only the first push's
+        // empty→non-empty edge (`first_was_empty`) ever drove a futex wake, and
+        // the eventfd counter already coalesced wakeups — the per-frame calls
+        // were redundant. The client drains the whole ring on wake, and the
+        // signal always fires before the next poll, so no wakeup is lost.
         if tls_ready || tls_pending {
             loop {
                 match tls.read(&mut rbuf) {
                     Ok(0) => return Ok(()),
                     Ok(n) => {
                         decoder.feed(&rbuf[..n]);
+                        let mut pushed = false;
+                        let mut first_was_empty = false;
                         loop {
                             match decoder.next_frame_borrowed() {
                                 Ok(Some((traffic_id, payload))) => {
-                                    push_g2c(seg, traffic_id, payload, shutdown)?;
+                                    let was_empty = push_g2c(seg, traffic_id, payload, shutdown)?;
+                                    if !pushed {
+                                        first_was_empty = was_empty;
+                                        pushed = true;
+                                    }
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
@@ -398,6 +412,9 @@ fn relay(
                                     ))
                                 }
                             }
+                        }
+                        if pushed {
+                            seg.signal_g2c(first_was_empty);
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -415,18 +432,22 @@ fn relay(
 
 /// Push one frame into the gateway→client ring, applying backpressure (spin
 /// with a short backoff) while the client has not drained enough space.
+///
+/// Returns whether the ring had been empty before this push — the empty→non-empty
+/// edge — so the caller can coalesce the wakeup [`ShmSegment::signal_g2c`] across a
+/// whole batch of frames (one syscall per TLS read instead of one per frame). The
+/// success path therefore does **not** signal; the caller signals once after the
+/// batch. A *full* ring is the exception: the producer cannot make progress until
+/// the client drains, so it nudges the client there before backing off.
 fn push_g2c(
     seg: &ShmSegment,
     traffic_id: u32,
     data: &[u8],
     shutdown: &AtomicBool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     loop {
         match seg.push_g2c_frame(traffic_id, data) {
-            Ok(Some(was_empty)) => {
-                seg.signal_g2c(was_empty);
-                return Ok(());
-            }
+            Ok(Some(was_empty)) => return Ok(was_empty),
             Ok(None) => {
                 if shutdown.load(Ordering::Relaxed) {
                     return Err(io::Error::other("shutdown while gateway->client ring full"));

@@ -6,7 +6,7 @@ pub mod params;
 
 use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 
-use ktls_pipe::{enable_ktls_ctx, KtlsSession};
+use ktls_pipe::{enable_ktls_ctx, get_tcp_ulp, KtlsSession};
 use openssl::ssl::{
     SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslSessionCacheMode,
     SslStream, SslVerifyMode, SslVersion,
@@ -63,6 +63,24 @@ impl ProxyStream {
         match self {
             ProxyStream::Tls(s) => s.ssl().pending(),
             ProxyStream::Ktls { .. } => 0,
+        }
+    }
+
+    /// Whether kTLS is *actually* active on the underlying socket — i.e. the
+    /// kernel `tls` ULP attached after the handshake (`get_tcp_ulp` == `"tls"`).
+    ///
+    /// Returns `false` for userspace TLS, and crucially also `false` when kTLS
+    /// was *requested* but did not activate (missing privilege / unsupported
+    /// cipher): in that case the raw fd still carries ciphertext, so any
+    /// zero-copy splice fast-path MUST gate on this and fall back to the
+    /// userspace SSL path — otherwise it would splice cleartext onto the wire
+    /// (TRA #56).
+    pub fn ktls_active(&self) -> bool {
+        match self {
+            ProxyStream::Ktls { _stream, .. } => get_tcp_ulp(_stream)
+                .map(|ulp| ulp.starts_with("tls"))
+                .unwrap_or(false),
+            ProxyStream::Tls(_) => false,
         }
     }
 }
