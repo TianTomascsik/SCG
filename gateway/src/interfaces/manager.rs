@@ -98,6 +98,10 @@ struct EndpointTemplate {
     rule_name: String,
     upstream_addr: String,
     tls_mode: TlsMode,
+    /// `true` when the rule is the `routing` provider: the endpoint relays
+    /// plaintext on both legs (no TLS), exactly like the TCP routing provider
+    /// (TRA #58). The local-caller auth (`SO_PEERCRED`/owner-uid) is unchanged.
+    routing: bool,
     protocol_version: Option<String>,
     /// Raw provider params from the rule, used to build the decrypt-direction
     /// TLS server acceptor (cert/key/profile/verify); empty for encrypt rules.
@@ -285,6 +289,7 @@ impl InterfaceManager {
                 &rule.provider_params,
                 rule.protocol_version.as_deref(),
             );
+            let routing = rule.effective_security_provider() == "routing";
             let key = template_key(
                 &app_id,
                 rule.traffic_class,
@@ -304,6 +309,7 @@ impl InterfaceManager {
                     rule_name: rule.name.clone(),
                     upstream_addr: rule.upstream_addr.clone(),
                     tls_mode,
+                    routing,
                     protocol_version: rule.protocol_version.clone(),
                     provider_params: rule.provider_params.clone(),
                     allowed_uids: Arc::new(rule.allowed_uids.clone()),
@@ -461,6 +467,7 @@ impl InterfaceManager {
             direction,
             upstream_addr: template.upstream_addr.clone(),
             tls_mode: template.tls_mode,
+            routing: template.routing,
             protocol_version: template.protocol_version.clone(),
             provider_params: template.provider_params.clone(),
             sock_buf_size: self.sock_buf_size,
@@ -606,6 +613,7 @@ impl InterfaceManager {
             direction,
             upstream_addr: template.upstream_addr.clone(),
             tls_mode: template.tls_mode,
+            routing: template.routing,
             protocol_version: template.protocol_version.clone(),
             provider_params: template.provider_params.clone(),
             sock_buf_size: self.sock_buf_size,

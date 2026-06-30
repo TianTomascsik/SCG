@@ -21,7 +21,12 @@ use std::time::{Duration, Instant};
 
 // ─── ProxyStream ─────────────────────────────────────────────────────────────
 
-/// A bidirectional stream — either userspace TLS or kTLS.
+/// A bidirectional stream — userspace TLS, kTLS, or plaintext.
+///
+/// `Plain` carries no crypto: it is used **only** by `routing` local endpoints
+/// (UDS/SHM), where the gateway is a plaintext passthrough exactly like the TCP
+/// routing provider. TLS/kTLS endpoints never construct it, so the encrypted
+/// data path is unchanged (TRA #58).
 pub enum ProxyStream {
     Tls(SslStream<TcpStream>),
     Ktls {
@@ -29,6 +34,8 @@ pub enum ProxyStream {
         /// Keep the TcpStream alive (KtlsSession borrows the fd).
         _stream: TcpStream,
     },
+    /// Plaintext passthrough (routing local endpoints only — no encryption).
+    Plain(TcpStream),
 }
 
 impl ProxyStream {
@@ -36,6 +43,7 @@ impl ProxyStream {
         match self {
             ProxyStream::Tls(s) => s.read(buf),
             ProxyStream::Ktls { session, .. } => session.read(buf),
+            ProxyStream::Plain(s) => s.read(buf),
         }
     }
 
@@ -47,6 +55,9 @@ impl ProxyStream {
             ProxyStream::Ktls { session, .. } => {
                 session.shutdown();
             }
+            ProxyStream::Plain(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Write);
+            }
         }
     }
 
@@ -55,14 +66,16 @@ impl ProxyStream {
         match self {
             ProxyStream::Tls(s) => s.get_ref().as_raw_fd(),
             ProxyStream::Ktls { _stream, .. } => _stream.as_raw_fd(),
+            ProxyStream::Plain(s) => s.as_raw_fd(),
         }
     }
 
-    /// Check how many bytes are buffered in the SSL layer (0 for kTLS).
+    /// Check how many bytes are buffered in the SSL layer (0 for kTLS/plaintext).
     pub fn ssl_pending(&self) -> usize {
         match self {
             ProxyStream::Tls(s) => s.ssl().pending(),
             ProxyStream::Ktls { .. } => 0,
+            ProxyStream::Plain(_) => 0,
         }
     }
 
@@ -80,7 +93,7 @@ impl ProxyStream {
             ProxyStream::Ktls { _stream, .. } => get_tcp_ulp(_stream)
                 .map(|ulp| ulp.starts_with("tls"))
                 .unwrap_or(false),
-            ProxyStream::Tls(_) => false,
+            ProxyStream::Tls(_) | ProxyStream::Plain(_) => false,
         }
     }
 }
@@ -90,6 +103,7 @@ impl io::Read for ProxyStream {
         match self {
             ProxyStream::Tls(s) => s.read(buf),
             ProxyStream::Ktls { session, .. } => session.read(buf),
+            ProxyStream::Plain(s) => s.read(buf),
         }
     }
 }
@@ -99,6 +113,7 @@ impl io::Write for ProxyStream {
         match self {
             ProxyStream::Tls(s) => s.write(buf),
             ProxyStream::Ktls { session, .. } => session.write(buf),
+            ProxyStream::Plain(s) => s.write(buf),
         }
     }
 
@@ -106,6 +121,7 @@ impl io::Write for ProxyStream {
         match self {
             ProxyStream::Tls(s) => s.flush(),
             ProxyStream::Ktls { session, .. } => session.flush(),
+            ProxyStream::Plain(s) => s.flush(),
         }
     }
 }
@@ -460,6 +476,14 @@ pub fn write_all_nb_proxy(stream: &mut ProxyStream, data: &[u8]) -> io::Result<(
                 }
                 Err(e) => return Err(e),
             },
+            ProxyStream::Plain(s) => match s.write(&data[pos..]) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    poll_proxy_write_ready(stream, 100)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
         };
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
@@ -504,6 +528,17 @@ pub fn write_nb_proxy_timed(
                 }
                 Err(e) => return Err(e),
             },
+            ProxyStream::Plain(s) => match s.write(&data[pos..]) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if last_progress.elapsed() > timeout {
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                    }
+                    poll_proxy_write_ready(stream, 100)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
         };
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
@@ -512,4 +547,35 @@ pub fn write_nb_proxy_timed(
         last_progress = Instant::now();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyStream;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    #[test]
+    fn plain_proxy_stream_round_trips_plaintext() {
+        // ProxyStream::Plain (routing local endpoints, TRA #58) is a no-crypto
+        // passthrough: bytes written through it arrive verbatim on the peer with
+        // no TLS framing, it never buffers in an SSL layer, and never reports
+        // kTLS active (so the splice fast-path treats it correctly).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 5];
+            sock.read_exact(&mut buf).unwrap();
+            buf
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        let mut plain = ProxyStream::Plain(client);
+        plain.write_all(b"hello").unwrap();
+        plain.flush().unwrap();
+        assert_eq!(&server.join().unwrap(), b"hello");
+        assert_eq!(plain.ssl_pending(), 0);
+        assert!(!plain.ktls_active());
+    }
 }

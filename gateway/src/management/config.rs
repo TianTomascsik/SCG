@@ -60,6 +60,20 @@ pub struct GatewayConfig {
     /// verification, PSK, custom ciphers), stay on userspace TLS automatically.
     #[serde(default = "default_prefer_ktls")]
     pub prefer_ktls: bool,
+
+    /// Base worker-thread count for every rule's connection pool. When `None`
+    /// (the default), each rule uses [`ConnectionPool::default_size`] (`2×CPU`).
+    /// Relay jobs are long-lived (one worker per connection for the connection's
+    /// lifetime) and `Normal`-class pools do not overflow, so a host driving more
+    /// concurrent connections than `2×CPU` must raise this or excess connections
+    /// queue behind the base workers. Validated to a sane range (see
+    /// [`MAX_CONN_POOL_SIZE`]): `0` is rejected (a Normal pool with no workers
+    /// silently forwards nothing) and oversized values are rejected (eagerly
+    /// spawning that many threads per rule is a self-inflicted resource
+    /// exhaustion — TRA register #57). `Safety` pools still floor at their
+    /// reserved minimum regardless of this value.
+    #[serde(default)]
+    pub conn_pool_size: Option<usize>,
 }
 
 /// Management API (gRPC) configuration.
@@ -215,6 +229,12 @@ fn default_sock_buf_size() -> usize {
 fn default_prefer_ktls() -> bool {
     true
 }
+
+/// Upper bound on a configured `conn_pool_size`. Each rule eagerly spawns this
+/// many worker threads, so an unbounded value is a self-inflicted resource
+/// exhaustion (TRA register #57). 4096 base workers per rule is far above any
+/// realistic single-host concurrency yet bounds the blast radius of a typo.
+pub const MAX_CONN_POOL_SIZE: usize = 4096;
 
 /// Resolve the effective crypto provider name, applying the kTLS preference.
 ///
@@ -1138,6 +1158,25 @@ impl GatewayConfig {
             );
         }
 
+        // Bound the connection-pool size before any thread is spawned (TRA #57):
+        // 0 would leave a Normal pool with no workers (silently forwards
+        // nothing); an oversized value eagerly spawns that many threads per rule.
+        if let Some(size) = self.conn_pool_size {
+            if size == 0 {
+                return Err(
+                    "\"conn_pool_size\" must be at least 1 (0 leaves the connection pool with no \
+                     workers, so the rule would forward no traffic)"
+                        .to_string(),
+                );
+            }
+            if size > MAX_CONN_POOL_SIZE {
+                return Err(format!(
+                    "\"conn_pool_size\" {size} exceeds the maximum {MAX_CONN_POOL_SIZE} \
+                     (each rule eagerly spawns this many worker threads)"
+                ));
+            }
+        }
+
         let mut seen_names = HashSet::new();
         let mut seen_listen = HashSet::new();
 
@@ -1666,6 +1705,23 @@ impl GatewayConfig {
             }
         }
 
+        // Posture: a routing local endpoint (UDS/SHM) relays plaintext on both
+        // legs — there is no local-IPC encryption (TRA #58). The local caller is
+        // still uid-authenticated, but the data itself is unprotected. Warn so an
+        // operator does not deploy it believing the channel is encrypted.
+        for rule in &self.rules {
+            if matches!(rule.listen_proto, Proto::Uds | Proto::Shm)
+                && rule.effective_security_provider() == "routing"
+            {
+                warnings.push(format!(
+                    "Rule '{}': routing over {} relays cleartext with no local-IPC encryption — \
+                     the local app's data is unprotected on the endpoint and upstream legs. \
+                     Use a tls/ktls provider for an encrypted local channel.",
+                    rule.name, rule.listen_proto
+                ));
+            }
+        }
+
         // Validate protocol_version per rule
         for rule in &self.rules {
             if let Some(ref version) = rule.protocol_version {
@@ -2104,6 +2160,60 @@ mod dscp_tests {
     }
 
     #[test]
+    fn validate_bounds_conn_pool_size() {
+        // TRA #57: the configurable base pool size must be range-checked before
+        // any thread is spawned — 0 (no workers) and over-cap (thread storm) are
+        // rejected at validate()/--validate time; omitting it keeps the default.
+        let with_pool = |size: serde_json::Value| -> GatewayConfig {
+            serde_json::from_value(serde_json::json!({
+                "conn_pool_size": size,
+                "rules": [{
+                    "name": "r",
+                    "direction": "encrypt",
+                    "listen_addr": "127.0.0.1:8080",
+                    "upstream_addr": "127.0.0.1:9000",
+                    "security_provider": "tls",
+                    "verify": "none"
+                }]
+            }))
+            .expect("deserialize config")
+        };
+
+        let zero_err = with_pool(serde_json::json!(0)).validate().unwrap_err();
+        assert!(
+            zero_err.contains("conn_pool_size"),
+            "unexpected error: {zero_err}"
+        );
+
+        let over_err = with_pool(serde_json::json!(MAX_CONN_POOL_SIZE + 1))
+            .validate()
+            .unwrap_err();
+        assert!(
+            over_err.contains("conn_pool_size"),
+            "unexpected error: {over_err}"
+        );
+
+        assert!(with_pool(serde_json::json!(64)).validate().is_ok());
+        assert!(with_pool(serde_json::json!(MAX_CONN_POOL_SIZE))
+            .validate()
+            .is_ok());
+        // Omitted → None → ConnectionPool::default_size(); always valid.
+        let omitted: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "r",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:8080",
+                "upstream_addr": "127.0.0.1:9000",
+                "security_provider": "tls",
+                "verify": "none"
+            }]
+        }))
+        .expect("deserialize config");
+        assert!(omitted.conn_pool_size.is_none());
+        assert!(omitted.validate().is_ok());
+    }
+
+    #[test]
     fn preserve_uses_sampled_then_falls_back() {
         let normal = rule_from_json(serde_json::json!({
             "traffic_class": "normal",
@@ -2296,6 +2406,47 @@ mod dscp_tests {
                 .iter()
                 .any(|w| w.contains("does not require client certificates")),
             "mutual decrypt should not warn"
+        );
+    }
+
+    fn uds_rule(provider: &str) -> GatewayConfig {
+        serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "name": "r",
+                "direction": "encrypt",
+                "listen_addr": "unused",
+                "listen_proto": "uds",
+                "upstream_addr": "127.0.0.1:9000",
+                "security_provider": provider,
+                "app_id": "app",
+                "allowed_uids": [0]
+            }]
+        }))
+        .expect("deserialize config")
+    }
+
+    #[test]
+    fn preflight_warns_on_plaintext_routing_local_endpoint() {
+        // A routing UDS/SHM endpoint relays cleartext — the operator must be
+        // warned that there is no local-IPC encryption (TRA #58 criterion 3).
+        let cfg = uds_rule("routing");
+        assert!(
+            warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("no local-IPC encryption")),
+            "expected a cleartext routing-local-endpoint warning"
+        );
+    }
+
+    #[test]
+    fn preflight_silent_on_tls_local_endpoint() {
+        // A tls local endpoint is encrypted — no cleartext warning.
+        let cfg = uds_rule("tls");
+        assert!(
+            !warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("no local-IPC encryption")),
+            "tls local endpoint should not warn about cleartext"
         );
     }
 

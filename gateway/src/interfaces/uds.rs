@@ -7,7 +7,8 @@
 //! traffic through a TLS/kTLS upstream.
 
 use crate::interfaces::endpoint::{
-    accept_tls_upstream, authenticate_peer, connect_tls_upstream, relay_uds_tls,
+    accept_plain_upstream, accept_tls_upstream, authenticate_peer, connect_plain_upstream,
+    connect_tls_upstream, relay_uds_tls,
 };
 use crate::management::config::{Direction, PerfKnobs, QosPolicy, TlsMode};
 use crate::management::telemetry::ConnectionMetrics;
@@ -40,6 +41,9 @@ pub struct UdsEndpointTask {
     pub upstream_addr: String,
     /// TLS transport mode for the upstream leg.
     pub tls_mode: TlsMode,
+    /// `true` for the `routing` provider: relay plaintext on both legs (no TLS),
+    /// like the TCP routing provider. Local-caller auth is unchanged (TRA #58).
+    pub routing: bool,
     /// Optional TLS protocol version override.
     pub protocol_version: Option<String>,
     /// Raw provider params used to build the decrypt-direction TLS acceptor.
@@ -180,8 +184,25 @@ fn authenticate(stream: &UnixStream, task: &UdsEndpointTask) -> Result<PeerCred,
 /// Establish the TLS upstream (dial for encrypt, accept for decrypt) and run the
 /// bidirectional relay for one client.
 fn serve(task: &UdsEndpointTask, stream: UnixStream) {
-    let tls = match task.direction {
-        Direction::Encrypt => connect_tls_upstream(
+    // Routing endpoints relay plaintext (no TLS) on the upstream leg, exactly
+    // like the TCP routing provider (TRA #58); the local-caller auth already
+    // passed above. TLS/kTLS endpoints take the encrypted path unchanged.
+    let tls = match (task.routing, task.direction) {
+        (true, Direction::Encrypt) => connect_plain_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+        (true, Direction::Decrypt) => accept_plain_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+        (false, Direction::Encrypt) => connect_tls_upstream(
             &task.label,
             &task.upstream_addr,
             task.tls_mode,
@@ -191,7 +212,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
             task.qos,
             &task.shutdown,
         ),
-        Direction::Decrypt => accept_tls_upstream(
+        (false, Direction::Decrypt) => accept_tls_upstream(
             &task.label,
             &task.upstream_addr,
             task.tls_mode,

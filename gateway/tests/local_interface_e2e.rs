@@ -11,9 +11,9 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{build_config, build_config_provider, current_uid, wait_for_socket, EchoServer};
 
@@ -182,4 +182,165 @@ fn shm_burst_round_trip_batched_signal() {
     let _ = mgmt_handle.join();
     let _ = std::fs::remove_dir_all(&tmp);
     let _ = echo;
+}
+
+/// Build a gateway config that bridges a SHM **encrypt** endpoint to a SHM
+/// **decrypt** endpoint over a loopback TCP, both in `routing` (plaintext) mode —
+/// exactly the topology SESHAT's SHM throughput scenarios use. A client on the
+/// encrypt endpoint floods `c2g`; the gateway relays it over `127.0.0.1:<port>`
+/// to the decrypt endpoint, whose `g2c` ring a second client drains.
+fn build_routing_shm_bridge(
+    uid: u32,
+    tmp: &std::path::Path,
+    port: u16,
+    ring_cap: usize,
+) -> GatewayConfig {
+    let mgmt_sock = tmp.join("mgmt.sock");
+    let runtime_dir = tmp.join("run");
+    let json = format!(
+        r#"{{
+            "rules": [
+                {{
+                    "name": "shm-flood-decrypt",
+                    "direction": "decrypt",
+                    "listen_addr": "unused",
+                    "listen_proto": "shm",
+                    "upstream_addr": "127.0.0.1:{port}",
+                    "upstream_proto": "tcp",
+                    "security_provider": "routing",
+                    "verify": "none",
+                    "traffic_class": "safety",
+                    "app_id": "flood",
+                    "allowed_uids": [{uid}]
+                }},
+                {{
+                    "name": "shm-flood-encrypt",
+                    "direction": "encrypt",
+                    "listen_addr": "unused",
+                    "listen_proto": "shm",
+                    "upstream_addr": "127.0.0.1:{port}",
+                    "upstream_proto": "tcp",
+                    "security_provider": "routing",
+                    "verify": "none",
+                    "traffic_class": "safety",
+                    "app_id": "flood",
+                    "allowed_uids": [{uid}]
+                }}
+            ],
+            "api": {{
+                "enabled": true,
+                "uds_path": "{mgmt}",
+                "runtime_dir": "{run}",
+                "shm_ring_capacity": {ring_cap}
+            }}
+        }}"#,
+        port = port,
+        uid = uid,
+        mgmt = mgmt_sock.display(),
+        run = runtime_dir.display(),
+        ring_cap = ring_cap,
+    );
+    serde_json::from_str(&json).expect("parse routing-SHM-bridge config")
+}
+
+/// End-to-end smoke for the `routing` SHM bridge under a sustained flood: a
+/// client floods the encrypt endpoint's `c2g` ring while a second client drains
+/// the decrypt endpoint's `g2c` ring, with the gateway relaying plaintext over a
+/// loopback TCP between them — the exact topology of SESHAT's `routing-only` SHM
+/// throughput scenarios.
+///
+/// It samples how many frames the receiver drained *during* the flood (before any
+/// post-flood settle): a healthy pipeline delivers many thousands. (The
+/// deterministic guard for the underlying `coalesce_c2g_into` drain bound is the
+/// `coalesce_c2g_is_bounded_per_call` unit test; this exercises the full path.)
+#[test]
+fn shm_routing_flood_delivers_under_load() {
+    const MSG: usize = 4096; // the message size that livelocked under SESHAT affinity
+    const FLOOD: Duration = Duration::from_secs(1);
+    const MIN_DELIVERED: u64 = 1000;
+
+    let uid = current_uid();
+    let tmp = common::temp_dir("e2e-shm-flood");
+    let port = common::free_port();
+    let config = build_routing_shm_bridge(uid, &tmp, port, 1024 * 1024);
+    let api = config.api.clone().expect("api config present");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let manager = InterfaceManager::new(&config, "itest-1.0", shutdown.clone());
+    let mgmt_handle = start_management_server(manager.clone(), api.clone(), shutdown.clone())
+        .expect("start management server");
+
+    let mgmt_path = std::path::PathBuf::from(&api.uds_path);
+    assert!(
+        wait_for_socket(&mgmt_path, Duration::from_secs(5)),
+        "management socket never became connectable"
+    );
+
+    // Receiver (decrypt endpoint) first, so the decrypt relay is accepting on the
+    // bridge port before the encrypt relay dials it.
+    let mut rx = ScgClient::connect(
+        Some(&mgmt_path),
+        "flood",
+        Transport::Shm,
+        TrafficClass::Safety,
+        Direction::Decrypt,
+    )
+    .expect("SHM rx connect");
+    let mut tx = ScgClient::connect(
+        Some(&mgmt_path),
+        "flood",
+        Transport::Shm,
+        TrafficClass::Safety,
+        Direction::Encrypt,
+    )
+    .expect("SHM tx connect");
+
+    let received = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let received_rx = received.clone();
+    let stop_rx = stop.clone();
+    let recv_handle = std::thread::spawn(move || {
+        let mut buf = vec![0u8; MSG];
+        while !stop_rx.load(Ordering::Relaxed) {
+            match rx.recv_into(&mut buf, Some(Duration::from_millis(50))) {
+                Ok(Some((_id, len))) => {
+                    assert_eq!(len, MSG, "payload length must be preserved");
+                    received_rx.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Flood the encrypt ring as fast as it accepts, for FLOOD seconds.
+    let payload = vec![0xABu8; MSG];
+    let deadline = Instant::now() + FLOOD;
+    let mut id = 0u32;
+    while Instant::now() < deadline {
+        if tx.try_send(id, &payload).expect("SHM send") {
+            id = id.wrapping_add(1);
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    // Sample delivery *during* the flood (a post-flood drain would mask a livelock
+    // that only resolves once the producer stops).
+    let delivered_during_flood = received.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = recv_handle.join();
+    let _ = tx.close();
+
+    shutdown.store(true, Ordering::SeqCst);
+    manager.shutdown_all();
+    let _ = mgmt_handle.join();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        delivered_during_flood >= MIN_DELIVERED,
+        "SHM relay delivered only {delivered_during_flood} frames during a {}s flood \
+         (expected >= {MIN_DELIVERED}); the c2g drain livelocked",
+        FLOOD.as_secs()
+    );
 }

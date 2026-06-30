@@ -24,7 +24,10 @@
 //! inside TLS, so a SHM client interoperates end-to-end with a UDS client on a
 //! peer gateway.
 
-use crate::interfaces::endpoint::{accept_tls_upstream, authenticate_peer, connect_tls_upstream};
+use crate::interfaces::endpoint::{
+    accept_plain_upstream, accept_tls_upstream, authenticate_peer, connect_plain_upstream,
+    connect_tls_upstream,
+};
 use crate::management::config::{Direction, QosPolicy, ShmNotify, ShmRingKind, TlsMode};
 use crate::networking::socket_manager::{apply_safety_priority, set_nodelay, set_nonblocking_fd};
 use crate::security::tls_engine::{write_all_nb_proxy, ProxyStream};
@@ -73,6 +76,9 @@ pub struct ShmEndpointTask {
     pub upstream_addr: String,
     /// TLS transport mode for the upstream leg.
     pub tls_mode: TlsMode,
+    /// `true` for the `routing` provider: relay plaintext on both legs (no TLS),
+    /// like the TCP routing provider. Local-caller auth is unchanged (TRA #58).
+    pub routing: bool,
     /// Optional TLS protocol version override.
     pub protocol_version: Option<String>,
     /// Raw provider params used to build the decrypt-direction TLS acceptor.
@@ -263,8 +269,24 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
         task.label
     );
 
-    let tls = match task.direction {
-        Direction::Encrypt => connect_tls_upstream(
+    // Routing endpoints relay plaintext (no TLS) on the upstream leg, like the
+    // TCP routing provider (TRA #58); local-caller auth already passed above.
+    let tls = match (task.routing, task.direction) {
+        (true, Direction::Encrypt) => connect_plain_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+        (true, Direction::Decrypt) => accept_plain_upstream(
+            &task.label,
+            &task.upstream_addr,
+            task.sock_buf_size,
+            task.qos,
+            &task.shutdown,
+        ),
+        (false, Direction::Encrypt) => connect_tls_upstream(
             &task.label,
             &task.upstream_addr,
             task.tls_mode,
@@ -274,7 +296,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
             task.qos,
             &task.shutdown,
         ),
-        Direction::Decrypt => accept_tls_upstream(
+        (false, Direction::Decrypt) => accept_tls_upstream(
             &task.label,
             &task.upstream_addr,
             task.tls_mode,
@@ -681,17 +703,30 @@ impl ShmSegment {
     /// and re-frames via `encode_into`.
     #[inline]
     fn coalesce_c2g_into(&self, framed: &mut Vec<u8>, scratch: &mut Vec<u8>) -> usize {
+        // Drain at most ~`RELAY_BUF_SIZE` of client data per call. The client
+        // (producer) can refill the ring as fast as the gateway drains it, so an
+        // unbounded `while let Some(..)` loop *livelocks*: it never returns to the
+        // caller to actually write the coalesced bytes upstream, `framed` grows
+        // without limit, and the downstream relay starves. Bounding the batch
+        // guarantees forward progress (write, then loop to drain the rest) and
+        // caps `framed` to its preallocated capacity.
         let mut n = 0;
         match &self.backend {
             RingBackend::Slot { consumer, .. } => {
-                while let Some(frame) = consumer.peek_frame() {
+                while framed.len() < RELAY_BUF_SIZE {
+                    let Some(frame) = consumer.peek_frame() else {
+                        break;
+                    };
                     framed.extend_from_slice(frame);
                     consumer.advance();
                     n += 1;
                 }
             }
             RingBackend::ByteStream { consumer, .. } => {
-                while let Some(traffic_id) = consumer.try_pop_into(scratch) {
+                while framed.len() < RELAY_BUF_SIZE {
+                    let Some(traffic_id) = consumer.try_pop_into(scratch) else {
+                        break;
+                    };
                     encode_into(framed, traffic_id, scratch);
                     n += 1;
                 }
@@ -844,5 +879,132 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
             return false;
         }
         return ret > 0 && (pfd.revents & libc::POLLIN) != 0;
+    }
+}
+
+#[cfg(test)]
+impl ShmSegment {
+    /// Test-only: build a client-side producer over this segment's `c2g` ring and
+    /// push `frame` until the ring is full, returning the number of frames
+    /// written. Used to pre-load the ring so a single `coalesce_c2g_into` can be
+    /// checked for its drain bound.
+    fn test_fill_c2g(&self, frame: &[u8]) -> usize {
+        use scg_ipc::shm::client_rings;
+        // A second, writable mapping of the same `c2g` memfd (the gateway's own
+        // mapping is read-only). MAP_SHARED writes land in the memfd pages, so the
+        // gateway consumer sees them; the c2g memfd is sealed SHRINK|GROW only, so
+        // a writable mapping is permitted.
+        let wr = os::mmap_shared(self.data_c2g_fd, self.cap_c2g, MapProt::ReadWrite)
+            .expect("writable c2g mapping");
+        // SAFETY: `_control_map`/`_data_g2c_map` are live mappings owned by `self`
+        // and outlive `producer`; `wr` is a live writable mapping of `cap_c2g`
+        // bytes held in scope for the whole fill; the control page was initialised
+        // by `create`, and the lengths match the segment geometry.
+        let (producer, _consumer) = unsafe {
+            client_rings(
+                self._control_map.as_ptr(),
+                self._control_map.len(),
+                wr.as_ptr(),
+                self.cap_c2g,
+                self._data_g2c_map.as_ptr(),
+                self.cap_g2c,
+            )
+        }
+        .expect("client rings");
+        let mut n = 0;
+        while producer.try_push(1, frame).expect("push frame") {
+            n += 1;
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a byte-stream SHM segment with the requested ring capacities. Only
+    /// the fields `ShmSegment::create` consults need to be meaningful.
+    fn byte_stream_segment(cap_c2g: usize, cap_g2c: usize) -> ShmSegment {
+        let task = ShmEndpointTask {
+            label: "test".to_string(),
+            control_socket_path: PathBuf::new(),
+            direction: Direction::Encrypt,
+            upstream_addr: String::new(),
+            tls_mode: TlsMode::Tls,
+            routing: true,
+            protocol_version: None,
+            provider_params: HashMap::new(),
+            sock_buf_size: 0,
+            qos: QosPolicy {
+                dscp_tag: None,
+                preserve_inbound_dscp: false,
+                traffic_class: crate::management::config::TrafficClass::default(),
+            },
+            cap_c2g,
+            cap_g2c,
+            spin_wait_us: 0,
+            ring_kind: ShmRingKind::ByteStream,
+            segment_size: 0,
+            num_segments: 0,
+            g2c_notify: ShmNotify::Eventfd,
+            allowed_uids: Arc::new(Vec::new()),
+            allowed_pids: Arc::new(Vec::new()),
+            owner_uid: 0,
+            token: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        ShmSegment::create(&task).expect("create byte-stream segment")
+    }
+
+    /// `coalesce_c2g_into` must drain at most ~`RELAY_BUF_SIZE` per call even when
+    /// the ring holds more. An unbounded loop livelocks under a sustained producer
+    /// (the SHM zero-throughput bug): with a ring larger than `RELAY_BUF_SIZE`,
+    /// the unbounded form drains the whole ring in one call, while the bounded
+    /// form stops at the budget and leaves the rest for the next iteration.
+    #[test]
+    fn coalesce_c2g_is_bounded_per_call() {
+        // Ring deliberately larger than the per-call drain budget so the bound is
+        // observable from a single static fill (no concurrency needed).
+        let cap_c2g = 2 * RELAY_BUF_SIZE; // 8 MiB
+        let seg = byte_stream_segment(cap_c2g, page_size());
+
+        let payload = vec![0u8; 4096];
+        let pushed = seg.test_fill_c2g(&payload);
+        let frame_len = 4096 + scg_ipc::frame::FRAME_HEADER_LEN;
+        // The fill must exceed one drain budget, otherwise the test proves nothing.
+        assert!(
+            pushed * frame_len > RELAY_BUF_SIZE,
+            "ring fill ({} bytes) must exceed RELAY_BUF_SIZE",
+            pushed * frame_len
+        );
+
+        let mut framed = Vec::with_capacity(RELAY_BUF_SIZE);
+        let mut scratch = Vec::new();
+        let drained = seg.coalesce_c2g_into(&mut framed, &mut scratch);
+
+        // Bounded: one call drains at most a budget's worth (+ at most one frame),
+        // not the whole oversized ring.
+        assert!(
+            framed.len() <= RELAY_BUF_SIZE + frame_len,
+            "coalesce drained {} bytes in one call; the per-call bound did not hold",
+            framed.len()
+        );
+        assert!(
+            drained < pushed,
+            "coalesce drained the whole ring in one call"
+        );
+        assert!(
+            !seg.consumer_is_empty(),
+            "the ring must still hold frames after a single bounded drain"
+        );
+
+        // Forward progress: draining repeatedly empties the ring.
+        let mut total = drained;
+        while !seg.consumer_is_empty() {
+            framed.clear();
+            total += seg.coalesce_c2g_into(&mut framed, &mut scratch);
+        }
+        assert_eq!(total, pushed, "every pushed frame must eventually drain");
     }
 }

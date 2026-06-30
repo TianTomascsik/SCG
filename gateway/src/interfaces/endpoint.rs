@@ -403,6 +403,81 @@ pub fn accept_tls_upstream(
     Ok(proxy)
 }
 
+/// Connect to `upstream_addr` over **plaintext TCP** (no TLS) for a `routing`
+/// local endpoint — the encrypt-direction counterpart for the routing provider.
+///
+/// The local-caller authentication (`SO_PEERCRED` + owner-uid) has already
+/// passed in the endpoint accept loop before this runs; this only sets up the
+/// plaintext relay leg, exactly as the static TCP routing provider does. No
+/// encryption is applied on this hop by design (TRA #58); a `--validate` posture
+/// warning advises the operator.
+pub fn connect_plain_upstream(
+    label: &str,
+    upstream_addr: &str,
+    sock_buf_size: usize,
+    qos: QosPolicy,
+    shutdown: &AtomicBool,
+) -> io::Result<ProxyStream> {
+    let upstream_tcp = connect_with_retry(
+        upstream_addr,
+        4,
+        Duration::from_secs(1),
+        Duration::from_secs(4),
+        shutdown,
+    )?;
+    let up_fd = upstream_tcp.as_raw_fd();
+    tune_socket_buffers(up_fd, sock_buf_size);
+    set_nodelay(up_fd, true);
+    let up_is_v6 = upstream_tcp
+        .peer_addr()
+        .map(|a| a.is_ipv6())
+        .unwrap_or(false);
+    apply_egress_qos(up_fd, qos.egress_dscp(None), qos.so_priority(), up_is_v6);
+    info!("[{label}] routing upstream connected (plaintext, no TLS)");
+    Ok(ProxyStream::Plain(upstream_tcp))
+}
+
+/// Accept one **plaintext TCP** connection (no TLS) on `listen_addr` for a
+/// `routing` decrypt local endpoint — the plaintext counterpart to
+/// [`accept_tls_upstream`].
+pub fn accept_plain_upstream(
+    label: &str,
+    listen_addr: &str,
+    sock_buf_size: usize,
+    qos: QosPolicy,
+    shutdown: &AtomicBool,
+) -> io::Result<ProxyStream> {
+    let listener = bind_tcp_listener(listen_addr, false, label).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("failed to bind routing listener on {listen_addr}"),
+        )
+    })?;
+    listener.set_nonblocking(false).ok();
+
+    let (stream, peer_addr): (TcpStream, _) = loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shutdown while awaiting routing connection",
+            ));
+        }
+        match accept_with_timeout(&listener, Duration::from_millis(200)) {
+            Some(Ok(pair)) => break pair,
+            Some(Err(e)) => return Err(e),
+            None => continue,
+        }
+    };
+
+    let fd = stream.as_raw_fd();
+    tune_socket_buffers(fd, sock_buf_size);
+    set_nodelay(fd, true);
+    let is_v6 = peer_addr.is_ipv6();
+    apply_egress_qos(fd, qos.egress_dscp(None), qos.so_priority(), is_v6);
+    info!("[{label}] routing downstream accepted from {peer_addr} (plaintext, no TLS)");
+    Ok(ProxyStream::Plain(stream))
+}
+
 /// Whether the UDS relay may use the zero-copy `splice(2)` fast-path.
 ///
 /// Splicing the UDS socket straight to the upstream fd (and back) is correct

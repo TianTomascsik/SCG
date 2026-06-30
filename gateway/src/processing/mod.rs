@@ -269,10 +269,16 @@ pub fn start_single_rule(
     let rule_shutdown_stats = rule_shutdown.clone();
     let stats_rule_name = rule_name.clone();
 
-    // Build the connection pool for this rule (2× CPUs). Safety rules get a
+    // Build the connection pool for this rule. Defaults to 2× CPUs, but an
+    // operator may raise it via `conn_pool_size` when driving more concurrent
+    // connections than that (relay jobs are long-lived and Normal pools don't
+    // overflow, so excess connections queue behind the base workers). The value
+    // is range-checked in `GatewayConfig::validate` (TRA #57). Safety rules get a
     // class-aware pool: reserved minimum workers at elevated priority so a
     // normal-traffic storm cannot starve safety capacity.
-    let pool_size = ConnectionPool::default_size();
+    let pool_size = config
+        .conn_pool_size
+        .unwrap_or_else(ConnectionPool::default_size);
     let conn_pool = Arc::new(ConnectionPool::new_for_class(
         pool_size,
         &rule.name,
