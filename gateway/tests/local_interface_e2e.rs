@@ -54,7 +54,7 @@ fn round_trip_through_gateway(config: GatewayConfig, tmp: &std::path::Path) {
     let api = config.api.clone().expect("api config present");
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let manager = InterfaceManager::new(&config, "itest-1.0", shutdown.clone(), None);
+    let manager = InterfaceManager::new(&config, "itest-1.0", None);
     let mgmt_handle = start_management_server(manager.clone(), api.clone(), shutdown.clone())
         .expect("start management server");
 
@@ -137,7 +137,7 @@ fn shm_burst_round_trip_batched_signal() {
     let api = config.api.clone().expect("api config present");
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let manager = InterfaceManager::new(&config, "itest-1.0", shutdown.clone(), None);
+    let manager = InterfaceManager::new(&config, "itest-1.0", None);
     let mgmt_handle = start_management_server(manager.clone(), api.clone(), shutdown.clone())
         .expect("start management server");
 
@@ -266,7 +266,7 @@ fn shm_routing_flood_delivers_under_load() {
     let api = config.api.clone().expect("api config present");
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let manager = InterfaceManager::new(&config, "itest-1.0", shutdown.clone(), None);
+    let manager = InterfaceManager::new(&config, "itest-1.0", None);
     let mgmt_handle = start_management_server(manager.clone(), api.clone(), shutdown.clone())
         .expect("start management server");
 

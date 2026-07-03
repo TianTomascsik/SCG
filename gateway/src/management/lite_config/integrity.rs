@@ -50,18 +50,26 @@ pub fn verify_ed25519(pubkey: &PKey<Public>, msg: &[u8], sig: &[u8]) -> Result<(
     }
 }
 
-/// Verify the detached signature next to `file` against `pubkey`.
+/// Verify the detached signature next to `file` over `data` — the exact bytes
+/// the caller already read and parsed, **never** a re-read of `file`: a writer
+/// racing the loader must not be able to swap the file's content between the
+/// parse and this check (TOCTOU, TRA #70). `file` is used only to locate the
+/// signature file and to label errors.
 ///
 /// Returns `Ok(())` on success or a human-readable error describing the first
 /// problem (missing signature, malformed base64, or a failed check).
-pub fn verify_signature(file: &Path, suffix: &str, pubkey: &PKey<Public>) -> Result<(), String> {
-    let data = fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+pub fn verify_signature_bytes(
+    data: &[u8],
+    file: &Path,
+    suffix: &str,
+    pubkey: &PKey<Public>,
+) -> Result<(), String> {
     let sig_file = sig_path_for(file, suffix);
     let sig_text = fs::read_to_string(&sig_file)
         .map_err(|e| format!("signature file not found: {}: {e}", sig_file.display()))?;
     let sig = base64::decode_block(sig_text.trim())
         .map_err(|e| format!("signature {} is not valid base64: {e}", sig_file.display()))?;
-    verify_ed25519(pubkey, &data, &sig).map_err(|e| {
+    verify_ed25519(pubkey, data, &sig).map_err(|e| {
         let name = file
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())

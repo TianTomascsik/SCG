@@ -7,8 +7,7 @@
 //! traffic through a TLS/kTLS upstream.
 
 use crate::interfaces::endpoint::{
-    accept_plain_upstream, accept_tls_upstream, authenticate_peer, connect_plain_upstream,
-    connect_tls_upstream, relay_uds_tls, EndpointPolicy,
+    authenticate_peer, establish_upstream, poll_readable, relay_uds_tls, EndpointPolicy,
 };
 use crate::management::config::{Direction, PerfKnobs, QosPolicy, TlsMode};
 use crate::management::telemetry::ConnectionMetrics;
@@ -21,7 +20,7 @@ use scg_ipc::token::CapabilityToken;
 use log::{error, info, warn};
 
 use std::collections::HashMap;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -196,59 +195,21 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
     });
     let policy = endpoint_policy.as_ref();
 
-    // Routing endpoints relay plaintext (no TLS) on the upstream leg, exactly
-    // like the TCP routing provider (TRA #58); the local-caller auth already
-    // passed above. TLS/kTLS endpoints take the encrypted path unchanged.
-    let tls = match (task.routing, task.direction) {
-        (true, Direction::Encrypt) => connect_plain_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-        (true, Direction::Decrypt) => accept_plain_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-        (false, Direction::Encrypt) => connect_tls_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.tls_mode,
-            &task.provider_params,
-            task.protocol_version.as_deref(),
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-        (false, Direction::Decrypt) => accept_tls_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.tls_mode,
-            &task.provider_params,
-            task.protocol_version.as_deref(),
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-    };
-    let mut tls = match tls {
-        Ok(t) => t,
-        Err(e) => {
-            let verb = match task.direction {
-                Direction::Encrypt => "connect",
-                Direction::Decrypt => "accept",
-            };
-            error!("[{}] upstream {verb} failed: {e}", task.label);
-            return;
-        }
+    let mut tls = match establish_upstream(
+        &task.label,
+        task.routing,
+        task.direction,
+        &task.upstream_addr,
+        task.tls_mode,
+        &task.provider_params,
+        task.protocol_version.as_deref(),
+        task.sock_buf_size,
+        task.qos,
+        policy,
+        &task.shutdown,
+    ) {
+        Some(t) => t,
+        None => return,
     };
 
     let direction = match task.direction {
@@ -275,33 +236,12 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
 
     let elapsed = conn_metrics.elapsed_secs();
     info!(
-        "[{}] UDS relay done: {:.3}s, {} msgs, {:.2} Mib in / {:.2} Mib out",
+        // bytes * 8 / 1e6 is decimal megabits (Mbit), not mebibits (L13).
+        "[{}] UDS relay done: {:.3}s, {} msgs, {:.2} Mbit in / {:.2} Mbit out",
         task.label,
         elapsed,
         conn_metrics.msgs_relayed,
         conn_metrics.bytes_in as f64 * 8.0 / 1e6,
         conn_metrics.bytes_out as f64 * 8.0 / 1e6,
     );
-}
-
-/// Poll a single fd for readability with a timeout (ms). Returns `true` if the
-/// fd is readable, `false` on timeout. Retries on `EINTR`.
-fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
-    loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pfd` is a valid, initialised pollfd for a single descriptor.
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return false;
-        }
-        return r > 0 && (pfd.revents & libc::POLLIN) != 0;
-    }
 }

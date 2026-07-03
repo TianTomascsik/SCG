@@ -5,12 +5,19 @@
 //! not yet implement (multi-path fail-over, UDS/SHM egress, integrity-only,
 //! PSK, policy enforcement, …) are surfaced as warnings rather than silently
 //! dropped, so an operator always sees what was and was not honoured.
+//!
+//! *Structural* errors are a different matter: an enabled connection that
+//! cannot be mapped at all (unresolvable `profile_ref`, missing endpoint, …)
+//! rejects the whole load (M16, fail-closed) — matching the classic loader,
+//! where any invalid config keeps the currently-running one. Only disabled
+//! connections are skipped with a warning.
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Result of mapping: the rendered classic-config `rules` array plus any
 /// non-fatal warnings describing deferred or downgraded behaviour.
+#[derive(Debug)]
 pub struct MappedRules {
     pub rules: Vec<Value>,
     pub warnings: Vec<String>,
@@ -63,7 +70,13 @@ pub fn map_connections_to_rules(merged: &Value) -> Result<MappedRules, String> {
 
         match map_one(conn, &profiles, &mut warnings) {
             Ok(rule) => rules.push(rule),
-            Err(e) => warnings.push(format!("connection '{cid}': skipped — {e}")),
+            // Fail closed (M16): an *enabled* connection that cannot be
+            // mapped rejects the whole load — on a hot reload the watcher
+            // then keeps the running config, instead of loading a config
+            // with this connection missing and tearing down the live rule
+            // that served it. Deferred-feature downgrades inside map_one
+            // remain warnings; only structural errors reach this arm.
+            Err(e) => return Err(format!("connection '{cid}': {e}")),
         }
     }
 
@@ -177,8 +190,11 @@ fn dtls_version(profile: &Value) -> Option<String> {
 }
 
 /// Choose the primary path: an explicit `role == "primary"`, else the lowest
-/// `priority`, else the first entry.
-fn pick_primary(paths: &[Value]) -> &Value {
+/// `priority` (which exists for any non-empty slice). Returns `None` for an
+/// empty slice instead of indexing into it — the emptiness invariant belongs
+/// to the caller, and a panicking `&paths[0]` fallback would turn a future
+/// caller's slip into a data-plane panic (L32).
+fn pick_primary(paths: &[Value]) -> Option<&Value> {
     paths
         .iter()
         .find(|p| p.get("role").and_then(|v| v.as_str()) == Some("primary"))
@@ -189,7 +205,6 @@ fn pick_primary(paths: &[Value]) -> &Value {
                     .unwrap_or(i64::MAX)
             })
         })
-        .unwrap_or(&paths[0])
 }
 
 fn map_one(
@@ -287,7 +302,7 @@ fn map_one(
             paths.len()
         ));
     }
-    let primary = pick_primary(paths);
+    let primary = pick_primary(paths).ok_or("connection has no 'paths'")?;
     let egress_ep = primary
         .pointer("/egress/endpoint")
         .ok_or("primary path has no 'egress.endpoint'")?;
@@ -472,9 +487,28 @@ mod tests {
         assert_eq!(r["app_protocol"], "ale");
     }
 
+    /// Like [`map`] but for configs expected to be rejected (M16 fail-closed).
+    fn map_err(connections: Value) -> String {
+        let merged = serde_json::json!({
+            "crypto": {
+                "profiles": [
+                    { "profile_id": "tls_c", "protocol": "TLS", "role": "client",
+                      "max_version": "1.3" },
+                    { "profile_id": "dtls_s", "protocol": "DTLS", "role": "server",
+                      "max_version": "1.2" }
+                ]
+            },
+            "connections": connections
+        });
+        map_connections_to_rules(&merged).unwrap_err()
+    }
+
+    // M16 (fail-closed): an ENABLED connection that cannot be mapped rejects
+    // the whole load, so a hot reload keeps the running config instead of
+    // silently dropping the connection and tearing down its live rule.
     #[test]
-    fn uds_egress_is_skipped_with_warning() {
-        let m = map(serde_json::json!([{
+    fn enabled_uds_egress_rejects_load_fail_closed() {
+        let err = map_err(serde_json::json!([{
             "connection_id": "c-uds",
             "app_id": "a",
             "enabled": true,
@@ -482,19 +516,12 @@ mod tests {
             "ingress": { "endpoint": { "ip": "127.0.20.20", "port": 5684, "protocol": "udp" } },
             "paths": [ { "egress": { "endpoint": { "type": "uds", "path": "/run/x.sock" } } } ]
         }]));
-        assert!(m.rules.is_empty());
-        assert!(
-            m.warnings
-                .iter()
-                .any(|w| w.contains("uds") && w.contains("skipped")),
-            "got: {:?}",
-            m.warnings
-        );
+        assert!(err.contains("c-uds") && err.contains("uds"), "got: {err}");
     }
 
     #[test]
-    fn auto_egress_without_transparent_is_skipped() {
-        let m = map(serde_json::json!([{
+    fn enabled_auto_egress_without_transparent_rejects_load() {
+        let err = map_err(serde_json::json!([{
             "connection_id": "c-bad-auto",
             "app_id": "a",
             "enabled": true,
@@ -503,11 +530,40 @@ mod tests {
             "ingress": { "endpoint": { "ip": "127.0.0.1", "port": 1234, "protocol": "tcp" } },
             "paths": [ { "egress": { "endpoint": "auto" } } ]
         }]));
+        assert!(err.contains("requires transparent"), "got: {err}");
+    }
+
+    #[test]
+    fn enabled_unresolvable_profile_ref_rejects_load() {
+        let err = map_err(serde_json::json!([{
+            "connection_id": "c-typo",
+            "app_id": "a",
+            "enabled": true,
+            "protection": { "profile_ref": "no-such-profile", "role": "client", "mode": "full" },
+            "ingress": { "endpoint": { "ip": "127.0.0.1", "port": 1235, "protocol": "tcp" } },
+            "paths": [ { "egress": { "endpoint": { "host": "h", "port": 443, "protocol": "tcp" } } } ]
+        }]));
+        assert!(
+            err.contains("c-typo") && err.contains("no-such-profile"),
+            "got: {err}"
+        );
+    }
+
+    // Disabled connections keep the warn-and-skip behaviour — even broken
+    // ones must not block the load.
+    #[test]
+    fn disabled_connection_is_skipped_with_warning() {
+        let m = map(serde_json::json!([{
+            "connection_id": "c-off",
+            "app_id": "a",
+            "enabled": false,
+            "protection": { "profile_ref": "no-such-profile", "role": "client", "mode": "full" },
+            "ingress": { "endpoint": { "ip": "127.0.0.1", "port": 1236, "protocol": "tcp" } },
+            "paths": [ { "egress": { "endpoint": { "host": "h", "port": 443, "protocol": "tcp" } } } ]
+        }]));
         assert!(m.rules.is_empty());
         assert!(
-            m.warnings
-                .iter()
-                .any(|w| w.contains("requires transparent")),
+            m.warnings.iter().any(|w| w.contains("disabled")),
             "got: {:?}",
             m.warnings
         );

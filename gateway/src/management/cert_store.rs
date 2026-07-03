@@ -40,8 +40,10 @@ pub fn get_or_init_cert() -> Result<&'static CachedCert, openssl::error::ErrorSt
     builder.set_not_after(not_after.as_ref())?;
     builder.sign(&pkey, MessageDigest::sha256())?;
     let cert = (pkey, builder.build());
-    let _ = CACHED_CERT.set(cert);
-    Ok(CACHED_CERT.get().unwrap())
+    // Build first, then publish with `get_or_init` (L31): no `.unwrap()` in
+    // library code, and the loser of a cold-start race discards its value
+    // deterministically instead of relying on a provably-Some `get()`.
+    Ok(CACHED_CERT.get_or_init(|| cert))
 }
 
 // ─── PEM identity loading ────────────────────────────────────────────────────
@@ -85,8 +87,14 @@ pub fn load_identity_pem(
 
     let cert_pem = std::fs::read(cert_path)
         .map_err(|e| format!("failed to read cert_path '{}': {}", cert_path.display(), e))?;
-    let key_pem = std::fs::read(key_path)
-        .map_err(|e| format!("failed to read key_path '{}': {}", key_path.display(), e))?;
+    // The PEM private key is secret material: wrap it in `Zeroizing` so the
+    // heap buffer is wiped when this function returns, on both the success and
+    // error paths, instead of lingering in freed memory (L1, KC-02). OpenSSL
+    // keeps its own parsed copy; this only protects the transient PEM bytes.
+    let key_pem = zeroize::Zeroizing::new(
+        std::fs::read(key_path)
+            .map_err(|e| format!("failed to read key_path '{}': {}", key_path.display(), e))?,
+    );
 
     let cert = X509::from_pem(&cert_pem)
         .map_err(|e| format!("invalid certificate in '{}': {}", cert_path.display(), e))?;
@@ -143,5 +151,22 @@ mod tests {
     fn key_perm_warning_silent_on_0600() {
         assert!(key_perm_warning(Path::new("/tmp/k.pem"), 0o100600).is_none());
         assert!(key_perm_warning(Path::new("/tmp/k.pem"), 0o100400).is_none());
+    }
+
+    // L31: concurrent get_or_init_cert yields one identical cached cert, no
+    // panic (the old set-then-unwrap could theoretically observe a race).
+    #[test]
+    fn get_or_init_cert_is_race_safe_and_stable() {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| get_or_init_cert().map(|c| c as *const CachedCert as usize))
+            })
+            .collect();
+        let addrs: Vec<usize> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread").expect("cert generated"))
+            .collect();
+        // Every thread observes the same cached instance (same address).
+        assert!(addrs.windows(2).all(|w| w[0] == w[1]));
     }
 }

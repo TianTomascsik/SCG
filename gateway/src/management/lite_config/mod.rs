@@ -73,19 +73,23 @@ pub fn load_with_warnings(
     let schema_path = dir.join(SCHEMA_FILE);
 
     // ── Parse both layers ───────────────────────────────────────────────────
-    let defaults: Value = read_json(&defaults_path)?;
-    let user: Value = read_json(&user_path)?;
+    // Each file is read from disk exactly once; the raw bytes are kept so the
+    // signatures below are verified over the very bytes that were parsed —
+    // never a re-read a concurrent writer could race (TOCTOU, TRA #70).
+    let (defaults_bytes, defaults) = read_json(&defaults_path)?;
+    let (user_bytes, user) = read_json(&user_path)?;
 
     // Merge + template now; the merged document carries the integrity metadata
-    // (schema hash, signature suffix) we need below.
+    // (schema hash) we need below. Template warnings flag user-set values in
+    // fields the data plane does not consume yet (M17).
     let mut merged = merge::deep_merge(defaults, user);
-    merge::apply_templates(&mut merged);
+    let template_warnings = merge::apply_templates(&mut merged);
 
     // ── Integrity (fail-closed, before trusting any mapped content) ──────────
     verify_integrity(
         dir,
-        &defaults_path,
-        &user_path,
+        (&defaults_path, &defaults_bytes),
+        (&user_path, &user_bytes),
         &schema_path,
         &merged,
         pubkey_override,
@@ -133,14 +137,20 @@ pub fn load_with_warnings(
 
     let config = GatewayConfig::from_value(Value::Object(root))?;
 
-    // Surface the trust-anchor advisories ahead of the mapping warnings.
+    // Surface the trust-anchor advisories first, then template (unconsumed
+    // field) warnings, then the mapping warnings.
+    integrity_warnings.extend(template_warnings);
     integrity_warnings.extend(warnings);
     Ok((config, integrity_warnings))
 }
 
-fn read_json(path: &Path) -> Result<Value, String> {
+/// Read and parse a JSON file, returning the raw bytes alongside the parsed
+/// value so signature verification can run over exactly what was parsed.
+fn read_json(path: &Path) -> Result<(Vec<u8>, Value), String> {
     let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    Ok((bytes, value))
 }
 
 /// Resolve the signing public key: explicit override first, otherwise the
@@ -165,19 +175,12 @@ fn resolve_pubkey(dir: &Path, override_: Option<&Path>) -> Result<PathBuf, Strin
     ))
 }
 
-fn sig_suffix(merged: &Value) -> String {
-    merged
-        .pointer("/runtime/config_signing/signature_suffix")
-        .and_then(|v| v.as_str())
-        .unwrap_or(integrity::DEFAULT_SIG_SUFFIX)
-        .to_string()
-}
-
-/// Verify detached signatures on both config files and the pinned schema hash.
+/// Verify detached signatures on both config files (over the already-parsed
+/// bytes) and the pinned schema hash.
 fn verify_integrity(
     dir: &Path,
-    defaults_path: &Path,
-    user_path: &Path,
+    defaults: (&Path, &[u8]),
+    user: (&Path, &[u8]),
     schema_path: &Path,
     merged: &Value,
     pubkey_override: Option<&Path>,
@@ -192,9 +195,14 @@ fn verify_integrity(
     let pubkey =
         integrity::load_ed25519_public_pem(&pubkey_pem).map_err(|e| format!("[integrity] {e}"))?;
 
-    let suffix = sig_suffix(merged);
-    for cfg in [defaults_path, user_path] {
-        integrity::verify_signature(cfg, &suffix, &pubkey)
+    // The signature-file suffix is fixed (L2): honoring
+    // `runtime.config_signing.signature_suffix` from the not-yet-verified
+    // merged document would let the very input under verification choose
+    // where its signatures come from — a bootstrapping inversion. The field
+    // is still accepted in configs for schema compatibility but ignored;
+    // every in-tree config uses the default.
+    for (path, bytes) in [defaults, user] {
+        integrity::verify_signature_bytes(bytes, path, integrity::DEFAULT_SIG_SUFFIX, &pubkey)
             .map_err(|e| format!("[integrity] {e}"))?;
     }
 
@@ -452,7 +460,7 @@ mod tests {
         // Append a connection that uses integrity-only + multi-path, then
         // re-sign the user file so integrity still passes.
         let user_path = fx.dir.join(USER_FILE);
-        let mut user: Value = read_json(&user_path).unwrap();
+        let (_, mut user): (Vec<u8>, Value) = read_json(&user_path).unwrap();
         let conns = user.get_mut("connections").unwrap().as_array_mut().unwrap();
         conns.push(serde_json::json!({
             "connection_id": "c-integrity",
@@ -496,5 +504,41 @@ mod tests {
         fs::remove_file(&sig).unwrap();
         let err = load_with_warnings(&fx.dir, Some(&fx.pubkey)).unwrap_err();
         assert!(err.contains("signature file not found"), "got: {err}");
+    }
+
+    // H1 / TRA #70: signatures are verified over the exact bytes the loader
+    // parsed — never a re-read of the file — so a writer racing the loader
+    // cannot swap content between the parse and the verification.
+    #[test]
+    fn signature_verified_over_parsed_bytes_not_a_reread() {
+        let fx = make_fixture();
+        let user_path = fx.dir.join(USER_FILE);
+        let (parsed_bytes, _value) = read_json(&user_path).unwrap();
+        let pubkey_pem = fs::read(&fx.pubkey).unwrap();
+        let pubkey = integrity::load_ed25519_public_pem(&pubkey_pem).unwrap();
+
+        // Simulate the TOCTOU race: after the loader read+parsed the bytes,
+        // an attacker swaps the on-disk file. Verification runs over the
+        // parsed bytes and still passes — proving there is no second read.
+        fs::write(&user_path, b"{\"tampered\":true}").unwrap();
+        integrity::verify_signature_bytes(
+            &parsed_bytes,
+            &user_path,
+            integrity::DEFAULT_SIG_SUFFIX,
+            &pubkey,
+        )
+        .expect("parsed bytes must verify regardless of on-disk content");
+
+        // Inverse: tampered in-memory bytes fail against the intact
+        // signature, whatever the disk says.
+        let mut tampered = parsed_bytes.clone();
+        tampered[0] ^= 0x01;
+        assert!(integrity::verify_signature_bytes(
+            &tampered,
+            &user_path,
+            integrity::DEFAULT_SIG_SUFFIX,
+            &pubkey,
+        )
+        .is_err());
     }
 }

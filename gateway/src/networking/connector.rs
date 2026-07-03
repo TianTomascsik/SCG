@@ -21,7 +21,6 @@ pub fn connect_with_retry(
         )
     })?;
     let mut retry_delay = initial_delay;
-    let mut last_err: Option<io::Error>;
 
     let mut attempt = 0;
     loop {
@@ -31,11 +30,16 @@ pub fn connect_with_retry(
 
         match TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
             Ok(s) => return Ok(s),
+            // Return the error of the final attempt directly from the arm (L33):
+            // no `Option<io::Error>` state carried across the loop `break`, so no
+            // `last_err.unwrap()` whose safety depends on a distant invariant.
             Err(e) => {
-                last_err = Some(e);
                 attempt += 1;
                 if max_attempts > 0 && attempt >= max_attempts {
-                    break;
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("connect to {}: {}", addr, e),
+                    ));
                 }
                 if sleep_with_shutdown_check(retry_delay, shutdown) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown"));
@@ -44,23 +48,23 @@ pub fn connect_with_retry(
             }
         }
     }
-
-    let e = last_err.unwrap();
-    Err(io::Error::new(
-        e.kind(),
-        format!("connect to {}: {}", addr, e),
-    ))
 }
 
-/// Sleep for the given duration, checking the shutdown flag every 500ms.
+/// Sleep for the given duration, checking the shutdown flag periodically.
 /// Returns `true` if shutdown was requested (caller should exit).
 pub fn sleep_with_shutdown_check(delay: Duration, shutdown: &AtomicBool) -> bool {
+    // Poll interval bounded at 500 ms, but never sleep past the deadline (L17):
+    // the old fixed 500 ms chunk overshot short delays by up to ~500 ms and
+    // quantised any sub-500 ms backoff up to 500 ms.
     let deadline = Instant::now() + delay;
-    while Instant::now() < deadline {
+    loop {
         if shutdown.load(Ordering::Relaxed) {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500).min(deadline - now));
     }
-    false
 }

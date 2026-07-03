@@ -309,6 +309,20 @@ impl RingConsumer {
     /// count is clamped to the ring capacity and the frame length is bounded so
     /// a hostile producer can never make the consumer read out of bounds.
     pub fn try_pop(&self) -> Option<(u32, Vec<u8>)> {
+        let mut buf = Vec::new();
+        let tid = self.try_pop_into(&mut buf)?;
+        Some((tid, buf))
+    }
+
+    /// Locate and validate the next complete frame without consuming it.
+    ///
+    /// Shared prologue of [`try_pop_into`](Self::try_pop_into) and
+    /// [`try_pop_into_slice`](Self::try_pop_into_slice), so the
+    /// untrusted-producer clamps (available bytes bounded by capacity, frame
+    /// length bounded by ring size and published bytes) exist exactly once.
+    /// Returns `(read_idx, payload_offset, payload_len, traffic_id)`.
+    #[inline]
+    fn next_frame(&self) -> Option<(u64, usize, usize, u32)> {
         let ix = self.indices();
         let read = ix.read_idx.load(Ordering::Relaxed);
         let write = ix.write_idx.load(Ordering::Acquire);
@@ -330,14 +344,17 @@ impl RingConsumer {
             // can back off rather than spin on bad data.
             return None;
         }
+        Some((read, next_off, len, traffic_id))
+    }
 
-        let mut payload = vec![0u8; len];
-        self.read_wrapping(next_off, &mut payload);
-        ix.read_idx.store(
+    /// Consume the frame located by [`next_frame`](Self::next_frame): advance
+    /// `read_idx` past its header + payload.
+    #[inline]
+    fn consume_frame(&self, read: u64, len: usize) {
+        self.indices().read_idx.store(
             read.wrapping_add((FRAME_HEADER_LEN + len) as u64),
             Ordering::Release,
         );
-        Some((traffic_id, payload))
     }
 
     /// Try to dequeue one frame into a caller-owned buffer, returning the
@@ -348,23 +365,7 @@ impl RingConsumer {
     /// instead of a freshly allocated `Vec`, so a hot relay loop can reuse one
     /// buffer across frames. The same untrusted-producer bounds checks apply.
     pub fn try_pop_into(&self, dst: &mut Vec<u8>) -> Option<u32> {
-        let ix = self.indices();
-        let read = ix.read_idx.load(Ordering::Relaxed);
-        let write = ix.write_idx.load(Ordering::Acquire);
-        let avail_raw = write.wrapping_sub(read);
-        let avail = std::cmp::min(avail_raw as usize, self.cap);
-        if avail < FRAME_HEADER_LEN {
-            return None;
-        }
-
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        let off = (read % self.cap as u64) as usize;
-        let next_off = self.read_wrapping(off, &mut header);
-        let (len, traffic_id) = decode_header(&header);
-        let len = len as usize;
-        if len > self.cap - FRAME_HEADER_LEN || avail < FRAME_HEADER_LEN + len {
-            return None;
-        }
+        let (read, next_off, len, traffic_id) = self.next_frame()?;
 
         // Resize without zero-filling the bytes we are about to overwrite.
         dst.clear();
@@ -372,16 +373,14 @@ impl RingConsumer {
         // SAFETY: `dst.reserve(len)` guarantees `dst` has capacity for at least
         // `len` bytes, so `dst.as_mut_ptr()` points to `len` writable bytes as
         // required by `read_wrapping_ptr`; `read_wrapping_ptr` fully initialises
-        // those `len` bytes (a frame of `len <= cap - header` was validated
-        // above), so the subsequent `set_len(len)` only exposes initialised data.
+        // those `len` bytes (a frame of `len <= cap - header` was validated by
+        // `next_frame`), so the subsequent `set_len(len)` only exposes
+        // initialised data.
         unsafe {
             self.read_wrapping_ptr(next_off, dst.as_mut_ptr(), len);
             dst.set_len(len);
         }
-        ix.read_idx.store(
-            read.wrapping_add((FRAME_HEADER_LEN + len) as u64),
-            Ordering::Release,
-        );
+        self.consume_frame(read, len);
         Some(traffic_id)
     }
 
@@ -395,36 +394,18 @@ impl RingConsumer {
     /// caller can hold) but the whole frame is always consumed from the ring.
     /// The same untrusted-producer bounds checks apply.
     pub fn try_pop_into_slice(&self, out: &mut [u8]) -> Option<(u32, usize)> {
-        let ix = self.indices();
-        let read = ix.read_idx.load(Ordering::Relaxed);
-        let write = ix.write_idx.load(Ordering::Acquire);
-        let avail_raw = write.wrapping_sub(read);
-        let avail = std::cmp::min(avail_raw as usize, self.cap);
-        if avail < FRAME_HEADER_LEN {
-            return None;
-        }
-
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        let off = (read % self.cap as u64) as usize;
-        let next_off = self.read_wrapping(off, &mut header);
-        let (len, traffic_id) = decode_header(&header);
-        let len = len as usize;
-        if len > self.cap - FRAME_HEADER_LEN || avail < FRAME_HEADER_LEN + len {
-            return None;
-        }
+        let (read, next_off, len, traffic_id) = self.next_frame()?;
 
         let n = len.min(out.len());
         // SAFETY: `n = min(len, out.len())`, so `out.as_mut_ptr()` points to at
         // least `n` writable bytes of the caller's slice, satisfying
         // `read_wrapping_ptr`'s contract; the read is clamped to what `out` can
-        // hold while the validated frame length keeps the source within the ring.
+        // hold while the frame length validated by `next_frame` keeps the
+        // source within the ring.
         unsafe {
             self.read_wrapping_ptr(next_off, out.as_mut_ptr(), n);
         }
-        ix.read_idx.store(
-            read.wrapping_add((FRAME_HEADER_LEN + len) as u64),
-            Ordering::Release,
-        );
+        self.consume_frame(read, len);
         Some((traffic_id, n))
     }
 

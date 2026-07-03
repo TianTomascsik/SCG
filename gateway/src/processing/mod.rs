@@ -104,11 +104,40 @@ impl RuleContext {
         true
     }
 
+    /// Resolve an upstream `target` (`host:port` or `ip:port`) to a single
+    /// [`SocketAddr`](std::net::SocketAddr) for the policy gate and
+    /// session/connection setup.
+    ///
+    /// DNS resolution happens **once per session / relay start** — callers must
+    /// never call this per datagram (DNS-per-packet would be a self-inflicted
+    /// DoS). A hostname that cannot be resolved returns `None` so the caller can
+    /// fail closed. This restores functionality for legitimate DNS-name
+    /// upstreams that the strict `IP:port`-only policy gate (DP-07, #54) would
+    /// otherwise drop entirely (TRA #73).
+    pub fn resolve_upstream_target(&self, target: &str) -> Option<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs;
+        match target.to_socket_addrs() {
+            Ok(mut addrs) => addrs.next(),
+            Err(e) => {
+                warn!(
+                    "[{}] cannot resolve upstream target '{target}': {e}",
+                    self.rule_name
+                );
+                None
+            }
+        }
+    }
+
     /// Classify + policy-gate a flow whose destination is still a `target` string
     /// (e.g. the configured `upstream_addr`). Fails **closed** when the target is
     /// not a parseable `IP:port` (DP-07): the flow is dropped and an `AUDIT deny`
     /// line is emitted, rather than silently skipping the default-deny/source
     /// whitelist gate. Callers must treat `false` as "drop this connection".
+    ///
+    /// This accepts only literal `IP:port`; a hostname upstream must first be
+    /// resolved once via [`resolve_upstream_target`](Self::resolve_upstream_target)
+    /// and gated through [`classify_and_check_policy`](Self::classify_and_check_policy)
+    /// on the resolved address (TRA #73).
     pub fn classify_and_check_policy_target(
         &self,
         src: &std::net::SocketAddr,
@@ -485,6 +514,28 @@ mod tests {
         let ctx = ctx_with_policy(None);
         let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         assert!(ctx.classify_and_check_policy_target(&src, "127.0.0.1:9000"));
+    }
+
+    // TRA #73: a hostname upstream resolves once to a concrete address that can
+    // then be policy-gated; an unresolvable name fails closed (None).
+    #[test]
+    fn resolve_upstream_target_resolves_and_fails_closed() {
+        let ctx = ctx_with_policy(None);
+        // localhost always resolves to a loopback address.
+        let resolved = ctx
+            .resolve_upstream_target("localhost:9000")
+            .expect("localhost must resolve");
+        assert!(resolved.ip().is_loopback());
+        assert_eq!(resolved.port(), 9000);
+        // A literal IP:port passes straight through.
+        assert_eq!(
+            ctx.resolve_upstream_target("127.0.0.1:9000"),
+            Some("127.0.0.1:9000".parse().unwrap())
+        );
+        // The reserved .invalid TLD never resolves → fail closed.
+        assert!(ctx
+            .resolve_upstream_target("nonexistent.invalid:443")
+            .is_none());
     }
 
     // A parseable target that a default-deny policy rejects is still dropped.

@@ -134,7 +134,7 @@ impl Read for KtlsSession {
             openssl_sys::SSL_ERROR_ZERO_RETURN => Ok(0),
             openssl_sys::SSL_ERROR_SYSCALL => {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error().is_none() {
+                if is_unclean_eof(ret, err.raw_os_error()) {
                     return Ok(0);
                 }
                 Err(err)
@@ -142,6 +142,19 @@ impl Read for KtlsSession {
             _ => Err(io::Error::other(ErrorStack::get())),
         }
     }
+}
+
+/// Whether an `SSL_ERROR_SYSCALL` outcome from `SSL_read` is an unclean EOF —
+/// the peer closed the transport without sending `close_notify`.
+///
+/// OpenSSL signals this as `SSL_ERROR_SYSCALL` with `ret == 0` and **no errno
+/// recorded**. `io::Error::last_os_error().raw_os_error()` never returns
+/// `None` (errno 0 arrives as `Some(0)`), so the check must match both forms;
+/// a genuine syscall failure always has `ret < 0` and a nonzero errno.
+/// Treating the unclean EOF as `Ok(0)` mirrors how the userspace TLS relay
+/// handles peers that abort without a TLS shutdown.
+fn is_unclean_eof(ret: libc::c_int, errno: Option<i32>) -> bool {
+    ret == 0 && matches!(errno, None | Some(0))
 }
 
 impl Write for KtlsSession {
@@ -262,4 +275,27 @@ pub fn kernel_supports_ktls() -> bool {
             .map(|s| s.split_whitespace().any(|ulp| ulp == "tls"))
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unclean_eof;
+
+    #[test]
+    fn syscall_ret0_with_errno0_is_unclean_eof() {
+        assert!(is_unclean_eof(0, Some(0)));
+        assert!(is_unclean_eof(0, None));
+    }
+
+    #[test]
+    fn syscall_ret0_with_real_errno_is_an_error() {
+        assert!(!is_unclean_eof(0, Some(libc::ECONNRESET)));
+    }
+
+    #[test]
+    fn syscall_negative_ret_is_never_eof() {
+        assert!(!is_unclean_eof(-1, Some(0)));
+        assert!(!is_unclean_eof(-1, None));
+        assert!(!is_unclean_eof(-1, Some(libc::EPIPE)));
+    }
 }

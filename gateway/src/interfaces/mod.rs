@@ -1,10 +1,12 @@
 //! Application Interfaces & Workers subsystem.
 //!
-//! Network listeners (TPROXY and non-TPROXY), sender workers, and I/O adapters.
+//! Owns the local-interface data plane: the [`manager`] control plane that
+//! authorises and spawns endpoints, the per-endpoint [`uds`] and [`shm`]
+//! implementations, their shared [`endpoint`] helpers (peer auth, TLS
+//! dial/accept, relay), and the [`tproxy`] transparent-socket utilities.
 
 pub mod endpoint;
 pub mod manager;
 pub mod shm;
-pub mod stubs;
 pub mod tproxy;
 pub mod uds;

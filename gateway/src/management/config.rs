@@ -63,7 +63,7 @@ pub struct GatewayConfig {
     pub prefer_ktls: bool,
 
     /// Base worker-thread count for every rule's connection pool. When `None`
-    /// (the default), each rule uses [`ConnectionPool::default_size`] (`2×CPU`).
+    /// (the default), each rule uses `ConnectionPool::default_size` (`2×CPU`).
     /// Relay jobs are long-lived (one worker per connection for the connection's
     /// lifetime) and `Normal`-class pools do not overflow, so a host driving more
     /// concurrent connections than `2×CPU` must raise this or excess connections
@@ -118,8 +118,9 @@ pub struct ApiConfig {
     pub runtime_dir: String,
 
     /// Default shared-memory ring capacity in bytes, per direction
-    /// (default: 1 MiB). Enlarging the ring trades queueing latency for
-    /// throughput headroom, so it is left to per-deployment config.
+    /// (default: 4 MiB, i.e. 8 MiB per SHM endpoint — one ring per direction).
+    /// Enlarging the ring trades queueing latency for throughput headroom, so
+    /// it is left to per-deployment config.
     #[serde(default = "default_shm_ring_capacity")]
     pub shm_ring_capacity: usize,
 
@@ -558,7 +559,12 @@ pub struct RuleConfig {
     pub app_protocol: Option<String>,
 
     /// Legacy alias for security_provider (for internal compatibility).
-    /// If both are set, security_provider takes precedence.
+    ///
+    /// Precedence: serde cannot distinguish an explicit `security_provider:
+    /// "tls"` from its default, so a non-default `tls_mode` wins whenever
+    /// `security_provider` is (or defaults to) `"tls"`; any other
+    /// `security_provider` value wins over `tls_mode`. See
+    /// [`RuleConfig::effective_security_provider`].
     #[serde(default = "default_tls_mode")]
     pub tls_mode: TlsMode,
 
@@ -717,18 +723,20 @@ impl RuleConfig {
     }
 
     /// Returns the effective security provider name.
-    /// Uses `security_provider` if explicitly set (non-default), otherwise
-    /// derives from `tls_mode` for backward compatibility.
+    ///
+    /// A non-default `security_provider` is used as-is. When it is `"tls"`
+    /// (explicitly or via its serde default — the two are indistinguishable),
+    /// the legacy `tls_mode` decides, so old configs that only set `tls_mode`
+    /// keep working. See the `tls_mode` field doc for the precedence note.
     pub fn effective_security_provider(&self) -> &str {
-        if self.security_provider != "tls" || self.tls_mode == TlsMode::Tls {
-            &self.security_provider
-        } else {
-            // tls_mode was set to something non-default, use it
+        if self.security_provider == "tls" {
             match self.tls_mode {
                 TlsMode::Tls => "tls",
                 TlsMode::Ktls => "ktls",
                 TlsMode::Dtls => "dtls",
             }
+        } else {
+            &self.security_provider
         }
     }
 
@@ -830,7 +838,7 @@ fn default_buffer_slot_size() -> usize {
 // ─── Enums ───────────────────────────────────────────────────────────────────
 
 /// Proxy direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// Plain TCP/UDP → TLS/kTLS/DTLS (encrypt outbound traffic).
@@ -849,7 +857,7 @@ impl fmt::Display for Direction {
 }
 
 /// Network protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
     Tcp,
@@ -896,7 +904,7 @@ impl fmt::Display for TlsMode {
 }
 
 /// Traffic priority class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum TrafficClass {
@@ -1206,6 +1214,12 @@ impl GatewayConfig {
 
         let mut seen_names = HashSet::new();
         let mut seen_listen = HashSet::new();
+        // UDS/SHM rules have no listen address; their runtime identity is the
+        // template key (app_id, class, direction, kind) used by the
+        // InterfaceManager — colliding keys would silently shadow each other
+        // ("last rule wins"), replacing an earlier rule's allow-lists and
+        // security posture, so they are a hard error like listen collisions.
+        let mut seen_templates: HashSet<(String, TrafficClass, Direction, Proto)> = HashSet::new();
 
         for (i, rule) in self.rules.iter().enumerate() {
             if rule.name.is_empty() {
@@ -1240,6 +1254,26 @@ impl GatewayConfig {
                         rule.name, i, rule.listen_proto
                     ));
                 }
+                let template = (
+                    rule.app_id.clone().unwrap_or_default(),
+                    rule.traffic_class,
+                    rule.direction,
+                    rule.listen_proto,
+                );
+                if !seen_templates.insert(template) {
+                    return Err(format!(
+                        "Rule '{}' (index {}): duplicate local-endpoint template (app_id={}, \
+                         class={:?}, direction={:?}, kind={}) conflicts with another rule — \
+                         at runtime the last rule would silently replace the earlier one's \
+                         allow-lists and security posture",
+                        rule.name,
+                        i,
+                        rule.app_id.as_deref().unwrap_or(""),
+                        rule.traffic_class,
+                        rule.direction,
+                        rule.listen_proto
+                    ));
+                }
             } else {
                 let listen_sock: SocketAddr =
                     rule.listen_addr.parse::<SocketAddr>().map_err(|e| {
@@ -1260,11 +1294,13 @@ impl GatewayConfig {
             }
 
             // Validate upstream address (host:port format) unless "auto"
-            if rule.upstream_addr != "auto" && !rule.upstream_addr.contains(':') {
-                return Err(format!(
-                    "Rule '{}' (index {}): upstream_addr '{}' must be 'auto' or HOST:PORT",
-                    rule.name, i, rule.upstream_addr
-                ));
+            if rule.upstream_addr != "auto" {
+                Self::validate_host_port(&rule.upstream_addr).map_err(|e| {
+                    format!(
+                        "Rule '{}' (index {}): upstream_addr '{}' must be 'auto' or HOST:PORT ({})",
+                        rule.name, i, rule.upstream_addr, e
+                    )
+                })?;
             }
 
             // "auto" upstream requires transparent mode
@@ -1275,20 +1311,38 @@ impl GatewayConfig {
                 ));
             }
 
-            // DTLS validation: DTLS is UDP-only
-            if rule.tls_mode == TlsMode::Dtls && rule.listen_proto != Proto::Udp {
-                return Err(format!(
-                    "Rule '{}' (index {}): DTLS mode requires listen_proto = \"udp\"",
-                    rule.name, i
-                ));
+            // DTLS validation (keyed to the effective provider so both the
+            // modern `security_provider: "dtls"` and the legacy
+            // `tls_mode: "dtls"` spellings are covered):
+            //   - DTLS is UDP-only.
+            //   - No original-destination recovery is implemented for DTLS, so
+            //     `upstream_addr = "auto"` is rejected like WireGuard's —
+            //     running it would reflect decrypted plaintext back toward the
+            //     client-facing segment on decrypt and relay nothing on
+            //     encrypt (TRA #74).
+            if rule.effective_security_provider() == "dtls" {
+                if rule.listen_proto != Proto::Udp {
+                    return Err(format!(
+                        "Rule '{}' (index {}): DTLS requires listen_proto = \"udp\"",
+                        rule.name, i
+                    ));
+                }
+                if rule.upstream_addr == "auto" {
+                    return Err(format!(
+                        "Rule '{}' (index {}): DTLS does not support upstream_addr = \"auto\" \
+                         (no original-destination recovery); configure an explicit upstream",
+                        rule.name, i
+                    ));
+                }
             }
 
             // kTLS capability gate: kernel TLS cannot offload NULL-encryption
             // (integrity-only) cipher suites. Reject at load so the error is
             // surfaced early instead of at connection time. Other non-offloadable
             // profiles (PKI/PSK/verify) fall back to userspace TLS at runtime.
-            let is_ktls = rule.effective_security_provider() == "ktls"
-                || (rule.tls_mode == TlsMode::Ktls && rule.effective_security_provider() == "tls");
+            // (`tls_mode == Ktls` needs no separate disjunct:
+            // effective_security_provider() already maps it to "ktls".)
+            let is_ktls = rule.effective_security_provider() == "ktls";
             if is_ktls {
                 if let Some(profile) = rule.provider_params.get("profile").and_then(|v| v.as_str())
                 {
@@ -1320,6 +1374,36 @@ impl GatewayConfig {
                             rule.name, i, e
                         )
                     })?;
+                }
+
+                // protocol_version syntax is a pure string check, so it is
+                // enforced here — on EVERY load path (startup, --validate,
+                // hot-reload, lite-config render) — not just in
+                // preflight_check(); the engines interpret the string loosely
+                // (`is_tls13()` is an equality test), so a typo like "tls13"
+                // would otherwise silently run as the TLS 1.2 default.
+                // preflight_check() keeps only the kTLS+TLS1.3 kernel-support
+                // warning.
+                if let Some(ref version) = rule.protocol_version {
+                    let (valid, expected) = match provider {
+                        "tls" | "ktls" => (
+                            matches!(version.as_str(), "tls1.2" | "tls1.3"),
+                            "'tls1.2' or 'tls1.3'",
+                        ),
+                        "dtls" => (
+                            matches!(version.as_str(), "dtls1.0" | "dtls1.2"),
+                            "'dtls1.0' or 'dtls1.2'",
+                        ),
+                        // Custom providers interpret protocol_version themselves.
+                        _ => (true, ""),
+                    };
+                    if !valid {
+                        return Err(format!(
+                            "Rule '{}' (index {}): invalid protocol_version '{}' for {} \
+                             provider (expected {})",
+                            rule.name, i, version, provider, expected
+                        ));
+                    }
                 }
             }
 
@@ -1569,38 +1653,13 @@ impl GatewayConfig {
         // Check for transparent/TPROXY requirements
         let has_transparent = self.rules.iter().any(|r| r.transparent);
         if has_transparent {
-            // Check CAP_NET_ADMIN via a simple test
-            // (trying IP_TRANSPARENT on a throwaway socket)
-            // SAFETY: `libc::socket` takes only scalar arguments and has no pointer
-            // preconditions; its return value is checked (`fd >= 0`) before `fd` is used.
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-            if fd >= 0 {
-                let one: libc::c_int = 1;
-                // SAFETY: `fd` is a valid open descriptor (checked `fd >= 0` above); the
-                // option pointer/len pair point to a fully-initialised `libc::c_int` (`one`)
-                // whose size is passed exactly via `size_of::<c_int>()`; the return value is
-                // checked below.
-                let ret = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_IP,
-                        19, // IP_TRANSPARENT
-                        &one as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    )
-                };
-                // SAFETY: `fd` is the valid descriptor returned by `socket` above and is not
-                // used after this call, so closing it exactly once is sound.
-                unsafe {
-                    libc::close(fd);
-                }
-                if ret != 0 {
-                    errors.push(
-                        "Transparent rules require CAP_NET_ADMIN capability. \
-                         Run as root or use: setcap cap_net_admin,cap_net_raw+ep <binary>"
-                            .to_string(),
-                    );
-                }
+            // CAP_NET_ADMIN check via the shared IP_TRANSPARENT probe.
+            if probe_ip_transparent() == Some(false) {
+                errors.push(
+                    "Transparent rules require CAP_NET_ADMIN capability. \
+                     Run as root or use: setcap cap_net_admin,cap_net_raw+ep <binary>"
+                        .to_string(),
+                );
             }
 
             // Check iptables chains exist
@@ -1627,38 +1686,15 @@ impl GatewayConfig {
         // ── Intercept self-configuration preflight ──────────────────────────
         let has_intercept = self.rules.iter().any(|r| r.intercept.is_some());
         if has_intercept {
-            // CAP_NET_ADMIN is mandatory when intercept is configured.
-            // SAFETY: `libc::socket` takes only scalar arguments and has no pointer
-            // preconditions; its return value is checked (`fd >= 0`) before `fd` is used.
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-            if fd >= 0 {
-                let one: libc::c_int = 1;
-                // SAFETY: `fd` is a valid open descriptor (checked `fd >= 0` above); the
-                // option pointer/len pair point to a fully-initialised `libc::c_int` (`one`)
-                // whose size is passed exactly via `size_of::<c_int>()`; the return value is
-                // checked below.
-                let ret = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_IP,
-                        19, // IP_TRANSPARENT
-                        &one as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    )
-                };
-                // SAFETY: `fd` is the valid descriptor returned by `socket` above and is not
-                // used after this call, so closing it exactly once is sound.
-                unsafe {
-                    libc::close(fd);
-                }
-                if ret != 0 {
-                    errors.push(
-                        "Intercept rules configured but CAP_NET_ADMIN is missing. \
-                         The gateway cannot install iptables rules without it. \
-                         Run as root or use: setcap cap_net_admin,cap_net_raw+ep <binary>"
-                            .to_string(),
-                    );
-                }
+            // CAP_NET_ADMIN is mandatory when intercept is configured; use the
+            // shared IP_TRANSPARENT probe.
+            if probe_ip_transparent() == Some(false) {
+                errors.push(
+                    "Intercept rules configured but CAP_NET_ADMIN is missing. \
+                     The gateway cannot install iptables rules without it. \
+                     Run as root or use: setcap cap_net_admin,cap_net_raw+ep <binary>"
+                        .to_string(),
+                );
             }
 
             // iptables binary must exist when self-configuring.
@@ -1748,38 +1784,15 @@ impl GatewayConfig {
             }
         }
 
-        // Validate protocol_version per rule
+        // protocol_version *syntax* is enforced in validate() (every load
+        // path); only the kernel-support caveat belongs here.
         for rule in &self.rules {
             if let Some(ref version) = rule.protocol_version {
-                let sp = rule.effective_security_provider();
-                match sp {
-                    "tls" | "ktls" => {
-                        match version.as_str() {
-                            "tls1.2" | "tls1.3" => {}
-                            _ => {
-                                errors.push(format!(
-                                    "Rule '{}': invalid protocol_version '{}' for {} provider (expected 'tls1.2' or 'tls1.3')",
-                                    rule.name, version, sp
-                                ));
-                            }
-                        }
-                        if sp == "ktls" && version == "tls1.3" {
-                            warnings.push(format!(
-                                "Rule '{}': kTLS + TLS 1.3 is not reliably supported by all kernels — will fall back to TLS 1.2 at runtime",
-                                rule.name
-                            ));
-                        }
-                    }
-                    "dtls" => match version.as_str() {
-                        "dtls1.0" | "dtls1.2" => {}
-                        _ => {
-                            errors.push(format!(
-                                    "Rule '{}': invalid protocol_version '{}' for dtls provider (expected 'dtls1.0' or 'dtls1.2')",
-                                    rule.name, version
-                                ));
-                        }
-                    },
-                    _ => {}
+                if rule.effective_security_provider() == "ktls" && version == "tls1.3" {
+                    warnings.push(format!(
+                        "Rule '{}': kTLS + TLS 1.3 is not reliably supported by all kernels — will fall back to TLS 1.2 at runtime",
+                        rule.name
+                    ));
                 }
             }
         }
@@ -2016,26 +2029,42 @@ impl GatewayConfig {
     }
 
     /// Validate that a string is a valid IP address or CIDR notation.
+    /// Validate an intercept match entry: a bare IP literal or an `IP/prefix`
+    /// CIDR.
+    ///
+    /// Delegates to [`AddressPattern::parse`] so the CIDR/IP parsing and
+    /// prefix-bound rules exist exactly once; shapes the pattern language
+    /// accepts but intercept matching does not (`any`, `IP:port`) are
+    /// rejected here.
     fn validate_ip_or_cidr(s: &str) -> Result<(), String> {
-        let s = s.trim();
-        if let Some((ip_str, prefix_str)) = s.split_once('/') {
-            let ip: IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {}", e))?;
-            let prefix_len: u8 = prefix_str
-                .parse()
-                .map_err(|e| format!("invalid prefix length: {}", e))?;
-            let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
-            if prefix_len > max_prefix {
-                return Err(format!(
-                    "prefix length {} exceeds max {}",
-                    prefix_len, max_prefix
-                ));
+        match AddressPattern::parse(s)? {
+            AddressPattern::Cidr { .. } | AddressPattern::IpOnly(_) => Ok(()),
+            AddressPattern::Any => Err("expected an IP address or CIDR, not 'any'".to_string()),
+            AddressPattern::Exact(_) => {
+                Err("expected an IP address or CIDR without a port".to_string())
             }
-        } else {
-            let _ip: IpAddr = s
-                .parse()
-                .map_err(|e| format!("invalid IP address: {}", e))?;
         }
-        Ok(())
+    }
+
+    /// Validate a `HOST:PORT` upstream endpoint: a non-empty host and a
+    /// nonzero `u16` port. Accepts bracketed IPv6 (`[::1]:443`) and DNS
+    /// hostnames — name resolution is deliberately a runtime concern.
+    fn validate_host_port(s: &str) -> Result<(), String> {
+        let (host, port) = s
+            .rsplit_once(':')
+            .ok_or_else(|| "missing ':' separator".to_string())?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if host.is_empty() {
+            return Err("empty host".to_string());
+        }
+        match port.parse::<u16>() {
+            Ok(0) => Err("port must be 1-65535".to_string()),
+            Ok(_) => Ok(()),
+            Err(_) => Err(format!("invalid port '{}'", port)),
+        }
     }
 
     /// Print a summary of all rules to stderr.
@@ -2265,14 +2294,63 @@ pub(crate) fn world_or_group_writable_warning(path: &Path, what: &str) -> Option
 /// `any`, a CIDR wider than a single host, or a non-loopback literal is
 /// considered "wide/untrusted" and worth flagging. Loopback and single-host
 /// trusted literals are not flagged.
+/// Probe whether this process may set `IP_TRANSPARENT` on a socket — the
+/// `CAP_NET_ADMIN` capability check behind transparent/TPROXY and intercept
+/// preflight. Shared by both preflight call sites so the `unsafe` probe exists
+/// exactly once.
+///
+/// Returns `None` when no probe socket could be created (nothing can be
+/// concluded), `Some(true)` when the kernel accepted the option, and
+/// `Some(false)` when it was refused (typically `EPERM`: missing
+/// `CAP_NET_ADMIN`).
+fn probe_ip_transparent() -> Option<bool> {
+    // SAFETY: `libc::socket` takes only scalar arguments and has no pointer
+    // preconditions; its return value is checked (`fd >= 0`) before `fd` is used.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let one: libc::c_int = 1;
+    // SAFETY: `fd` is a valid open descriptor (checked `fd >= 0` above); the
+    // option pointer/len pair point to a fully-initialised `libc::c_int`
+    // (`one`) whose size is passed exactly via `size_of::<c_int>()`; the
+    // return value is checked below.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_IP,
+            libc::IP_TRANSPARENT,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    // SAFETY: `fd` is the valid descriptor returned by `socket` above and is
+    // not used after this call, so closing it exactly once is sound.
+    unsafe {
+        libc::close(fd);
+    }
+    Some(ret == 0)
+}
+
 fn is_wide_untrusted_source(source: &str) -> bool {
     let s = source.trim();
     if s.eq_ignore_ascii_case("any") || s == "*" {
         return true;
     }
-    // CIDR: wide unless it is a single-host prefix (/32 v4, /128 v6).
-    if let Some((_, prefix)) = s.split_once('/') {
-        return !matches!(prefix.trim(), "32" | "128");
+    // CIDR: wide unless it is a *family-correct* single-host prefix (/32 for
+    // IPv4, /128 for IPv6 — an IPv6 "/32" spans 2^96 addresses). A single-host
+    // CIDR is then held to the same trust rule as the equivalent bare literal
+    // below: trusted only when loopback.
+    if let Some((ip_str, prefix)) = s.split_once('/') {
+        return match ip_str.trim().parse::<std::net::IpAddr>() {
+            Ok(ip)
+                if (ip.is_ipv4() && prefix.trim() == "32")
+                    || (ip.is_ipv6() && prefix.trim() == "128") =>
+            {
+                !ip.is_loopback()
+            }
+            _ => true,
+        };
     }
     // Bare host/IP[:port]: trusted only if it is a loopback literal.
     let host = crate::security::tls_engine::params::host_of(s).unwrap_or_else(|| s.to_string());
@@ -3434,5 +3512,333 @@ mod tls_validation_tests {
         }))
         .expect("deserialize");
         assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+}
+
+#[cfg(test)]
+mod validation_hardening_tests {
+    //! Load-time validation hardening from the 2026-07-02 code review:
+    //! M12 (duplicate UDS/SHM template keys), M13 (DTLS checks keyed to the
+    //! effective provider), M14 (protocol_version enforced on every load
+    //! path), L14 (provider precedence), L15 (upstream host:port rigor),
+    //! L16 (family-aware wide-source heuristic), L25 (validate_ip_or_cidr
+    //! delegates to AddressPattern::parse), and the TRA #74 dtls+auto
+    //! rejection.
+    use super::*;
+
+    fn cfg(rules: serde_json::Value) -> GatewayConfig {
+        serde_json::from_value(serde_json::json!({ "rules": rules })).expect("deserialize config")
+    }
+
+    fn tls_rule(name: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "name": name,
+            "direction": "encrypt",
+            "listen_addr": format!("127.0.0.1:{}", 18000 + name.len()),
+            "upstream_addr": "127.0.0.1:9000",
+            "security_provider": "tls",
+            "verify": "none"
+        });
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        base
+    }
+
+    // ── TRA #74: dtls + upstream_addr="auto" is rejected fail-closed ────────
+
+    #[test]
+    fn validate_rejects_dtls_auto_upstream_modern_key() {
+        let c = cfg(serde_json::json!([tls_rule(
+            "d",
+            serde_json::json!({
+                "security_provider": "dtls",
+                "listen_proto": "udp",
+                "upstream_proto": "udp",
+                "upstream_addr": "auto",
+                "transparent": true
+            })
+        )]));
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("auto"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_dtls_auto_upstream_legacy_tls_mode() {
+        let mut rule = tls_rule(
+            "d",
+            serde_json::json!({
+                "listen_proto": "udp",
+                "upstream_proto": "udp",
+                "upstream_addr": "auto",
+                "transparent": true,
+                "tls_mode": "dtls"
+            }),
+        );
+        // Legacy spelling: no security_provider key at all.
+        rule.as_object_mut().unwrap().remove("security_provider");
+        let err = cfg(serde_json::json!([rule])).validate().unwrap_err();
+        assert!(err.contains("auto"), "unexpected error: {err}");
+    }
+
+    // ── M13: DTLS UDP-only keyed to the effective provider ──────────────────
+
+    #[test]
+    fn validate_rejects_dtls_provider_on_tcp() {
+        let c = cfg(serde_json::json!([tls_rule(
+            "d",
+            serde_json::json!({
+                "security_provider": "dtls",
+                "listen_proto": "tcp"
+            })
+        )]));
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.contains("udp") || err.contains("UDP"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_legacy_dtls_on_tcp() {
+        let mut rule = tls_rule(
+            "d",
+            serde_json::json!({
+                "listen_proto": "tcp",
+                "tls_mode": "dtls"
+            }),
+        );
+        rule.as_object_mut().unwrap().remove("security_provider");
+        let err = cfg(serde_json::json!([rule])).validate().unwrap_err();
+        assert!(
+            err.contains("udp") || err.contains("UDP"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── M12: duplicate UDS/SHM template keys ────────────────────────────────
+
+    fn uds_rule(name: &str, app_id: &str, direction: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "direction": direction,
+            "listen_proto": "uds",
+            "listen_addr": "",
+            "upstream_addr": "127.0.0.1:9000",
+            "app_id": app_id,
+            "allowed_uids": [1000],
+            "security_provider": "routing"
+        })
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_uds_template_key() {
+        // Same (app_id, class, direction, kind): the second rule would
+        // silently shadow the first's allow-lists at runtime.
+        let c = cfg(serde_json::json!([
+            uds_rule("a", "etcs", "encrypt"),
+            uds_rule("b", "etcs", "encrypt"),
+        ]));
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.contains("duplicate local-endpoint template"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_same_app_id_different_direction() {
+        let c = cfg(serde_json::json!([
+            uds_rule("a", "etcs", "encrypt"),
+            uds_rule("b", "etcs", "decrypt"),
+        ]));
+        assert!(c.validate().is_ok(), "{:?}", c.validate());
+    }
+
+    // ── M14: protocol_version enforced by validate() on every load path ─────
+
+    #[test]
+    fn validate_rejects_bad_protocol_version_tls() {
+        let c = cfg(serde_json::json!([tls_rule(
+            "t",
+            serde_json::json!({ "protocol_version": "tls1.4" })
+        )]));
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("protocol_version"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_bad_protocol_version_dtls() {
+        let c = cfg(serde_json::json!([tls_rule(
+            "d",
+            serde_json::json!({
+                "security_provider": "dtls",
+                "listen_proto": "udp",
+                "upstream_proto": "udp",
+                "protocol_version": "dtls9"
+            })
+        )]));
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("protocol_version"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn from_value_rejects_bad_protocol_version() {
+        // from_value is the hot-reload / lite-config choke point — the same
+        // typo that --validate rejects must fail here too (M14: previously it
+        // silently ran as the TLS 1.2 default after a hot reload).
+        let err = GatewayConfig::from_value(serde_json::json!({
+            "rules": [tls_rule("t", serde_json::json!({ "protocol_version": "tls13" }))]
+        }))
+        .unwrap_err();
+        assert!(err.contains("protocol_version"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_valid_protocol_versions() {
+        for v in ["tls1.2", "tls1.3"] {
+            let c = cfg(serde_json::json!([tls_rule(
+                "t",
+                serde_json::json!({ "protocol_version": v })
+            )]));
+            assert!(c.validate().is_ok(), "version {v}: {:?}", c.validate());
+        }
+    }
+
+    // ── L15: upstream_addr host:port rigor ──────────────────────────────────
+
+    #[test]
+    fn validate_rejects_malformed_upstream_addrs() {
+        for bad in [
+            "backend",
+            "host:",
+            ":443",
+            "host:0",
+            "host:99999",
+            "host:port",
+        ] {
+            let c = cfg(serde_json::json!([tls_rule(
+                "t",
+                serde_json::json!({ "upstream_addr": bad })
+            )]));
+            let err = c.validate().unwrap_err();
+            assert!(
+                err.contains("upstream_addr"),
+                "'{bad}' should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_wellformed_upstream_addrs() {
+        for good in ["10.0.0.1:8443", "[::1]:443", "backend.example.com:443"] {
+            let c = cfg(serde_json::json!([tls_rule(
+                "t",
+                serde_json::json!({ "upstream_addr": good })
+            )]));
+            assert!(c.validate().is_ok(), "'{good}': {:?}", c.validate());
+        }
+    }
+
+    // ── L14: provider precedence table ──────────────────────────────────────
+
+    #[test]
+    fn effective_security_provider_precedence() {
+        let rule = |sp: Option<&str>, tm: Option<&str>| -> RuleConfig {
+            let mut base = serde_json::json!({
+                "name": "r",
+                "direction": "encrypt",
+                "listen_addr": "127.0.0.1:1",
+            });
+            let obj = base.as_object_mut().unwrap();
+            if let Some(sp) = sp {
+                obj.insert("security_provider".into(), serde_json::json!(sp));
+            }
+            if let Some(tm) = tm {
+                obj.insert("tls_mode".into(), serde_json::json!(tm));
+            }
+            serde_json::from_value(base).expect("deserialize rule")
+        };
+        // (security_provider, tls_mode) → effective
+        let table = [
+            (None, None, "tls"),
+            (None, Some("ktls"), "ktls"),
+            (None, Some("dtls"), "dtls"),
+            (Some("tls"), Some("dtls"), "dtls"), // documented: tls_mode wins over (default-indistinguishable) "tls"
+            (Some("ktls"), None, "ktls"),
+            (Some("ktls"), Some("dtls"), "ktls"), // non-"tls" provider wins over tls_mode
+            (Some("wireguard"), Some("dtls"), "wireguard"),
+        ];
+        for (sp, tm, want) in table {
+            assert_eq!(
+                rule(sp, tm).effective_security_provider(),
+                want,
+                "sp={sp:?} tls_mode={tm:?}"
+            );
+        }
+    }
+
+    // ── L16: family-aware wide-source heuristic ─────────────────────────────
+
+    #[test]
+    fn wide_source_heuristic_is_family_aware() {
+        // Wide shapes.
+        assert!(is_wide_untrusted_source("any"));
+        assert!(is_wide_untrusted_source("0.0.0.0/0"));
+        assert!(is_wide_untrusted_source("10.0.0.0/8"));
+        // An IPv6 /32 spans 2^96 addresses — must be wide (was the L16 bug).
+        assert!(is_wide_untrusted_source("2001:db8::/32"));
+        // Family-correct single-host prefixes follow the bare-literal rule:
+        // trusted only when loopback.
+        assert!(!is_wide_untrusted_source("127.0.0.1/32"));
+        assert!(!is_wide_untrusted_source("::1/128"));
+        assert!(is_wide_untrusted_source("10.1.2.3/32"));
+        assert!(is_wide_untrusted_source("2001:db8::1/128"));
+        // Consistent with the bare literals:
+        assert!(is_wide_untrusted_source("10.1.2.3"));
+        assert!(!is_wide_untrusted_source("127.0.0.1"));
+        // Junk prefixes stay wide (fail-safe for an advisory).
+        assert!(is_wide_untrusted_source("nonsense/32"));
+    }
+
+    // ── L25: validate_ip_or_cidr delegates to AddressPattern::parse ─────────
+
+    #[test]
+    fn validate_ip_or_cidr_matches_address_pattern_semantics() {
+        // Accepted: bare IPs and CIDRs of both families.
+        for good in [
+            "10.0.0.1",
+            "10.0.0.0/8",
+            "fe80::1",
+            "fe80::/10",
+            "0.0.0.0/0",
+        ] {
+            assert!(
+                GatewayConfig::validate_ip_or_cidr(good).is_ok(),
+                "'{good}' should be accepted"
+            );
+        }
+        // Rejected: out-of-range prefixes, malformed IPs, and pattern shapes
+        // that are not address-only.
+        for bad in [
+            "10.0.0.0/33",
+            "fe80::/129",
+            "1.2.3/8",
+            "not-an-ip",
+            "any",
+            "1.2.3.4:80",
+        ] {
+            assert!(
+                GatewayConfig::validate_ip_or_cidr(bad).is_err(),
+                "'{bad}' should be rejected"
+            );
+        }
+        // Parity with AddressPattern::parse on the shared corpus: everything
+        // validate_ip_or_cidr accepts must parse as a pattern too.
+        for s in ["10.0.0.1", "10.0.0.0/8", "fe80::/10"] {
+            assert!(AddressPattern::parse(s).is_ok());
+        }
     }
 }

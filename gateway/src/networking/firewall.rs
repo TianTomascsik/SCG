@@ -12,7 +12,7 @@
 //! - Teardown removes only what was added (chains, jumps, routing policy).
 
 use crate::management::config::{GatewayConfig, InterceptConfig, InterceptMode, Proto, RuleConfig};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::net::SocketAddr;
 use std::process::Command;
 
@@ -52,10 +52,13 @@ impl FirewallManager {
     /// Returns a `FirewallManager` that tracks what was created (for teardown),
     /// or an error string if setup fails.
     pub fn setup(config: &GatewayConfig) -> Result<Self, String> {
-        let rules_with_intercept: Vec<&RuleConfig> = config
+        // Pair each intercept rule with its `InterceptConfig` once (L34), so no
+        // downstream code re-derives it with a `.unwrap()` that relies on this
+        // filter's invariant holding at a distance.
+        let rules_with_intercept: Vec<(&RuleConfig, &InterceptConfig)> = config
             .rules
             .iter()
-            .filter(|r| r.intercept.is_some())
+            .filter_map(|r| r.intercept.as_ref().map(|ic| (r, ic)))
             .collect();
 
         if rules_with_intercept.is_empty() {
@@ -69,15 +72,15 @@ impl FirewallManager {
         }
 
         // Classify which chains/features we need.
-        let needs_encrypt_chain = rules_with_intercept.iter().any(|r| {
+        let needs_encrypt_chain = rules_with_intercept.iter().any(|(_, ic)| {
             matches!(
-                r.intercept.as_ref().unwrap().mode,
+                ic.mode,
                 InterceptMode::IngressRedirect | InterceptMode::EgressRedirect
             )
         });
         let needs_decrypt_chain = rules_with_intercept
             .iter()
-            .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::Tproxy);
+            .any(|(_, ic)| ic.mode == InterceptMode::Tproxy);
 
         let mut mgr = Self {
             owns_encrypt_chain: false,
@@ -137,7 +140,10 @@ impl FirewallManager {
 
     // ── Encrypt chain setup ─────────────────────────────────────────────────
 
-    fn ensure_encrypt_chain(&mut self, rules: &[&RuleConfig]) -> Result<(), String> {
+    fn ensure_encrypt_chain(
+        &mut self,
+        rules: &[(&RuleConfig, &InterceptConfig)],
+    ) -> Result<(), String> {
         // Create or flush the chain.
         Self::create_or_flush_chain("iptables", "nat", CHAIN_ENCRYPT)?;
         self.owns_encrypt_chain = true;
@@ -146,10 +152,17 @@ impl FirewallManager {
         // ingress_redirect → PREROUTING; egress_redirect → OUTPUT.
         let has_ingress = rules
             .iter()
-            .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::IngressRedirect);
+            .any(|(_, ic)| ic.mode == InterceptMode::IngressRedirect);
         let has_egress = rules
             .iter()
-            .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::EgressRedirect);
+            .any(|(_, ic)| ic.mode == InterceptMode::EgressRedirect);
+        // The IPv6 mirror only exists so an egress `127.0.0.1` REDIRECT also
+        // catches `::1` (M18): compute whether any egress rule actually needs
+        // it, so we don't touch ip6tables at all when none does.
+        let needs_v6_mirror = rules.iter().any(|(_, ic)| {
+            ic.mode == InterceptMode::EgressRedirect
+                && ic.match_dst.iter().any(|d| d == "127.0.0.1")
+        });
 
         if has_ingress {
             Self::ensure_jump("iptables", "nat", "PREROUTING", CHAIN_ENCRYPT)?;
@@ -161,48 +174,37 @@ impl FirewallManager {
             // returns the caller's effective UID by value, takes no pointers, and never
             // sets errno; it has no preconditions and cannot cause undefined behaviour.
             let uid = unsafe { libc::geteuid() };
-            run_nft(
-                "iptables",
-                &[
-                    "-t",
-                    "nat",
-                    "-A",
-                    CHAIN_ENCRYPT,
-                    "-m",
-                    "owner",
-                    "--uid-owner",
-                    &uid.to_string(),
-                    "-j",
-                    "RETURN",
-                ],
-            )?;
+            run_iptables(&[
+                "-t",
+                "nat",
+                "-A",
+                CHAIN_ENCRYPT,
+                "-m",
+                "owner",
+                "--uid-owner",
+                &uid.to_string(),
+                "-j",
+                "RETURN",
+            ])?;
 
-            // IPv6: set up equivalent chain for egress (browsers use ::1 for localhost).
-            Self::create_or_flush_chain("ip6tables", "nat", CHAIN_ENCRYPT)?;
-            self.owns_encrypt_chain_v6 = true;
-            Self::ensure_jump("ip6tables", "nat", "OUTPUT", CHAIN_ENCRYPT)?;
-            run_nft(
-                "ip6tables",
-                &[
-                    "-t",
-                    "nat",
-                    "-A",
-                    CHAIN_ENCRYPT,
-                    "-m",
-                    "owner",
-                    "--uid-owner",
-                    &uid.to_string(),
-                    "-j",
-                    "RETURN",
-                ],
-            )?;
+            // IPv6 mirror (browsers use ::1 for localhost): best-effort, and
+            // only when an egress rule actually redirects 127.0.0.1 (M18).
+            // On hosts booted with ipv6.disable=1 or lacking the ip6tables nat
+            // table, a failure here logs a warning and leaves the v4 setup
+            // intact instead of aborting gateway startup.
+            if needs_v6_mirror {
+                if let Err(e) = Self::setup_v6_egress_return(uid) {
+                    warn!("IPv6 loopback interception unavailable: {e}");
+                } else {
+                    self.owns_encrypt_chain_v6 = true;
+                }
+            }
         }
 
         // Add per-rule REDIRECT entries. TPROXY rules are handled by
         // `ensure_decrypt_chain`; skip them here so the `match` below is
         // exhaustive over `InterceptMode` without a panicking fallback arm (CP-13).
-        for rule in rules {
-            let ic = rule.intercept.as_ref().unwrap();
+        for (rule, ic) in rules {
             if ic.mode == InterceptMode::Tproxy {
                 continue;
             }
@@ -240,10 +242,12 @@ impl FirewallManager {
                             args.extend_from_slice(&["--dport", &dports]);
                         }
                         args.extend_from_slice(&["-j", "REDIRECT", "--to-port", &port_str]);
-                        run_nft("iptables", &args)?;
+                        run_iptables(&args)?;
 
-                        // IPv6 mirror: 127.0.0.1 → also cover ::1 via ip6tables.
-                        if dst == "127.0.0.1" {
+                        // IPv6 mirror: 127.0.0.1 → also cover ::1 via ip6tables,
+                        // but only if the v6 chain was actually set up, and
+                        // best-effort (M18): a v6-disabled host must not fail.
+                        if dst == "127.0.0.1" && self.owns_encrypt_chain_v6 {
                             let mut args6 =
                                 vec!["-t", "nat", "-A", CHAIN_ENCRYPT, "-d", "::1", "-p", &proto];
                             if dports.contains(',') || dports.contains(':') {
@@ -252,7 +256,9 @@ impl FirewallManager {
                                 args6.extend_from_slice(&["--dport", &dports]);
                             }
                             args6.extend_from_slice(&["-j", "REDIRECT", "--to-port", &port_str]);
-                            run_nft("ip6tables", &args6)?;
+                            if let Err(e) = run_cmd("ip6tables", &args6) {
+                                warn!("[{}] IPv6 ::1 mirror rule failed: {e}", rule.name);
+                            }
                         }
                     }
                     debug!(
@@ -270,9 +276,36 @@ impl FirewallManager {
         Ok(())
     }
 
+    /// Best-effort setup of the ip6tables egress chain + owner-return rule that
+    /// mirrors the v4 egress interception onto `::1` (M18). Returns `Err` if any
+    /// ip6tables step fails (IPv6 disabled / no nat table); the caller downgrades
+    /// that to a warning and continues with v4 only.
+    fn setup_v6_egress_return(uid: libc::uid_t) -> Result<(), String> {
+        Self::create_or_flush_chain("ip6tables", "nat", CHAIN_ENCRYPT)?;
+        Self::ensure_jump("ip6tables", "nat", "OUTPUT", CHAIN_ENCRYPT)?;
+        run_cmd(
+            "ip6tables",
+            &[
+                "-t",
+                "nat",
+                "-A",
+                CHAIN_ENCRYPT,
+                "-m",
+                "owner",
+                "--uid-owner",
+                &uid.to_string(),
+                "-j",
+                "RETURN",
+            ],
+        )
+    }
+
     // ── Decrypt chain setup (TPROXY) ────────────────────────────────────────
 
-    fn ensure_decrypt_chain(&mut self, rules: &[&RuleConfig]) -> Result<(), String> {
+    fn ensure_decrypt_chain(
+        &mut self,
+        rules: &[(&RuleConfig, &InterceptConfig)],
+    ) -> Result<(), String> {
         // Routing policy (ip rule + ip route). Track which elements *we* created
         // (vs. found pre-existing) so teardown removes only ours (CP-10).
         let (rule_added, route_added) = Self::ensure_routing_policy()?;
@@ -300,8 +333,7 @@ impl FirewallManager {
         ])?;
 
         // Exclude gateway's own listening ports from TPROXY (RETURN rules).
-        for rule in rules {
-            let ic = rule.intercept.as_ref().unwrap();
+        for (rule, ic) in rules {
             if ic.mode != InterceptMode::Tproxy {
                 continue;
             }
@@ -323,8 +355,7 @@ impl FirewallManager {
         }
 
         // Per-rule TPROXY entries.
-        for rule in rules {
-            let ic = rule.intercept.as_ref().unwrap();
+        for (rule, ic) in rules {
             if ic.mode != InterceptMode::Tproxy {
                 continue;
             }
@@ -388,7 +419,7 @@ impl FirewallManager {
             )?;
         }
         if need_route {
-            run_cmd(
+            if let Err(e) = run_cmd(
                 "ip",
                 &[
                     "route",
@@ -400,7 +431,16 @@ impl FirewallManager {
                     "table",
                     TPROXY_TABLE,
                 ],
-            )?;
+            ) {
+                // Roll back the rule we just added before returning (M19): the
+                // caller sets `owns_routing_rule` from our return value, so on
+                // this early Err it would otherwise never learn to remove the
+                // freshly-added fwmark rule — a leak past the aborted startup.
+                if need_rule {
+                    Self::remove_routing_rule();
+                }
+                return Err(e);
+            }
         }
         Ok((need_rule, need_route))
     }
@@ -409,8 +449,25 @@ impl FirewallManager {
     /// routing elements need creating. Pure so it is unit-testable without
     /// `CAP_NET_ADMIN`. `(rule_needed, route_needed)`.
     fn routing_policy_needed(rule_show: &str, route_show: &str) -> (bool, bool) {
-        let rule_needed =
-            !rule_show.contains("fwmark") || !rule_show.contains(&format!("lookup {TPROXY_TABLE}"));
+        // The required rule must appear on a SINGLE line as both the mark and
+        // the table lookup (M20): two unrelated pre-existing rules (e.g.
+        // `fwmark 0x2 lookup 200` plus any `lookup 100`) must not be mistaken
+        // for our `fwmark 1 lookup 100`, or we would skip installing it and
+        // TPROXY-marked packets would never reach the local table. `ip rule
+        // show` renders the mark in hex, so accept both `1` and `0x1`.
+        let mark_dec = TPROXY_MARK;
+        let mark_hex = format!("0x{:x}", TPROXY_MARK.parse::<u32>().unwrap_or(1));
+        let have_rule = rule_show.lines().any(|line| {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let mark_ok = toks
+                .windows(2)
+                .any(|w| w[0] == "fwmark" && (w[1] == mark_dec || w[1] == mark_hex.as_str()));
+            let table_ok = toks
+                .windows(2)
+                .any(|w| w[0] == "lookup" && w[1] == TPROXY_TABLE);
+            mark_ok && table_ok
+        });
+        let rule_needed = !have_rule;
         let route_needed = !route_show.contains("local default");
         (rule_needed, route_needed)
     }
@@ -454,10 +511,10 @@ impl FirewallManager {
 
         if exists {
             // Flush existing rules.
-            run_nft(binary, &["-t", table, "-F", chain])?;
+            run_cmd(binary, &["-t", table, "-F", chain])?;
         } else {
             // Create new chain.
-            run_nft(binary, &["-t", table, "-N", chain])?;
+            run_cmd(binary, &["-t", table, "-N", chain])?;
         }
         Ok(())
     }
@@ -471,7 +528,7 @@ impl FirewallManager {
             .status();
         match check {
             Ok(s) if s.success() => Ok(()), // already present
-            _ => run_nft(binary, &["-t", table, "-A", parent, "-j", chain]),
+            _ => run_cmd(binary, &["-t", table, "-A", parent, "-j", chain]),
         }
     }
 
@@ -527,10 +584,6 @@ fn run_iptables(args: &[&str]) -> Result<(), String> {
     run_cmd("iptables", args)
 }
 
-fn run_nft(binary: &str, args: &[&str]) -> Result<(), String> {
-    run_cmd(binary, args)
-}
-
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
     debug!("exec: {} {}", cmd, args.join(" "));
     let output = Command::new(cmd)
@@ -564,32 +617,32 @@ pub struct IptablesCmd {
 /// Pure function for unit testing.
 pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
     let mut cmds = Vec::new();
-    let rules_with_intercept: Vec<&RuleConfig> = config
+    let rules_with_intercept: Vec<(&RuleConfig, &InterceptConfig)> = config
         .rules
         .iter()
-        .filter(|r| r.intercept.is_some())
+        .filter_map(|r| r.intercept.as_ref().map(|ic| (r, ic)))
         .collect();
 
     if rules_with_intercept.is_empty() {
         return cmds;
     }
 
-    let needs_encrypt = rules_with_intercept.iter().any(|r| {
+    let needs_encrypt = rules_with_intercept.iter().any(|(_, ic)| {
         matches!(
-            r.intercept.as_ref().unwrap().mode,
+            ic.mode,
             InterceptMode::IngressRedirect | InterceptMode::EgressRedirect
         )
     });
     let needs_decrypt = rules_with_intercept
         .iter()
-        .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::Tproxy);
+        .any(|(_, ic)| ic.mode == InterceptMode::Tproxy);
 
     let has_ingress = rules_with_intercept
         .iter()
-        .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::IngressRedirect);
+        .any(|(_, ic)| ic.mode == InterceptMode::IngressRedirect);
     let has_egress = rules_with_intercept
         .iter()
-        .any(|r| r.intercept.as_ref().unwrap().mode == InterceptMode::EgressRedirect);
+        .any(|(_, ic)| ic.mode == InterceptMode::EgressRedirect);
 
     if needs_encrypt {
         // Create/flush chain.
@@ -634,8 +687,7 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
         }
 
         // Per-rule entries.
-        for rule in &rules_with_intercept {
-            let ic = rule.intercept.as_ref().unwrap();
+        for (rule, ic) in &rules_with_intercept {
             if ic.mode != InterceptMode::IngressRedirect && ic.mode != InterceptMode::EgressRedirect
             {
                 continue;
@@ -815,8 +867,7 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
         ]));
 
         // RETURN for own listening ports.
-        for rule in &rules_with_intercept {
-            let ic = rule.intercept.as_ref().unwrap();
+        for (rule, ic) in &rules_with_intercept {
             if ic.mode != InterceptMode::Tproxy {
                 continue;
             }
@@ -849,8 +900,7 @@ pub fn plan_firewall_commands(config: &GatewayConfig) -> Vec<IptablesCmd> {
         }
 
         // Per-rule TPROXY entries.
-        for rule in &rules_with_intercept {
-            let ic = rule.intercept.as_ref().unwrap();
+        for (rule, ic) in &rules_with_intercept {
             if ic.mode != InterceptMode::Tproxy {
                 continue;
             }
@@ -968,6 +1018,31 @@ mod tests {
             FirewallManager::routing_policy_needed("from all fwmark 0x1 lookup 100", ""),
             (false, true)
         );
+    }
+
+    // M20: the mark and table must be on the SAME line. Two unrelated
+    // pre-existing rules (another proxy's fwmark 0x2 lookup 200, plus some
+    // other lookup 100) must NOT be mistaken for our fwmark 1 lookup 100, or we
+    // would skip installing the rule TPROXY needs.
+    #[test]
+    fn routing_policy_needed_ignores_cross_line_substrings() {
+        let rule_show =
+            "0:\tfrom all lookup local\n32000:\tfrom all fwmark 0x2 lookup 200\n32001:\tfrom all lookup 100\n";
+        // fwmark 0x2 and lookup 100 exist, but never together → rule needed.
+        assert!(FirewallManager::routing_policy_needed(rule_show, "local default dev lo").0);
+    }
+
+    #[test]
+    fn routing_policy_needed_accepts_decimal_and_hex_mark() {
+        for line in [
+            "32765:\tfrom all fwmark 0x1 lookup 100\n",
+            "32765:\tfrom all fwmark 1 lookup 100\n",
+        ] {
+            assert!(
+                !FirewallManager::routing_policy_needed(line, "local default dev lo").0,
+                "line should satisfy the rule: {line:?}"
+            );
+        }
     }
 
     // CP-13: a mixed tproxy + egress config plans commands for both modes without

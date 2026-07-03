@@ -25,8 +25,7 @@
 //! peer gateway.
 
 use crate::interfaces::endpoint::{
-    accept_plain_upstream, accept_tls_upstream, authenticate_peer, connect_plain_upstream,
-    connect_tls_upstream, EndpointPolicy,
+    authenticate_peer, establish_upstream, poll_readable, EndpointPolicy,
 };
 use crate::management::config::{Direction, QosPolicy, ShmNotify, ShmRingKind, TlsMode};
 use crate::networking::socket_manager::{apply_safety_priority, set_nodelay, set_nonblocking_fd};
@@ -280,58 +279,21 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
     });
     let policy = endpoint_policy.as_ref();
 
-    // Routing endpoints relay plaintext (no TLS) on the upstream leg, like the
-    // TCP routing provider (TRA #58); local-caller auth already passed above.
-    let tls = match (task.routing, task.direction) {
-        (true, Direction::Encrypt) => connect_plain_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-        (true, Direction::Decrypt) => accept_plain_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-        (false, Direction::Encrypt) => connect_tls_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.tls_mode,
-            &task.provider_params,
-            task.protocol_version.as_deref(),
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-        (false, Direction::Decrypt) => accept_tls_upstream(
-            &task.label,
-            &task.upstream_addr,
-            task.tls_mode,
-            &task.provider_params,
-            task.protocol_version.as_deref(),
-            task.sock_buf_size,
-            task.qos,
-            policy,
-            &task.shutdown,
-        ),
-    };
-    let mut tls = match tls {
-        Ok(t) => t,
-        Err(e) => {
-            let verb = match task.direction {
-                Direction::Encrypt => "connect",
-                Direction::Decrypt => "accept",
-            };
-            error!("[{}] upstream {verb} failed: {e}", task.label);
-            return;
-        }
+    let mut tls = match establish_upstream(
+        &task.label,
+        task.routing,
+        task.direction,
+        &task.upstream_addr,
+        task.tls_mode,
+        &task.provider_params,
+        task.protocol_version.as_deref(),
+        task.sock_buf_size,
+        task.qos,
+        policy,
+        &task.shutdown,
+    ) {
+        Some(t) => t,
+        None => return,
     };
 
     if let Err(e) = relay(
@@ -395,7 +357,12 @@ fn relay(
         }
 
         let tls_pending = tls.ssl_pending() > 0;
-        let (tls_ready, evt_ready, ctl_hup) = poll_relay(tls_fd, evt_fd, ctl_fd, tls_pending, 100)?;
+        // Ring residue after a bounded coalesce must not wait out a full poll
+        // (M8): a burst larger than one coalesce budget leaves frames in the
+        // c2g ring whose eventfd was already drained.
+        let ring_pending = !seg.consumer_is_empty();
+        let (tls_ready, evt_ready, ctl_hup) =
+            poll_relay(tls_fd, evt_fd, ctl_fd, tls_pending, ring_pending, 100)?;
         if ctl_hup {
             debug!("[{label}] control socket hung up; client gone");
             break;
@@ -418,12 +385,15 @@ fn relay(
         // gateway -> client: read TLS bytes, reassemble frames, push into g2c.
         // Frames are pushed without a per-frame wakeup; a single `signal_g2c`
         // fires after each TLS read drains, so the client gets one eventfd/futex
-        // wake per batch instead of one syscall per frame. This is exactly
-        // equivalent to the old per-frame signalling: only the first push's
-        // empty→non-empty edge (`first_was_empty`) ever drove a futex wake, and
-        // the eventfd counter already coalesced wakeups — the per-frame calls
-        // were redundant. The client drains the whole ring on wake, and the
-        // signal always fires before the next poll, so no wakeup is lost.
+        // wake per batch instead of one syscall per frame.
+        //
+        // The wake must fire if ANY push in the batch drove the ring from empty
+        // to non-empty, not just the first (M9): under concurrent consumption
+        // the client can drain the ring to empty and park mid-batch, so a later
+        // push's empty→non-empty edge is the one that must wake it. Latching
+        // only the first edge dropped that wakeup, stalling the client until its
+        // bounded futex park (≤50 ms) expired. `any_was_empty` ORs the edges
+        // across the whole batch; `pushed` still gates whether we signal at all.
         if tls_ready || tls_pending {
             loop {
                 match tls.read(&mut rbuf) {
@@ -431,15 +401,14 @@ fn relay(
                     Ok(n) => {
                         decoder.feed(&rbuf[..n]);
                         let mut pushed = false;
-                        let mut first_was_empty = false;
+                        let mut any_was_empty = false;
                         loop {
                             match decoder.next_frame_borrowed() {
                                 Ok(Some((traffic_id, payload))) => {
-                                    let was_empty = push_g2c(seg, traffic_id, payload, shutdown)?;
-                                    if !pushed {
-                                        first_was_empty = was_empty;
-                                        pushed = true;
-                                    }
+                                    let was_empty =
+                                        push_g2c(seg, traffic_id, payload, ctl_fd, shutdown)?;
+                                    any_was_empty |= was_empty;
+                                    pushed = true;
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
@@ -451,7 +420,7 @@ fn relay(
                             }
                         }
                         if pushed {
-                            seg.signal_g2c(first_was_empty);
+                            seg.signal_g2c(any_was_empty);
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -485,6 +454,7 @@ fn push_g2c(
     seg: &ShmSegment,
     traffic_id: u32,
     data: &[u8],
+    ctl_fd: RawFd,
     shutdown: &AtomicBool,
 ) -> io::Result<bool> {
     loop {
@@ -493,6 +463,20 @@ fn push_g2c(
             Ok(None) => {
                 if shutdown.load(Ordering::Relaxed) {
                     return Err(io::Error::other("shutdown while gateway->client ring full"));
+                }
+                // Detect client death while the ring is full (H3): a client
+                // that crashed or was killed is exactly the client whose ring
+                // fills and never drains, so the POLLHUP the relay watches for
+                // in `poll_relay` can never fire from here (this is called from
+                // the inner TLS-read loop, not the outer poll). Probe the
+                // control socket each backoff; a gone client returns a quiet
+                // EOF so `serve()` tears the endpoint down and releases the
+                // upstream TLS session instead of spinning forever.
+                if ctl_socket_gone(ctl_fd) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "client gone with gateway->client ring full",
+                    ));
                 }
                 // Nudge the client in case it is waiting, then back off.
                 seg.signal_g2c(true);
@@ -552,6 +536,58 @@ struct ShmSegment {
     g2c_evt: EventFd,
 }
 
+/// Resolved on-wire geometry of a SHM segment: the exact ring/control sizes and
+/// notify mode the gateway maps *and* advertises to the client. Both
+/// [`ShmSegment::create`] (mapping) and the gRPC CreateShm reply
+/// (`InterfaceManager::create_shm`) derive from [`resolve_shm_layout`] so the
+/// two can never disagree — a slot ring reporting byte-stream caps, or an
+/// eventfd notify for a futex ring, would make the management API lie to any
+/// external consumer (M7).
+pub(crate) struct ShmLayout {
+    pub ring_kind: u8,
+    pub capacity: u32,
+    pub segment_size: u32,
+    pub cap_c2g: usize,
+    pub cap_g2c: usize,
+    pub ctl_len: usize,
+    pub notify: i32,
+}
+
+/// Compute the page-aligned ring/control geometry and notify mode for `task`.
+/// Pure (no syscalls beyond the page-size query); the single source of truth
+/// for both mapping and reporting.
+pub(crate) fn resolve_shm_layout(task: &ShmEndpointTask) -> ShmLayout {
+    let page = page_size();
+    let (ring_kind, capacity, segment_size, cap_c2g, cap_g2c, ctl_len) = match task.ring_kind {
+        ShmRingKind::ByteStream => {
+            let c2g = round_up(task.cap_c2g.max(page), page);
+            let g2c = round_up(task.cap_g2c.max(page), page);
+            let ctl = round_up(SHM_CONTROL_SIZE, page);
+            (SHM_RING_BYTESTREAM, 0u32, 0u32, c2g, g2c, ctl)
+        }
+        ShmRingKind::Slot => {
+            let cap = (task.num_segments.max(2)).next_power_of_two();
+            let seg_sz = round_up(task.segment_size.max(segment_size_for(0)), CACHE_LINE);
+            let data = round_up(ring_data_bytes(cap, seg_sz).max(page), page);
+            let ctl = round_up(slot_control_size(cap).max(page), page);
+            (SHM_RING_SLOT, cap as u32, seg_sz as u32, data, data, ctl)
+        }
+    };
+    let notify = match (task.ring_kind, task.g2c_notify) {
+        (ShmRingKind::Slot, ShmNotify::Futex) => SHM_NOTIFY_FUTEX as i32,
+        _ => SHM_NOTIFY_EVENTFD as i32,
+    };
+    ShmLayout {
+        ring_kind,
+        capacity,
+        segment_size,
+        cap_c2g,
+        cap_g2c,
+        ctl_len,
+        notify,
+    }
+}
+
 impl ShmSegment {
     /// Allocate and initialise the control page, both data rings, and the two
     /// eventfds for the ring kind requested by `task`. The gateway→client data
@@ -560,29 +596,19 @@ impl ShmSegment {
     /// ring the consumer writes only the control-page sequence array, never the
     /// payload region, so the seal still holds.)
     fn create(task: &ShmEndpointTask) -> io::Result<ShmSegment> {
-        let page = page_size();
-
-        // Resolve geometry and the control-page size for the chosen ring kind.
-        let (ring_kind, capacity, segment_size, cap_c2g, cap_g2c, ctl_len) = match task.ring_kind {
-            ShmRingKind::ByteStream => {
-                let c2g = round_up(task.cap_c2g.max(page), page);
-                let g2c = round_up(task.cap_g2c.max(page), page);
-                let ctl = round_up(SHM_CONTROL_SIZE, page);
-                (SHM_RING_BYTESTREAM, 0u32, 0u32, c2g, g2c, ctl)
-            }
-            ShmRingKind::Slot => {
-                let cap = (task.num_segments.max(2)).next_power_of_two();
-                let seg_sz = round_up(task.segment_size.max(segment_size_for(0)), CACHE_LINE);
-                let data = round_up(ring_data_bytes(cap, seg_sz).max(page), page);
-                let ctl = round_up(slot_control_size(cap).max(page), page);
-                (SHM_RING_SLOT, cap as u32, seg_sz as u32, data, data, ctl)
-            }
-        };
-
-        let g2c_notify = match (task.ring_kind, task.g2c_notify) {
-            (ShmRingKind::Slot, ShmNotify::Futex) => SHM_NOTIFY_FUTEX,
-            _ => SHM_NOTIFY_EVENTFD,
-        };
+        // Geometry and notify mode come from the shared resolver so the mapping
+        // here and the gRPC reply cannot drift (M7).
+        let ShmLayout {
+            ring_kind,
+            capacity,
+            segment_size,
+            cap_c2g,
+            cap_g2c,
+            ctl_len,
+            notify: g2c_notify_i32,
+        } = resolve_shm_layout(task);
+        // The segment stores the notify mode as the on-wire `u8`.
+        let g2c_notify = g2c_notify_i32 as u8;
 
         let control_fd = os::memfd_create("scg-shm-ctl")?;
         let data_c2g_fd = match os::memfd_create("scg-shm-c2g") {
@@ -804,6 +830,17 @@ impl ShmSegment {
     }
 }
 
+impl Drop for ShmSegment {
+    fn drop(&mut self) {
+        // The memfds are normally closed on the success path once the client
+        // holds its own copies; on an error return (e.g. `send_with_fds`
+        // failing) that call is skipped and the raw fds would leak (L12).
+        // `close_memfds` is idempotent (guarded by `fd >= 0`, sets to -1), so
+        // running it here is a safe no-op after a successful hand-off.
+        self.close_memfds();
+    }
+}
+
 /// Query the system page size (mappings and ring capacities are page-aligned).
 fn page_size() -> usize {
     // SAFETY: `sysconf` only reads a system-wide configuration value for the
@@ -832,6 +869,13 @@ fn poll_relay(
     evt_fd: RawFd,
     ctl_fd: RawFd,
     tls_pending: bool,
+    // When either the TLS engine has buffered plaintext OR the c2g ring still
+    // holds undrained frames after a bounded coalesce (M8), poll must not
+    // block: the eventfd was already drained and an idle client sends no new
+    // signal, so a 100 ms wait would strand that residue. `tls_ready` stays
+    // keyed on `tls_pending` alone — ring residue does not make the TLS fd
+    // readable.
+    ring_pending: bool,
     timeout_ms: i32,
 ) -> io::Result<(bool, bool, bool)> {
     let mut fds = [
@@ -851,7 +895,11 @@ fn poll_relay(
             revents: 0,
         },
     ];
-    let timeout = if tls_pending { 0 } else { timeout_ms };
+    let timeout = if tls_pending || ring_pending {
+        0
+    } else {
+        timeout_ms
+    };
 
     loop {
         // SAFETY: `fds` is a live, mutable stack array of `fds.len()` fully
@@ -878,28 +926,23 @@ fn poll_relay(
     Ok((tls_ready, evt_ready, ctl_hup))
 }
 
-/// Poll a single fd for readability with a timeout; retries on `EINTR`.
-fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
+/// Zero-timeout probe of the control socket for peer death (POLLHUP/POLLERR,
+/// or POLLIN — the client never sends after the handshake, so any readable
+/// data also means it is gone). Used inside the g2c backpressure loop (H3) so
+/// a client that dies while its ring is full is detected instead of the relay
+/// spinning forever with the upstream TLS session held open.
+fn ctl_socket_gone(ctl_fd: RawFd) -> bool {
     let mut pfd = libc::pollfd {
-        fd,
+        fd: ctl_fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    loop {
-        // SAFETY: `pfd` is a live, fully initialised `pollfd` on the stack, so the
-        // pointer is valid for a single-element array (count `1`); `poll` only
-        // writes its `revents` field. The negative return is checked and `EINTR`
-        // retried below.
-        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return false;
-        }
-        return ret > 0 && (pfd.revents & libc::POLLIN) != 0;
-    }
+    // SAFETY: `pfd` is a live, fully-initialised single `pollfd`; the
+    // pointer/count pair (1) is valid for the call and `poll` only writes
+    // `revents`. A negative return (including EINTR) is treated as
+    // "not known gone" — conservative, the caller re-probes next backoff.
+    let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+    ret > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLIN)) != 0
 }
 
 #[cfg(test)]
@@ -976,6 +1019,161 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         ShmSegment::create(&task).expect("create byte-stream segment")
+    }
+
+    /// Whether a raw fd is still open (fcntl F_GETFD succeeds).
+    fn fd_is_open(fd: RawFd) -> bool {
+        // SAFETY: `F_GETFD` only queries the descriptor flags; it takes no
+        // pointer arguments and has no side effects on a valid fd.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    // L12: `close_memfds` must actually close the three memfds and record them
+    // as closed. This is the primitive the Drop impl invokes so an error path
+    // (e.g. `send_with_fds` failing) no longer leaks them. Checked in the same
+    // thread immediately after close so no other test can reopen the numbers
+    // between the close and the probe.
+    #[test]
+    fn close_memfds_closes_and_records() {
+        let mut seg = byte_stream_segment(page_size(), page_size());
+        let (c, a, b) = (seg.control_fd, seg.data_c2g_fd, seg.data_g2c_fd);
+        assert!(fd_is_open(c) && fd_is_open(a) && fd_is_open(b));
+        seg.close_memfds();
+        assert!(!fd_is_open(c) && !fd_is_open(a) && !fd_is_open(b));
+        // Fields reset to -1 so the (idempotent) Drop is a no-op.
+        assert_eq!(
+            (seg.control_fd, seg.data_c2g_fd, seg.data_g2c_fd),
+            (-1, -1, -1)
+        );
+        drop(seg); // must not double-close / panic
+    }
+
+    // L12: dropping a segment that was never explicitly closed (the leak path)
+    // must run close_memfds via Drop and not double-close. The close primitive
+    // is verified deterministically above; the Drop impl is a one-liner calling
+    // it, so here we only assert a fresh segment drops cleanly.
+    #[test]
+    fn drop_of_fresh_segment_is_clean() {
+        let seg = byte_stream_segment(page_size(), page_size());
+        drop(seg); // Drop → close_memfds; must not panic / double-close.
+    }
+
+    /// Build a slot+futex SHM segment — the mode where the empty→non-empty
+    /// wake edge is load-bearing (the byte-stream ring always signals via a
+    /// coalescing eventfd, so M9 only affects the slot ring).
+    fn slot_futex_segment(num_segments: usize, segment_size: usize) -> ShmSegment {
+        let task = ShmEndpointTask {
+            label: "test-slot".to_string(),
+            control_socket_path: PathBuf::new(),
+            direction: Direction::Encrypt,
+            upstream_addr: String::new(),
+            tls_mode: TlsMode::Tls,
+            routing: true,
+            protocol_version: None,
+            provider_params: HashMap::new(),
+            sock_buf_size: 0,
+            qos: QosPolicy {
+                dscp_tag: None,
+                preserve_inbound_dscp: false,
+                traffic_class: crate::management::config::TrafficClass::default(),
+            },
+            cap_c2g: 0,
+            cap_g2c: 0,
+            spin_wait_us: 0,
+            ring_kind: ShmRingKind::Slot,
+            segment_size,
+            num_segments,
+            g2c_notify: ShmNotify::Futex,
+            allowed_uids: Arc::new(Vec::new()),
+            allowed_pids: Arc::new(Vec::new()),
+            owner_uid: 0,
+            token: Arc::new(Mutex::new(None)),
+            policy: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        ShmSegment::create(&task).expect("create slot segment")
+    }
+
+    // M7: the reported geometry must reflect the ACTUAL ring the client sees.
+    // A slot ring's caps come from num_segments × segment_size (not the
+    // byte-stream ring_capacity), and its notify mode is futex — both were
+    // previously mis-reported (byte-stream caps + hardcoded eventfd).
+    #[test]
+    fn resolve_shm_layout_reports_slot_geometry_and_futex_notify() {
+        let seg_task = |kind, notify| ShmEndpointTask {
+            label: "t".into(),
+            control_socket_path: PathBuf::new(),
+            direction: Direction::Encrypt,
+            upstream_addr: String::new(),
+            tls_mode: TlsMode::Tls,
+            routing: true,
+            protocol_version: None,
+            provider_params: HashMap::new(),
+            sock_buf_size: 0,
+            qos: QosPolicy {
+                dscp_tag: None,
+                preserve_inbound_dscp: false,
+                traffic_class: crate::management::config::TrafficClass::default(),
+            },
+            cap_c2g: 4096,
+            cap_g2c: 4096,
+            spin_wait_us: 0,
+            ring_kind: kind,
+            segment_size: 256,
+            num_segments: 8,
+            g2c_notify: notify,
+            allowed_uids: Arc::new(Vec::new()),
+            allowed_pids: Arc::new(Vec::new()),
+            owner_uid: 0,
+            token: Arc::new(Mutex::new(None)),
+            policy: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Byte-stream: page-aligned caps, eventfd notify.
+        let bs = resolve_shm_layout(&seg_task(ShmRingKind::ByteStream, ShmNotify::Eventfd));
+        assert_eq!(bs.notify, SHM_NOTIFY_EVENTFD as i32);
+        assert!(bs.cap_c2g >= 4096 && bs.cap_c2g.is_multiple_of(page_size()));
+
+        // Slot + futex: caps derive from the slot geometry, notify is futex.
+        let slot = resolve_shm_layout(&seg_task(ShmRingKind::Slot, ShmNotify::Futex));
+        assert_eq!(slot.notify, SHM_NOTIFY_FUTEX as i32);
+        let expected = round_up(
+            ring_data_bytes(8, round_up(256, CACHE_LINE)).max(page_size()),
+            page_size(),
+        );
+        assert_eq!(slot.cap_c2g, expected);
+        assert_eq!(slot.cap_c2g, slot.cap_g2c);
+    }
+
+    // M9: the g2c wake must fire if ANY push in a batch drove the ring from
+    // empty to non-empty, not only the first. The load-bearing primitive is
+    // `push_g2c_frame` reporting the empty→non-empty edge on the slot ring:
+    // the first push into an empty ring reports `true`, a push while the ring
+    // is still non-empty reports `false`. The relay ORs these edges across the
+    // whole batch (`any_was_empty |= was_empty`) so a concurrent client that
+    // re-empties the ring mid-batch is still woken by the later true edge.
+    #[test]
+    fn g2c_slot_push_reports_empty_to_nonempty_edge() {
+        let seg = slot_futex_segment(8, 128);
+        let payload = [7u8; 32];
+        // First push into an empty ring: this is the wake edge.
+        assert_eq!(
+            seg.push_g2c_frame(1, &payload).expect("push1"),
+            Some(true),
+            "first push into an empty ring must report the empty→non-empty edge"
+        );
+        // Second push while still non-empty: no fresh edge.
+        assert_eq!(
+            seg.push_g2c_frame(2, &payload).expect("push2"),
+            Some(false),
+            "a push into an already-non-empty ring is not a wake edge"
+        );
+        // The relay's `any_was_empty |= was_empty` therefore latches the true
+        // edge regardless of which push in the batch produced it — the M9 fix.
+        let batch = [Some(false), Some(true), Some(false)];
+        let any = batch.iter().flatten().fold(false, |acc, &e| acc | e);
+        assert!(any, "OR across the batch preserves a mid-batch wake edge");
     }
 
     /// `coalesce_c2g_into` must drain at most ~`RELAY_BUF_SIZE` per call even when

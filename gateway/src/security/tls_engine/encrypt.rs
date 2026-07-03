@@ -63,6 +63,8 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         None => return,
     };
     listener.set_nonblocking(false).ok();
+    // Listener port, for original-destination recovery (M10).
+    let listen_port = listener.local_addr().ok().map(|a| a.port());
 
     // Resolve typed security parameters once; shared by all connections.
     let tls_params =
@@ -98,22 +100,27 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
             None => continue, // timeout, check shutdown
         };
 
-        // Determine upstream target (TPROXY may redirect to original destination)
-        let target = if ctx.transparent {
-            match tproxy::get_original_dst(client_stream.as_raw_fd()) {
-                Ok(orig) => {
+        // Determine upstream target. For a transparent rule with the `"auto"`
+        // upstream, recover the original destination (REDIRECT/DNAT *or* true
+        // TPROXY) and fail closed if it cannot be recovered — the old
+        // SO_ORIGINAL_DST-only path silently misrouted TPROXY flows to the
+        // configured upstream (M10). A transparent rule with an explicit
+        // upstream is a fixed-forward interceptor and forwards there.
+        let target = if ctx.transparent && ctx.upstream_addr == "auto" {
+            match tproxy::recover_transparent_dst(client_stream.as_raw_fd(), listen_port) {
+                Some(orig) => {
                     debug!(
-                        "[{}] TPROXY {} \u{2192} {} (original dst)",
+                        "[{}] transparent {} \u{2192} {} (recovered original dst)",
                         ctx.rule_name, peer_addr, orig
                     );
                     orig.to_string()
                 }
-                Err(e) => {
+                None => {
                     warn!(
-                        "[{}] SO_ORIGINAL_DST failed: {}, using configured upstream",
-                        ctx.rule_name, e
+                        "[{}] dropping {}: could not recover transparent original dst",
+                        ctx.rule_name, peer_addr
                     );
-                    ctx.upstream_addr.clone()
+                    continue;
                 }
             }
         } else {
@@ -756,7 +763,9 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                     }
                 };
                 for i in 0..count {
-                    let (src, payload) = udp_rx.get(i);
+                    let Some((src, payload)) = udp_rx.get(i) else {
+                        continue;
+                    };
                     match src {
                         Some(s) if accept_source(&mut last_peer, s) => {}
                         Some(s) => {

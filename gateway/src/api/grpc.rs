@@ -296,7 +296,7 @@ mod tests {
 
     fn service(version: &str) -> ManagementService {
         let cfg: GatewayConfig = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
-        let manager = InterfaceManager::new(&cfg, version, Arc::new(AtomicBool::new(false)), None);
+        let manager = InterfaceManager::new(&cfg, version, None);
         ManagementService { manager }
     }
 
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn hardened_server_builds() {
         let cfg: GatewayConfig = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
-        let manager = InterfaceManager::new(&cfg, "t", Arc::new(AtomicBool::new(false)), None);
+        let manager = InterfaceManager::new(&cfg, "t", None);
         let _router =
             hardened_server().add_service(ManagementApiServer::new(ManagementService { manager }));
     }

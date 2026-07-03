@@ -1,7 +1,7 @@
 //! Generated gRPC client/server stubs for the SCG management API.
 //!
 //! The actual types are produced at build time from
-//! `proto/scg_management.proto` by [`build.rs`].
+//! `proto/scg_management.proto` by `build.rs`.
 
 /// Management API protobuf types and gRPC stubs (`scg.management.v1`).
 pub mod management {

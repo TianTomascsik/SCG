@@ -74,11 +74,22 @@ impl SharedConfig {
             Err(_) => return false,
         };
         let last = *self.last_modified.read().unwrap_or_else(|e| e.into_inner());
-        current_mtime > last
+        // `!=`, not `>`: restoring a known-good backup (cp -p, rsync -a,
+        // git checkout) gives the file an *older* mtime than the loaded one,
+        // and that replacement must still trigger a reload (M15).
+        current_mtime != last
     }
 
     /// Reload config from disk. Returns the diff, or an error string.
     pub fn reload(&self) -> Result<ConfigDiff, String> {
+        // Capture the watched file's mtime BEFORE reading it (M15): a write
+        // landing mid-load then leaves the stored value differing from the
+        // file's real mtime, so the next poll re-triggers and converges on the
+        // latest content. Stamping after the read would adopt the new mtime
+        // while having loaded the old bytes — permanently missing that edit.
+        let pre_read_mtime = fs::metadata(&self.config_path)
+            .and_then(|m| m.modified())
+            .ok();
         let new_config = match &self.lite {
             Some(source) => {
                 // Re-run the full layered pipeline (signatures + schema hash are
@@ -109,8 +120,8 @@ impl SharedConfig {
             error!("[reload advisory (error-severity)] {e}");
         }
 
-        // Update stored mtime
-        if let Ok(mtime) = fs::metadata(&self.config_path).and_then(|m| m.modified()) {
+        // Store the mtime captured before the read (see above).
+        if let Some(mtime) = pre_read_mtime {
             *self
                 .last_modified
                 .write()
@@ -149,17 +160,26 @@ where
     // required `fn(c_int)` ABI, cast to the `sighandler_t` the call expects. The
     // handler has `'static` lifetime (a top-level `fn`) so it stays valid for the
     // whole process, and it only touches the `'static` `SIGHUP_RECEIVED` atomic,
-    // so installing it introduces no dangling pointer or data race.
-    unsafe {
+    // so installing it introduces no dangling pointer or data race. The return
+    // value is checked below.
+    let prev = unsafe {
         libc::signal(
             libc::SIGHUP,
             sighup_handler as *const () as libc::sighandler_t,
-        );
+        )
+    };
+    if prev == libc::SIG_ERR {
+        warn!("[gateway] failed to install SIGHUP handler; reload via file polling only");
     }
 
     extern "C" fn sighup_handler(_sig: libc::c_int) {
+        // Async-signal-safe body: an atomic store and nothing else (H4).
+        // Formatting or logging here would allocate and take the logger lock —
+        // if SIGHUP lands while the interrupted thread holds either, the
+        // process self-deadlocks or corrupts allocator state. The operator
+        // message is emitted by the watcher thread when it consumes the flag
+        // (up to one poll interval later).
         SIGHUP_RECEIVED.store(true, Ordering::SeqCst);
-        info!("[gateway] SIGHUP received — reloading configuration...");
     }
 
     std::thread::Builder::new()
@@ -168,8 +188,11 @@ where
             while !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(2));
 
-                let should_reload =
-                    SIGHUP_RECEIVED.swap(false, Ordering::SeqCst) || shared.has_changed();
+                let sighup = SIGHUP_RECEIVED.swap(false, Ordering::SeqCst);
+                if sighup {
+                    info!("[gateway] SIGHUP received — reloading configuration...");
+                }
+                let should_reload = sighup || shared.has_changed();
 
                 if should_reload {
                     match shared.reload() {
@@ -231,5 +254,104 @@ mod tests {
         assert!(new_advisories(&same, &same).is_empty());
         // A reload that *removes* an advisory introduces nothing new.
         assert!(new_advisories(&same, &["x".to_string()]).is_empty());
+    }
+
+    use super::SharedConfig;
+    use crate::management::config::GatewayConfig;
+    use std::time::{Duration, SystemTime};
+
+    fn write_config(path: &std::path::Path, port: u16) {
+        let json = format!(
+            r#"{{"rules":[{{"name":"r","direction":"encrypt",
+                "listen_addr":"127.0.0.1:{port}","upstream_addr":"127.0.0.1:9000",
+                "security_provider":"tls","verify":"none"}}]}}"#
+        );
+        std::fs::write(path, json).expect("write config");
+    }
+
+    /// Self-cleaning temp dir holding one gateway config file, mirroring the
+    /// lite_config test convention (no external tempdir crate).
+    struct TempConfig {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl TempConfig {
+        fn new(tag: &str, port: u16) -> TempConfig {
+            let dir = std::env::temp_dir().join(format!(
+                "scg-cfgmgr-test-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            let path = dir.join("gw.json");
+            write_config(&path, port);
+            TempConfig { dir, path }
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // M15(b): restoring a backup whose mtime is OLDER than the loaded config
+    // (cp -p, rsync -a, git checkout) must still be detected as a change —
+    // the comparison is `!=`, not `>`.
+    #[test]
+    fn has_changed_detects_older_mtime_replacement() {
+        let tc = TempConfig::new("older-mtime", 18101);
+        let path = tc.path.clone();
+        let cfg = GatewayConfig::load(path.to_str().expect("utf8 path")).expect("load");
+        let shared = SharedConfig::new(cfg, path.to_str().expect("utf8 path"));
+        assert!(!shared.has_changed(), "freshly loaded config is unchanged");
+
+        // Backdate the file: same content situation as restoring a backup.
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(old)
+            .expect("set mtime");
+        assert!(
+            shared.has_changed(),
+            "older-mtime replacement must trigger a reload"
+        );
+
+        // Reload converges: stored mtime adopts the file's, change flag clears.
+        shared.reload().expect("reload");
+        assert!(!shared.has_changed(), "reload must clear the change flag");
+    }
+
+    // M15(a): the stored mtime is captured before the read, so a normal
+    // edit → reload cycle stamps the edited file's mtime and re-arms cleanly.
+    #[test]
+    fn reload_adopts_edited_file_mtime() {
+        let tc = TempConfig::new("edit-cycle", 18102);
+        let path = tc.path.clone();
+        let cfg = GatewayConfig::load(path.to_str().expect("utf8 path")).expect("load");
+        let shared = SharedConfig::new(cfg, path.to_str().expect("utf8 path"));
+
+        // Edit the config (new upstream port) and nudge the mtime forward so
+        // filesystems with coarse timestamps still observe a change.
+        write_config(&path, 18103);
+        let newer = SystemTime::now() + Duration::from_secs(2);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(newer)
+            .expect("set mtime");
+
+        assert!(shared.has_changed());
+        let diff = shared.reload().expect("reload");
+        assert_eq!(diff.changed.len(), 1, "listen port change must be detected");
+        assert!(
+            !shared.has_changed(),
+            "stored mtime adopts the edited file's"
+        );
     }
 }

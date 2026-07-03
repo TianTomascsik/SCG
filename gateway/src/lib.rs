@@ -339,7 +339,6 @@ pub fn run(
     let interface_manager = interfaces::manager::InterfaceManager::new(
         &config,
         env!("CARGO_PKG_VERSION"),
-        shutdown.clone(),
         Some(policy_manager.clone()),
     );
     let api_cfg = config.api.clone().unwrap_or_default();

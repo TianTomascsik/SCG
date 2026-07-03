@@ -44,6 +44,9 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         None => return,
     };
     listener.set_nonblocking(false).ok();
+    // Listener port, used to tell a genuine TPROXY redirect from a direct
+    // connection during original-destination recovery (M10).
+    let listen_port = listener.local_addr().ok().map(|a| a.port());
 
     info!(
         "[{}] Decrypt listener on {} ({}) → {} ({})",
@@ -87,24 +90,28 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         apply_tcp_latency_opts(fd, ctx.perf.notsent_lowat, ctx.perf.busy_poll_us);
         // Prioritise the client-facing (SCG → client) return path.
         ctx.apply_egress_qos(fd, peer_addr.is_ipv6(), None);
-        // to discover the original destination IP:port, then forward locally.
-        // We use the original destination IP (not 127.0.0.1) because some
-        // applications (e.g. a multicast discovery channel) bind to specific
-        // interface IPs rather than 0.0.0.0, so 127.0.0.1:{port} would get refused.
+        // Recover the original destination IP:port and forward there. We use
+        // the original destination IP (not 127.0.0.1) because some applications
+        // (e.g. a multicast discovery channel) bind to specific interface IPs
+        // rather than 0.0.0.0, so 127.0.0.1:{port} would get refused.
+        //
+        // `recover_transparent_dst` handles both REDIRECT/DNAT (SO_ORIGINAL_DST)
+        // and true TPROXY (getsockname), where the old SO_ORIGINAL_DST-only path
+        // dropped EVERY connection (M10). It fails closed when the destination
+        // cannot be recovered.
         let resolved_upstream = if ctx.upstream_addr == "auto" && ctx.transparent {
-            match tproxy::get_original_dst(fd) {
-                Ok(orig) => {
-                    let local = orig.to_string();
+            match tproxy::recover_transparent_dst(fd, listen_port) {
+                Some(orig) => {
                     debug!(
-                        "[{}] TPROXY decrypt {} → {} (original dst {})",
-                        ctx.rule_name, peer_addr, local, orig,
+                        "[{}] transparent decrypt {} → {} (recovered original dst)",
+                        ctx.rule_name, peer_addr, orig,
                     );
-                    local
+                    orig.to_string()
                 }
-                Err(e) => {
-                    error!(
-                        "[{}] SO_ORIGINAL_DST failed for decrypt {}: {}",
-                        ctx.rule_name, peer_addr, e,
+                None => {
+                    warn!(
+                        "[{}] dropping decrypt {}: could not recover transparent original dst",
+                        ctx.rule_name, peer_addr,
                     );
                     continue;
                 }

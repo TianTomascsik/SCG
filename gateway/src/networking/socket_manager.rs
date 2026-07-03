@@ -505,6 +505,8 @@ pub struct MmsgRecvBuf {
     iovecs: Vec<libc::iovec>,
     msgs: Vec<libc::mmsghdr>,
     lens: Vec<usize>,
+    /// Datagram count from the most recent `recv`; bounds `get` (L35).
+    last_n: usize,
 }
 
 impl MmsgRecvBuf {
@@ -529,6 +531,7 @@ impl MmsgRecvBuf {
             ],
             msgs: vec![unsafe { std::mem::zeroed() }; batch],
             lens: vec![0usize; batch],
+            last_n: 0,
         }
     }
 
@@ -591,16 +594,26 @@ impl MmsgRecvBuf {
             // the later slice index infallible (no narrowing, no overflow — #16).
             self.lens[i] = (self.msgs[i].msg_len as usize).min(slot_len);
         }
+        self.last_n = n;
         Ok(n)
     }
 
-    /// Source address + payload of the `i`-th datagram from the last `recv`.
-    /// `i` must be `< n` where `n` is that `recv`'s return value.
-    pub fn get(&self, i: usize) -> (Option<SocketAddr>, &[u8]) {
+    /// Source address + payload of the `i`-th datagram from the last `recv`,
+    /// or `None` when `i` is beyond that recv's count (L35).
+    ///
+    /// Total over `i`: an out-of-range index returns `None` instead of panicking
+    /// (`i >= batch`) or silently returning a previous batch's leftover
+    /// address/payload (`last_n <= i < batch`) — the latter would misattribute
+    /// a datagram to the wrong source, which the single-client source pin
+    /// (TRA #7/#39) keys off.
+    pub fn get(&self, i: usize) -> Option<(Option<SocketAddr>, &[u8])> {
+        if i >= self.last_n {
+            return None;
+        }
         let len = self.lens[i].min(self.slot_len);
         let off = i * self.slot_len;
         let payload = &self.data[off..off + len];
-        (sockaddr_storage_to_socketaddr(&self.names[i]), payload)
+        Some((sockaddr_storage_to_socketaddr(&self.names[i]), payload))
     }
 }
 
@@ -764,7 +777,21 @@ pub fn accept_with_timeout(
     // SAFETY: `pfd` is a valid, fully-initialised `pollfd` for one descriptor; we
     // pass `nfds = 1` matching the single-element buffer and a valid timeout.
     let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        // EINTR is a benign wakeup — treat like a timeout so the caller loops.
+        // Any other hard error is surfaced (L18) instead of being reported as a
+        // timeout, which would otherwise let a persistent poll failure (e.g.
+        // EBADF from an fd lifecycle bug) become a silent 100%-CPU spin.
+        if err.kind() == io::ErrorKind::Interrupted {
+            return None;
+        }
+        return Some(Err(err));
+    }
+    if pfd.revents & libc::POLLNVAL != 0 {
+        return Some(Err(io::Error::from_raw_os_error(libc::EBADF)));
+    }
+    if ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0 {
         Some(listener.accept())
     } else {
         None
@@ -935,8 +962,15 @@ fn poll_two_fds_once(fd_a: RawFd, fd_b: RawFd, timeout_ms: i32) -> io::Result<(b
         return Ok((false, false));
     }
 
-    let a_ready = fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0;
-    let b_ready = fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0;
+    // Include POLLERR/POLLNVAL, not just POLLIN/POLLHUP (H6): the kernel
+    // reports error conditions regardless of the requested `events`, and on a
+    // connected UDP socket a pending ICMP error (e.g. port-unreachable) sets
+    // POLLERR until a recv/send clears it. Reporting the fd as ready lets the
+    // caller's next read surface the error and tear down, instead of poll()
+    // returning immediately every iteration → a 100%-CPU busy-spin.
+    let mask = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    let a_ready = fds[0].revents & mask != 0;
+    let b_ready = fds[1].revents & mask != 0;
     Ok((a_ready, b_ready))
 }
 
@@ -1034,7 +1068,7 @@ mod tests {
         for _ in 0..100 {
             let n = buf.recv(rx.as_raw_fd()).unwrap();
             for i in 0..n {
-                let (src, payload) = buf.get(i);
+                let (src, payload) = buf.get(i).expect("i < n is in range");
                 got.push((src.expect("ipv4 source"), payload.to_vec()));
             }
             if got.len() >= 3 {
@@ -1071,11 +1105,46 @@ mod tests {
         for _ in 0..100 {
             let n = buf.recv(rx.as_raw_fd()).unwrap();
             if n > 0 {
-                len = buf.get(0).1.len();
+                len = buf.get(0).expect("first datagram present").1.len();
                 break;
             }
         }
         assert_eq!(len, 16, "oversized datagram clamped to the 16-byte slot");
+    }
+
+    // L35: `get` is total — an index beyond the last recv's count returns None
+    // instead of panicking or handing back a previous batch's stale data.
+    #[test]
+    fn mmsg_get_beyond_last_n_is_none() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"one", rx_addr).unwrap();
+
+        let mut buf = MmsgRecvBuf::new(8, 2048);
+        let mut n = 0;
+        for _ in 0..100 {
+            n = buf.recv(rx.as_raw_fd()).unwrap();
+            if n > 0 {
+                break;
+            }
+        }
+        assert_eq!(n, 1);
+        assert!(buf.get(0).is_some());
+        // Index within the allocation but beyond this recv's count → None,
+        // never the previous batch's leftover source/payload.
+        assert!(buf.get(1).is_none());
+        assert!(buf.get(7).is_none());
+        // Index beyond the allocation → None (no panic).
+        assert!(buf.get(999).is_none());
+    }
+
+    // L35: a fresh buffer (no recv yet) yields None for any index.
+    #[test]
+    fn mmsg_get_before_first_recv_is_none() {
+        let buf = MmsgRecvBuf::new(4, 64);
+        assert!(buf.get(0).is_none());
     }
 
     /// `sendmmsg` must deliver every staged datagram to the connected peer in

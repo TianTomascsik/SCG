@@ -13,7 +13,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::interfaces::endpoint::upstream_tls_mode;
-use crate::interfaces::shm::{run_shm_endpoint, ShmEndpointTask};
+use crate::interfaces::shm::{resolve_shm_layout, run_shm_endpoint, ShmEndpointTask};
 use crate::interfaces::uds::{run_uds_endpoint, UdsEndpointTask};
 use crate::management::config::{
     Direction, GatewayConfig, PerfKnobs, Proto, QosPolicy, ShmNotify, ShmRingKind, TlsMode,
@@ -21,7 +21,6 @@ use crate::management::config::{
 };
 use crate::processing::policy::PolicyManager;
 
-use scg_ipc::handshake::SHM_NOTIFY_EVENTFD;
 use scg_ipc::token::CapabilityToken;
 use scg_proto::v1::RuleInfo;
 
@@ -130,7 +129,6 @@ struct EndpointTemplate {
 
 /// A currently-live endpoint instance.
 struct LiveEndpoint {
-    kind: Proto,
     socket_path: PathBuf,
     owner_uid: u32,
     owner_key: String,
@@ -222,7 +220,6 @@ impl InterfaceManager {
     pub fn new(
         config: &GatewayConfig,
         version: impl Into<String>,
-        _global_shutdown: Arc<AtomicBool>,
         policy: Option<Arc<RwLock<PolicyManager>>>,
     ) -> Arc<Self> {
         let api = config.api.clone().unwrap_or_default();
@@ -249,6 +246,21 @@ impl InterfaceManager {
             rate: Mutex::new(RateLimiter::new()),
             policy,
         })
+    }
+
+    /// Lock the live-endpoint registry, recovering the guard if a previous
+    /// holder panicked (L29). One consistent no-`unwrap` poison policy across
+    /// every internal mutex: a poisoned registry lock does not corrupt the map
+    /// (the panic that poisoned it happened between well-formed operations), so
+    /// recovering and continuing is safe and never aborts a management RPC.
+    fn live(&self) -> std::sync::MutexGuard<'_, LiveState> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock the per-uid rate limiter, recovering a poisoned guard (see
+    /// [`live`](Self::live)).
+    fn rate(&self) -> std::sync::MutexGuard<'_, RateLimiter> {
+        self.rate.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Re-derive the UDS/SHM authorization templates (and the ListRules
@@ -412,11 +424,7 @@ impl InterfaceManager {
     ) -> Result<(), Status> {
         // Token-bucket rate limit on create requests.
         if self.max_create_per_min > 0 {
-            let admitted = self
-                .rate
-                .lock()
-                .unwrap()
-                .allow(caller.uid, self.max_create_per_min);
+            let admitted = self.rate().allow(caller.uid, self.max_create_per_min);
             if !admitted {
                 let reason = format!(
                     "endpoint-creation rate limit exceeded ({}/min)",
@@ -429,7 +437,7 @@ impl InterfaceManager {
 
         // Live-endpoint quota per uid (replacements do not increase the count).
         if self.max_endpoints_per_uid > 0 {
-            let live = self.live.lock().unwrap();
+            let live = self.live();
             let is_replace = live.by_owner.contains_key(owner_key);
             if !is_replace {
                 let owned = live
@@ -450,16 +458,23 @@ impl InterfaceManager {
         Ok(())
     }
 
-    /// Create (or atomically replace) a UDS endpoint for the caller.
-    pub fn create_uds(
+    /// Fetch the endpoint template for `(app_id, class, direction, kind)` and
+    /// run the full authorization + admission gate for `caller` (M26): template
+    /// lookup under a short read lock, the uid/pid allow-list checks with their
+    /// audit-deny lines, and the rate-limit + per-uid-quota admission. Returns
+    /// the cloned template and the caller's `owner_key` on success. Both
+    /// `create_uds` and `create_shm` route through this so the security-critical
+    /// checks cannot drift between the two entry points.
+    fn authorize_and_admit(
         &self,
+        op: &str,
         caller: CallerCred,
         app_id: &str,
         class: TrafficClass,
         direction: Direction,
-        _ring_capacity: usize,
-    ) -> Result<UdsCreated, Status> {
-        let key = template_key(app_id, class, direction, Proto::Uds);
+        kind: Proto,
+    ) -> Result<(EndpointTemplate, String), Status> {
+        let key = template_key(app_id, class, direction, kind);
         // Clone the template out under a short read lock so a concurrent
         // hot-reload (write) is never blocked by this create's I/O, and so this
         // request sees a consistent snapshot of the authorization fields (#42).
@@ -471,20 +486,20 @@ impl InterfaceManager {
             .cloned();
         let template = template.ok_or_else(|| {
             Status::not_found(format!(
-                "no uds rule for app_id={app_id} class={class} direction={direction}"
+                "no {kind} rule for app_id={app_id} class={class} direction={direction}"
             ))
         })?;
 
         // Authorise the caller against the rule's allow-lists.
         if template.allowed_uids.is_empty() || !template.allowed_uids.contains(&caller.uid) {
-            Self::audit_deny("create_uds", caller, app_id, "uid not in allowed_uids");
+            Self::audit_deny(op, caller, app_id, "uid not in allowed_uids");
             return Err(Status::permission_denied(format!(
                 "uid {} is not authorised for app_id={app_id}",
                 caller.uid
             )));
         }
         if !template.allowed_pids.is_empty() && !template.allowed_pids.contains(&caller.pid) {
-            Self::audit_deny("create_uds", caller, app_id, "pid not in allowed_pids");
+            Self::audit_deny(op, caller, app_id, "pid not in allowed_pids");
             return Err(Status::permission_denied(format!(
                 "pid {} is not authorised for app_id={app_id}",
                 caller.pid
@@ -492,8 +507,23 @@ impl InterfaceManager {
         }
 
         // Enforce per-uid rate limit and live-endpoint quota.
-        let owner_key = owner_key(caller.uid, app_id, class, direction, Proto::Uds);
-        self.check_admission("create_uds", caller, app_id, &owner_key)?;
+        let owner_key = owner_key(caller.uid, app_id, class, direction, kind);
+        self.check_admission(op, caller, app_id, &owner_key)?;
+
+        Ok((template, owner_key))
+    }
+
+    /// Create (or atomically replace) a UDS endpoint for the caller.
+    pub fn create_uds(
+        &self,
+        caller: CallerCred,
+        app_id: &str,
+        class: TrafficClass,
+        direction: Direction,
+        _ring_capacity: usize,
+    ) -> Result<UdsCreated, Status> {
+        let (template, owner_key) =
+            self.authorize_and_admit("create_uds", caller, app_id, class, direction, Proto::Uds)?;
 
         // Resolve a per-uid runtime directory for the socket.
         let dir = self
@@ -543,7 +573,6 @@ impl InterfaceManager {
             id,
             owner_key.clone(),
             LiveEndpoint {
-                kind: Proto::Uds,
                 socket_path: socket_path.clone(),
                 owner_uid: caller.uid,
                 owner_key,
@@ -586,39 +615,8 @@ impl InterfaceManager {
         // admin-configured template default is trusted and not subject to this cap.
         const MAX_SHM_RING_CAPACITY: usize = 256 * 1024 * 1024;
 
-        let key = template_key(app_id, class, direction, Proto::Shm);
-        // Clone the template out under a short read lock (see create_uds, #42).
-        let template = self
-            .templates
-            .read()
-            .map_err(|_| Status::internal("interface-manager templates lock poisoned"))?
-            .get(&key)
-            .cloned();
-        let template = template.ok_or_else(|| {
-            Status::not_found(format!(
-                "no shm rule for app_id={app_id} class={class} direction={direction}"
-            ))
-        })?;
-
-        // Authorise the caller against the rule's allow-lists.
-        if template.allowed_uids.is_empty() || !template.allowed_uids.contains(&caller.uid) {
-            Self::audit_deny("create_shm", caller, app_id, "uid not in allowed_uids");
-            return Err(Status::permission_denied(format!(
-                "uid {} is not authorised for app_id={app_id}",
-                caller.uid
-            )));
-        }
-        if !template.allowed_pids.is_empty() && !template.allowed_pids.contains(&caller.pid) {
-            Self::audit_deny("create_shm", caller, app_id, "pid not in allowed_pids");
-            return Err(Status::permission_denied(format!(
-                "pid {} is not authorised for app_id={app_id}",
-                caller.pid
-            )));
-        }
-
-        // Enforce per-uid rate limit and live-endpoint quota.
-        let owner_key = owner_key(caller.uid, app_id, class, direction, Proto::Shm);
-        self.check_admission("create_shm", caller, app_id, &owner_key)?;
+        let (template, owner_key) =
+            self.authorize_and_admit("create_shm", caller, app_id, class, direction, Proto::Shm)?;
 
         // Both rings use the same capacity: the request value if given, else the
         // template default. The endpoint thread rounds it up to a page.
@@ -638,6 +636,17 @@ impl InterfaceManager {
         } else {
             template.ring_capacity
         };
+
+        // A slot-ring's geometry comes from num_segments/segment_size, so a
+        // caller-supplied ring_capacity is not honoured — warn instead of
+        // silently discarding it (M7).
+        if ring_capacity > 0 && matches!(template.ring_kind, ShmRingKind::Slot) {
+            warn!(
+                "[{}] create_shm: ring_capacity={ring_capacity} ignored for a slot-ring template \
+                 (geometry is set by num_segments × segment_size)",
+                template.rule_name
+            );
+        }
 
         let dir = self
             .resolve_runtime_dir(caller.uid)
@@ -685,6 +694,14 @@ impl InterfaceManager {
             shutdown: shutdown.clone(),
         };
 
+        // Compute the reported geometry from the SAME resolver the endpoint
+        // thread uses to map the segment (M7), before `task` is moved into the
+        // thread — so the gRPC reply's caps and notify mode match what the
+        // client actually sees on the control page (slot rings and futex mode
+        // included), instead of the byte-stream-only `round_up_page(cap)` and a
+        // hardcoded eventfd.
+        let layout = resolve_shm_layout(&task);
+
         let join = std::thread::Builder::new()
             .name(format!("shm-ep-{id}"))
             .spawn(move || run_shm_endpoint(task))
@@ -694,7 +711,6 @@ impl InterfaceManager {
             id,
             owner_key.clone(),
             LiveEndpoint {
-                kind: Proto::Shm,
                 socket_path: control_socket_path.clone(),
                 owner_uid: caller.uid,
                 owner_key,
@@ -704,28 +720,29 @@ impl InterfaceManager {
             &label,
         )?;
 
-        // The endpoint thread rounds the capacity up to a page; report the same
-        // value to the client so its ring geometry matches the control page.
-        let cap_reported = round_up_page(cap) as u64;
         Self::audit_allow("create_shm", caller, app_id, id);
         info!(
-            "[{label}] created SHM endpoint id={id} at {} for uid={} (rings {cap_reported}B/dir)",
+            "[{label}] created SHM endpoint id={id} at {} for uid={} (rings {}B c2g / {}B g2c, notify={})",
             control_socket_path.display(),
-            caller.uid
+            caller.uid,
+            layout.cap_c2g,
+            layout.cap_g2c,
+            layout.notify
         );
         Ok(ShmCreated {
             control_socket_path: control_socket_path.to_string_lossy().into_owned(),
             token: token_bytes,
             endpoint_id: id,
-            cap_c2g: cap_reported,
-            cap_g2c: cap_reported,
-            notify: SHM_NOTIFY_EVENTFD as i32,
+            cap_c2g: layout.cap_c2g as u64,
+            cap_g2c: layout.cap_g2c as u64,
+            notify: layout.notify,
         })
     }
 
     /// Tear down a previously-created endpoint owned by the caller.
     pub fn close(&self, caller: CallerCred, endpoint_id: u32) -> Result<(), Status> {
-        let mut live = self.live.lock().unwrap();
+        let mut live = self.live();
+        // Single lookup+remove: no `.unwrap()` on a second lookup (L29).
         let owner_uid = live
             .by_id
             .get(&endpoint_id)
@@ -736,7 +753,9 @@ impl InterfaceManager {
                 "only the owning uid may close this endpoint",
             ));
         }
-        let mut ep = live.by_id.remove(&endpoint_id).unwrap();
+        let Some(mut ep) = live.by_id.remove(&endpoint_id) else {
+            return Err(Status::not_found(format!("no endpoint id={endpoint_id}")));
+        };
         live.by_owner.remove(&ep.owner_key);
         drop(live);
 
@@ -751,24 +770,37 @@ impl InterfaceManager {
         Ok(())
     }
 
-    /// Signal every live endpoint to shut down (called on gateway shutdown).
+    /// Signal every live endpoint to shut down and wait for its thread to exit
+    /// (called on gateway shutdown).
+    ///
+    /// Flags are stored on *all* endpoints first, then the threads are joined
+    /// (L10): signalling and joining one at a time would serialise the
+    /// per-endpoint poll latency. Joining (rather than the old detach) lets a
+    /// relay finish its in-flight write and send a clean TLS `close_notify`
+    /// instead of being killed mid-write by process exit; the lib.rs shutdown
+    /// watchdog force-exits if any thread hangs, bounding the wait.
     pub fn shutdown_all(&self) {
-        let mut live = self.live.lock().unwrap();
-        let ids: Vec<u32> = live.by_id.keys().copied().collect();
-        for id in ids {
-            if let Some(mut ep) = live.by_id.remove(&id) {
-                ep.shutdown.store(true, Ordering::SeqCst);
-                ep.join.take();
-                let _ = std::fs::remove_file(&ep.socket_path);
-                let _ = ep.kind; // kind retained for future per-kind teardown
-            }
+        let mut eps: Vec<LiveEndpoint> = {
+            let mut live = self.live();
+            live.by_owner.clear();
+            live.by_id.drain().map(|(_, ep)| ep).collect()
+        };
+        // Signal every endpoint before joining any, so their poll intervals
+        // overlap instead of summing.
+        for ep in &eps {
+            ep.shutdown.store(true, Ordering::SeqCst);
         }
-        live.by_owner.clear();
+        for ep in &mut eps {
+            if let Some(handle) = ep.join.take() {
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_file(&ep.socket_path);
+        }
     }
 
     /// Remove and signal an endpoint without joining (used on create/replace).
     fn detach_endpoint(&self, id: u32) {
-        let ep = { self.live.lock().unwrap().by_id.remove(&id) };
+        let ep = { self.live().by_id.remove(&id) };
         if let Some(mut ep) = ep {
             ep.shutdown.store(true, Ordering::SeqCst);
             ep.join.take();
@@ -776,10 +808,18 @@ impl InterfaceManager {
     }
 
     /// Allocate the next endpoint id, wrapping past `u32::MAX` back to 1.
+    ///
+    /// Skips ids currently present in `by_id` while holding the lock (L11): a
+    /// wrap-around that reused a still-live id would silently orphan that
+    /// endpoint (its `by_owner` entry would then point at another owner's id).
+    /// Practically unreachable under the default rate limit, but cheap to close.
     fn alloc_id(&self) -> u32 {
-        let mut live = self.live.lock().unwrap();
-        let id = live.next_id;
-        live.next_id = live.next_id.checked_add(1).unwrap_or(1).max(1);
+        let mut live = self.live();
+        let mut id = live.next_id;
+        while live.by_id.contains_key(&id) {
+            id = id.checked_add(1).unwrap_or(1).max(1);
+        }
+        live.next_id = id.checked_add(1).unwrap_or(1).max(1);
         id
     }
 
@@ -793,7 +833,7 @@ impl InterfaceManager {
         label: &str,
     ) -> Result<(), Status> {
         let replaced = {
-            let mut live = self.live.lock().unwrap();
+            let mut live = self.live();
             // Atomic quota enforcement: re-check the per-uid live-endpoint quota
             // under the SAME lock that performs the insert. The pre-check in
             // `check_admission` releases the lock before insertion, so two
@@ -847,11 +887,7 @@ impl InterfaceManager {
 
         if ensure_dir(&base, 0o755).is_ok() {
             let per_uid = base.join(uid.to_string());
-            if ensure_dir(&per_uid, 0o700).is_ok() {
-                if euid == 0 {
-                    let _ = scg_ipc::os::chown(&per_uid, uid, uid);
-                }
-                let _ = scg_ipc::os::chmod(&per_uid, 0o700);
+            if let Ok(()) = ensure_per_uid_dir(&per_uid, uid, euid == 0) {
                 return Ok(per_uid);
             }
         }
@@ -881,31 +917,64 @@ fn ensure_dir(path: &std::path::Path, mode: u32) -> io::Result<()> {
     }
 }
 
+/// Create (or accept) the per-uid runtime directory `<runtime_dir>/<uid>`
+/// without following a symlink into a privileged chown/chmod (M3, CWE-59).
+///
+/// `mkdir_mode` chmods through a pre-existing symlink on `EEXIST`, so if an
+/// operator points `runtime_dir` at a world-writable directory a local
+/// attacker could pre-plant `<runtime_dir>/<uid>` as a symlink and redirect
+/// the root gateway's chown/chmod onto an attacker-chosen target. Here we
+/// `create_dir` (which fails `AlreadyExists` instead of chmod-ing through a
+/// symlink) and then `lstat`-verify the entry is a real directory owned by
+/// root or the target uid *before* any chown/chmod. A narrow swap-after-lstat
+/// TOCTOU remains (the fully robust form uses `openat(O_NOFOLLOW)` +
+/// `fchownat`); rejecting the planted symlink closes the practical primitive.
+fn ensure_per_uid_dir(per_uid: &std::path::Path, uid: u32, privileged: bool) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::create_dir(per_uid) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // lstat (does not follow symlinks): reject anything that is not a real dir.
+    let meta = std::fs::symlink_metadata(per_uid)?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "runtime dir '{}' exists but is not a directory (symlink?); refusing",
+                per_uid.display()
+            ),
+        ));
+    }
+    // A pre-existing dir must be owned by root or the target uid — an
+    // unexpected owner means we did not create it and must not chown it.
+    let owner = meta.uid();
+    if owner != 0 && owner != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime dir '{}' is owned by uid {} (expected root or {}); refusing",
+                per_uid.display(),
+                owner,
+                uid
+            ),
+        ));
+    }
+    if privileged {
+        let _ = scg_ipc::os::chown(per_uid, uid, uid);
+    }
+    let _ = scg_ipc::os::chmod(per_uid, 0o700);
+    Ok(())
+}
+
 /// Map the config traffic class to its proto integer value.
 fn traffic_class_to_proto(class: TrafficClass) -> i32 {
     match class {
         TrafficClass::Normal => 0,
         TrafficClass::Safety => 1,
     }
-}
-
-/// Round a byte count up to the next system page boundary (matches the rounding
-/// the SHM endpoint thread applies to its ring capacities).
-fn round_up_page(n: usize) -> usize {
-    let page = {
-        // SAFETY: `sysconf` is passed the well-known constant `_SC_PAGESIZE`; it
-        // takes only this integer name (no pointers/buffers), touches no caller
-        // memory, and its `c_long` return value is validated below (`v <= 0`
-        // falls back to 4096) before any use.
-        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if v <= 0 {
-            4096usize
-        } else {
-            v as usize
-        }
-    };
-    let n = n.max(page);
-    (n + page - 1) & !(page - 1)
 }
 
 /// Template lookup key: `app_id`, class, direction and kind.
@@ -934,6 +1003,8 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scg_ipc::handshake::SHM_NOTIFY_EVENTFD;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
     use tonic::Code;
 
@@ -994,6 +1065,44 @@ mod tests {
         dir
     }
 
+    // M3 (CWE-59): a pre-planted per-uid symlink must be rejected, and its
+    // target must be left untouched — never chmod/chown-ed through the link.
+    #[test]
+    fn ensure_per_uid_dir_rejects_planted_symlink() {
+        let base = unique_tmp();
+        let uid = unsafe { libc::getuid() };
+        // The attacker-controlled target the symlink points at.
+        let target = base.join("victim");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let per_uid = base.join(uid.to_string());
+        std::os::unix::fs::symlink(&target, &per_uid).unwrap();
+
+        let err = ensure_per_uid_dir(&per_uid, uid, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not a directory"),
+            "planted symlink must be rejected: {err}"
+        );
+        // The target's mode must be unchanged (not chmod-ed to 0700 through
+        // the link).
+        let mode = std::fs::symlink_metadata(&target).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o755, "symlink target must be left untouched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A fresh per-uid dir is created 0700 and accepted.
+    #[test]
+    fn ensure_per_uid_dir_creates_fresh_dir_0700() {
+        let base = unique_tmp();
+        let uid = unsafe { libc::getuid() };
+        let per_uid = base.join(uid.to_string());
+        ensure_per_uid_dir(&per_uid, uid, false).expect("fresh dir accepted");
+        let meta = std::fs::symlink_metadata(&per_uid).unwrap();
+        assert!(meta.file_type().is_dir());
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn manager_with_uds_rule(allowed_uid: u32, runtime_dir: &Path) -> Arc<InterfaceManager> {
         let json = format!(
             r#"{{
@@ -1024,7 +1133,7 @@ mod tests {
             runtime_dir.display()
         );
         let config: GatewayConfig = serde_json::from_str(&json).expect("parse test config");
-        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)), None)
+        InterfaceManager::new(&config, "test", None)
     }
 
     #[test]
@@ -1230,7 +1339,7 @@ mod tests {
             runtime_dir.display()
         );
         let config: GatewayConfig = serde_json::from_str(&json).expect("parse test config");
-        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)), None)
+        InterfaceManager::new(&config, "test", None)
     }
 
     #[test]
@@ -1388,7 +1497,7 @@ mod tests {
             rd = runtime_dir.display()
         );
         let config: GatewayConfig = serde_json::from_str(&json).expect("parse test config");
-        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)), None)
+        InterfaceManager::new(&config, "test", None)
     }
 
     #[test]

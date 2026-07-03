@@ -281,7 +281,9 @@ pub fn relay_tls_to_udp(
                     Err(_) => return Ok(()),
                 };
                 for i in 0..count {
-                    let (_src, payload) = udp_rx.get(i);
+                    let Some((_src, payload)) = udp_rx.get(i) else {
+                        continue;
+                    };
                     framing.frame_into(payload, &mut batch_buf);
                     conn_metrics.record_read(payload.len());
                     conn_metrics.record_relay(payload.len());

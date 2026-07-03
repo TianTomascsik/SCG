@@ -10,16 +10,16 @@ use std::time::Instant;
 
 // ─── Per-connection metrics ──────────────────────────────────────────────────
 
-/// Metrics collected for a single proxied connection/session.
-///
-/// When constructed with a `RuleMetrics` reference, bytes/messages are
-/// published to the rule-level atomics in real time so that periodic
-/// `print_summary()` reflects live traffic from active connections.
 /// Batch size for flushing per-connection metrics to rule-level atomics.
 /// Accumulating locally and flushing periodically reduces cache-line bounces
 /// on the shared AtomicU64 counters.
 const METRICS_FLUSH_INTERVAL: u64 = 1024;
 
+/// Metrics collected for a single proxied connection/session.
+///
+/// When constructed with a `RuleMetrics` reference, bytes/messages are
+/// published to the rule-level atomics in real time so that periodic
+/// `print_summary()` reflects live traffic from active connections.
 pub struct ConnectionMetrics {
     pub direction: String, // "encrypt" or "decrypt"
     pub tls_mode: String,  // "tls" or "ktls"

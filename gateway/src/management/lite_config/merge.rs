@@ -1,8 +1,10 @@
 //! Layered-config assembly: deep-merge of `defaults` + `user`, then the
-//! per-connection template fill. This is the Rust mirror of `deep_merge` and
-//! `apply_templates` in `tools/validate_config.py`; the two implementations
-//! must stay behaviourally identical so the offline validator and the gateway
-//! agree on the materialised configuration.
+//! per-connection template fill. This module is the sole authoritative
+//! implementation of the merge/template semantics — no offline validator
+//! mirrors it today. (An earlier doc referenced a `tools/validate_config.py`
+//! that does not exist in the repository; if an external validator is ever
+//! added, pin parity with cross-language golden-file fixtures rather than a
+//! prose invariant.)
 
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -43,8 +45,18 @@ fn default_egress_source() -> Value {
 ///
 /// A user file only carries what is unique to a flow; the platform template
 /// fills the mechanical fields *before* the document is mapped to data-plane
-/// rules. Mirrors `apply_templates` in the Python validator.
-pub fn apply_templates(merged: &mut Value) {
+/// rules.
+///
+/// Returns warnings for **user-set values in fields the data plane does not
+/// consume yet** (M17): `egress.source`, `routing.out_interface`,
+/// `runtime_update`, and a `connection_group_id` differing from the
+/// connection id are template-filled here but read by nothing downstream, so
+/// an explicit operator value would otherwise be silently ignored — the
+/// module contract promises a warning instead. Detection must happen here
+/// (not in mapping) because after the fill an injected default and a user
+/// value are indistinguishable.
+pub fn apply_templates(merged: &mut Value) -> Vec<String> {
+    let mut warnings = Vec::new();
     // Snapshot the template values from `defaults` up front (immutable borrow
     // ends before we take the mutable borrow of `connections`).
     let tmpl_enabled;
@@ -99,22 +111,36 @@ pub fn apply_templates(merged: &mut Value) {
     }
 
     let Some(connections) = merged.get_mut("connections").and_then(|c| c.as_array_mut()) else {
-        return;
+        return warnings;
     };
 
     for conn in connections.iter_mut() {
         let Some(obj) = conn.as_object_mut() else {
             continue;
         };
+        let cid = obj
+            .get("connection_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
 
         obj.entry("enabled").or_insert_with(|| tmpl_enabled.clone());
         obj.entry("transparent")
             .or_insert_with(|| tmpl_transparent.clone());
 
-        if !obj.contains_key("connection_group_id") {
-            if let Some(cid) = obj.get("connection_id").cloned() {
-                obj.insert("connection_group_id".to_string(), cid);
+        match obj.get("connection_group_id") {
+            None => {
+                if let Some(cid_v) = obj.get("connection_id").cloned() {
+                    obj.insert("connection_group_id".to_string(), cid_v);
+                }
             }
+            Some(group) if Some(group) != obj.get("connection_id") => {
+                warnings.push(format!(
+                    "connection '{cid}': connection_group_id is not yet honoured by the \
+                     data plane (no consumer of connection grouping)"
+                ));
+            }
+            Some(_) => {}
         }
 
         if !obj.contains_key("traffic_class") {
@@ -125,8 +151,17 @@ pub fn apply_templates(merged: &mut Value) {
             }
         }
 
-        if !obj.contains_key("runtime_update") {
-            obj.insert("runtime_update".to_string(), tmpl_runtime_update.clone());
+        match obj.get("runtime_update") {
+            None => {
+                obj.insert("runtime_update".to_string(), tmpl_runtime_update.clone());
+            }
+            Some(user_ru) if *user_ru != tmpl_runtime_update => {
+                warnings.push(format!(
+                    "connection '{cid}': runtime_update is not yet honoured by the data \
+                     plane (hot-reload policy is field-aware and global, not per-connection)"
+                ));
+            }
+            Some(_) => {}
         }
 
         if let Some(prot) = obj.get_mut("protection").and_then(|p| p.as_object_mut()) {
@@ -145,7 +180,29 @@ pub fn apply_templates(merged: &mut Value) {
                     p.entry("priority").or_insert_with(|| Value::from(0));
                 }
                 if let Some(egress) = p.get_mut("egress").and_then(|e| e.as_object_mut()) {
-                    egress.entry("source").or_insert_with(|| tmpl_src.clone());
+                    match egress.get("source") {
+                        None => {
+                            egress.insert("source".to_string(), tmpl_src.clone());
+                        }
+                        Some(src) if *src != tmpl_src => {
+                            warnings.push(format!(
+                                "connection '{cid}': egress.source is not yet honoured by \
+                                 the data plane (no bind-source support; the OS chooses \
+                                 the source address)"
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                }
+                match p.get("routing").and_then(|r| r.get("out_interface")) {
+                    Some(iface) if *iface != tmpl_out_iface => {
+                        warnings.push(format!(
+                            "connection '{cid}': routing.out_interface is not yet honoured \
+                             by the data plane (no interface pinning; the routing table \
+                             decides)"
+                        ));
+                    }
+                    _ => {}
                 }
                 if !p.contains_key("routing") {
                     let mut routing = Map::new();
@@ -155,6 +212,7 @@ pub fn apply_templates(merged: &mut Value) {
             }
         }
     }
+    warnings
 }
 
 #[cfg(test)]
@@ -207,7 +265,10 @@ mod tests {
                 }
             ]
         });
-        apply_templates(&mut doc);
+        let warnings = apply_templates(&mut doc);
+        // Template-injected defaults are silent — only USER-set values in
+        // unconsumed fields warn (M17).
+        assert!(warnings.is_empty(), "got: {warnings:?}");
         let conn = &doc["connections"][0];
         assert_eq!(conn["enabled"], true);
         assert_eq!(conn["transparent"], false);
@@ -222,5 +283,84 @@ mod tests {
         assert_eq!(path["priority"], 0);
         assert_eq!(path["egress"]["source"]["ip"], "auto");
         assert_eq!(path["routing"]["out_interface"], "eth0");
+    }
+
+    // M17: user-set values in fields nothing downstream consumes must warn —
+    // the module contract promises "surfaced, never silently dropped".
+    #[test]
+    fn user_set_unconsumed_fields_warn() {
+        let mut doc = serde_json::json!({
+            "defaults": {
+                "connection": {
+                    "default_egress_source": { "ip": "auto", "port": "auto" },
+                    "default_out_interface": "eth0"
+                },
+                "protection": { "default_mode": "full" }
+            },
+            "connections": [
+                {
+                    "connection_id": "c1",
+                    "app_id": "app-a",
+                    "connection_group_id": "custom-group",
+                    "runtime_update": { "mode": "immediate" },
+                    "protection": { "profile_ref": "p", "role": "client" },
+                    "paths": [
+                        { "path_id": "only",
+                          "egress": {
+                              "endpoint": { "host": "h", "port": 1 },
+                              "source": { "ip": "10.0.0.5", "port": "auto" }
+                          },
+                          "routing": { "out_interface": "eth1" } }
+                    ]
+                }
+            ]
+        });
+        let warnings = apply_templates(&mut doc);
+        for field in [
+            "connection_group_id",
+            "runtime_update",
+            "egress.source",
+            "routing.out_interface",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(field) && w.contains("c1")),
+                "expected a warning naming '{field}', got: {warnings:?}"
+            );
+        }
+    }
+
+    // Explicitly writing the template-default value is not a lie to the
+    // operator — no warning.
+    #[test]
+    fn user_set_default_values_stay_silent() {
+        let mut doc = serde_json::json!({
+            "defaults": {
+                "connection": {
+                    "default_egress_source": { "ip": "auto", "port": "auto" },
+                    "default_out_interface": "eth0"
+                },
+                "protection": { "default_mode": "full" }
+            },
+            "connections": [
+                {
+                    "connection_id": "c1",
+                    "app_id": "app-a",
+                    "connection_group_id": "c1",
+                    "protection": { "profile_ref": "p", "role": "client" },
+                    "paths": [
+                        { "path_id": "only",
+                          "egress": {
+                              "endpoint": { "host": "h", "port": 1 },
+                              "source": { "ip": "auto", "port": "auto" }
+                          },
+                          "routing": { "out_interface": "eth0" } }
+                    ]
+                }
+            ]
+        });
+        let warnings = apply_templates(&mut doc);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
     }
 }

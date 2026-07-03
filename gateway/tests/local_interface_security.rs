@@ -16,7 +16,6 @@ mod common;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,8 +34,7 @@ fn fresh_uds_endpoint(tag: &str) -> (Arc<InterfaceManager>, std::path::PathBuf, 
     let tmp = temp_dir(tag);
     // The upstream is unreachable on purpose; auth must fail before relaying.
     let config = build_config("127.0.0.1:1", uid, &tmp);
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let manager = InterfaceManager::new(&config, "itest-sec", shutdown, None);
+    let manager = InterfaceManager::new(&config, "itest-sec", None);
     let caller = CallerCred {
         uid,
         gid: uid,

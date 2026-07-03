@@ -351,20 +351,23 @@ impl SlotConsumer {
         Some((tid, buf))
     }
 
-    /// Try to dequeue one frame into a caller-owned buffer, returning the
-    /// frame's `traffic_id`. Allocation-free across calls when `dst` is reused.
+    /// Locate the next READY slot, copy out and decode its frame header, and
+    /// clamp the untrusted length — without consuming the slot.
     ///
-    /// The producer-written `len` is treated as untrusted and clamped to the
-    /// slot's payload capacity so a hostile producer can never make the
-    /// consumer read out of the slot.
-    pub fn try_pop_into(&self, dst: &mut Vec<u8>) -> Option<u32> {
+    /// Shared prologue of [`try_pop_into`](Self::try_pop_into),
+    /// [`try_pop_into_slice`](Self::try_pop_into_slice) and
+    /// [`peek_frame`](Self::peek_frame), so the READY check, the header decode
+    /// and the hostile-producer length clamp exist exactly once. Returns
+    /// `(read_pos, slot_idx, slot_ptr, payload_len, traffic_id)`; the slot
+    /// stays owned by this consumer until [`release_slot`](Self::release_slot).
+    #[inline]
+    fn next_ready(&self) -> Option<(u64, usize, *const u8, usize, u32)> {
         let hdr = self.header();
         let pos = hdr.read_pos.load(Ordering::Relaxed);
         let idx = (pos & self.mask) as usize;
         let seq = self.seq_at(idx).load(Ordering::Acquire);
         // diff == 0 → slot READY; diff < 0 → producer hasn't published it.
-        let diff = seq.wrapping_sub(pos.wrapping_add(1)) as i64;
-        if diff != 0 {
+        if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
             return None;
         }
 
@@ -372,15 +375,43 @@ impl SlotConsumer {
         // readable bytes, so this offset stays within the segment array.
         let seg = unsafe { self.data.add(idx * self.segment_size) };
         let mut header = [0u8; FRAME_HEADER_LEN];
-        // SAFETY: the slot is READY (`diff == 0`) and owned by this consumer until
-        // released below, so its first `FRAME_HEADER_LEN` bytes are stable; `header`
-        // is a distinct local array of exactly that length, so the regions cannot overlap.
+        // SAFETY (bounds): the slot spans `segment_size >= FRAME_HEADER_LEN` bytes
+        // and `header` is a distinct local array of exactly that length, so the
+        // copy stays in bounds and the regions cannot overlap. Concurrency: per
+        // the seq protocol the READY slot is owned by this consumer, so an
+        // *honest* producer does not touch it; the region remains peer-writable,
+        // however, so a protocol-violating peer can mutate it concurrently and
+        // this read may tear (TRA #71, accepted: the bytes are peer-controlled
+        // data, and every bound below derives from this already-copied local
+        // header, never re-read from shared memory).
         unsafe {
             std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
         }
         let (len, traffic_id) = decode_header(&header);
         // Clamp a hostile/garbled length to the slot's payload capacity.
         let len = (len as usize).min(self.max_payload());
+        Some((pos, idx, seg, len, traffic_id))
+    }
+
+    /// Release the READY slot located by [`next_ready`](Self::next_ready) for
+    /// producer reuse `capacity` laps ahead and advance the read position.
+    #[inline]
+    fn release_slot(&self, pos: u64, idx: usize) {
+        self.seq_at(idx)
+            .store(pos.wrapping_add(self.capacity as u64), Ordering::Release);
+        self.header()
+            .read_pos
+            .store(pos.wrapping_add(1), Ordering::Relaxed);
+    }
+
+    /// Try to dequeue one frame into a caller-owned buffer, returning the
+    /// frame's `traffic_id`. Allocation-free across calls when `dst` is reused.
+    ///
+    /// The producer-written `len` is treated as untrusted and clamped to the
+    /// slot's payload capacity so a hostile producer can never make the
+    /// consumer read out of the slot.
+    pub fn try_pop_into(&self, dst: &mut Vec<u8>) -> Option<u32> {
+        let (pos, idx, seg, len, traffic_id) = self.next_ready()?;
 
         dst.clear();
         dst.reserve(len);
@@ -393,10 +424,7 @@ impl SlotConsumer {
             dst.set_len(len);
         }
 
-        // Release the slot for reuse `capacity` laps ahead, then advance.
-        self.seq_at(idx)
-            .store(pos.wrapping_add(self.capacity as u64), Ordering::Release);
-        hdr.read_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
+        self.release_slot(pos, idx);
         Some(traffic_id)
     }
 
@@ -411,29 +439,10 @@ impl SlotConsumer {
     /// the caller can hold; the returned length is the number of bytes actually
     /// written. The same untrusted-producer clamp as `try_pop_into` applies.
     pub fn try_pop_into_slice(&self, out: &mut [u8]) -> Option<(u32, usize)> {
-        let hdr = self.header();
-        let pos = hdr.read_pos.load(Ordering::Relaxed);
-        let idx = (pos & self.mask) as usize;
-        let seq = self.seq_at(idx).load(Ordering::Acquire);
-        // diff == 0 → slot READY; diff < 0 → producer hasn't published it.
-        if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
-            return None;
-        }
+        let (pos, idx, seg, len, traffic_id) = self.next_ready()?;
 
-        // SAFETY: `idx < capacity` (masked) and `data` maps `capacity * segment_size`
-        // readable bytes, so this offset stays within the segment array.
-        let seg = unsafe { self.data.add(idx * self.segment_size) };
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        // SAFETY: the slot is READY and owned by this consumer until released below,
-        // so its first `FRAME_HEADER_LEN` bytes are stable; `header` is a distinct
-        // local array of exactly that length, so the regions cannot overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
-        }
-        let (len, traffic_id) = decode_header(&header);
-        // Clamp a hostile/garbled length to the slot's payload capacity, then to
-        // what the caller's buffer can hold.
-        let len = (len as usize).min(self.max_payload());
+        // The clamped frame length is further clamped to what the caller's
+        // buffer can hold.
         let n = len.min(out.len());
         // SAFETY: `n <= max_payload()` so `FRAME_HEADER_LEN + n <= segment_size`, keeping
         // the read inside this owned slot; `n <= out.len()` so the write stays within the
@@ -442,10 +451,7 @@ impl SlotConsumer {
             std::ptr::copy_nonoverlapping(seg.add(FRAME_HEADER_LEN), out.as_mut_ptr(), n);
         }
 
-        // Release the slot for reuse `capacity` laps ahead, then advance.
-        self.seq_at(idx)
-            .store(pos.wrapping_add(self.capacity as u64), Ordering::Release);
-        hdr.read_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
+        self.release_slot(pos, idx);
         Some((traffic_id, n))
     }
 
@@ -454,46 +460,56 @@ impl SlotConsumer {
     ///
     /// Returns `None` when the ring is empty. The returned slice borrows the
     /// shared data segment and is valid until the matching [`advance`](Self::advance)
-    /// call (the slot stays owned by this consumer until then, so the producer
-    /// cannot overwrite it). A hostile/garbled `len` is clamped to the slot's
-    /// payload capacity, mirroring [`try_pop_into`](Self::try_pop_into).
+    /// call (the slot stays owned by this consumer until then, so an *honest*
+    /// producer cannot overwrite it — see the residual-risk note below). A
+    /// hostile/garbled `len` is clamped to the slot's payload capacity,
+    /// mirroring [`try_pop_into`](Self::try_pop_into).
+    ///
+    /// # Untrusted-peer caveat (TRA #71)
+    ///
+    /// For a direction whose data region is writable by the peer (the
+    /// gateway's c2g side — only g2c is sealed), a protocol-violating peer can
+    /// rewrite the slot while the borrow is live, so the bytes may tear. This
+    /// is consciously accepted: the contents are peer-controlled data either
+    /// way, and every length/bound is derived from a header copied out before
+    /// use, never re-read from shared memory. Callers must treat the bytes as
+    /// untrusted and must not rely on them being stable across the borrow.
     pub fn peek_frame(&self) -> Option<&[u8]> {
-        let hdr = self.header();
-        let pos = hdr.read_pos.load(Ordering::Relaxed);
-        let idx = (pos & self.mask) as usize;
-        let seq = self.seq_at(idx).load(Ordering::Acquire);
-        // diff == 0 → slot READY; diff < 0 → producer hasn't published it.
-        if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
-            return None;
-        }
-        // SAFETY: `idx < capacity` (masked) and `data` maps `capacity * segment_size`
-        // readable bytes, so this offset stays within the segment array.
-        let seg = unsafe { self.data.add(idx * self.segment_size) };
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        // SAFETY: the slot is READY and owned by this consumer (not yet advanced), so
-        // its first `FRAME_HEADER_LEN` bytes are stable; `header` is a distinct local
-        // array of exactly that length, so the regions cannot overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(seg, header.as_mut_ptr(), FRAME_HEADER_LEN);
-        }
-        let (len, _traffic_id) = decode_header(&header);
-        let len = (len as usize).min(self.max_payload());
+        let (_pos, _idx, seg, len, _traffic_id) = self.next_ready()?;
         let total = FRAME_HEADER_LEN + len;
-        // SAFETY: `total <= segment_size`; the slot is owned by this consumer
-        // (READY, not yet advanced) so the bytes are stable for the borrow.
+        // SAFETY (bounds): `len <= max_payload()` so `total <= segment_size`,
+        // keeping the slice inside this slot, and the slot outlives `&self`.
+        // Concurrency: the seq protocol keeps an honest producer off the slot
+        // until `advance()`; a protocol-violating peer with a writable mapping
+        // can still mutate the bytes behind this `&[u8]` — an accepted residual
+        // documented on the method (TRA #71), safe-Rust-observable only as
+        // torn peer-controlled payload bytes because no length or offset is
+        // ever derived from the borrowed region itself.
         Some(unsafe { std::slice::from_raw_parts(seg, total) })
     }
 
-    /// Release the slot observed by the most recent [`peek_frame`] and advance
-    /// the read position. Call exactly once per consumed `peek_frame`.
+    /// Release the slot observed by the most recent
+    /// [`peek_frame`](Self::peek_frame) and advance the read position. Call
+    /// exactly once per consumed `peek_frame`.
+    ///
+    /// Calling without a preceding successful `peek_frame` (e.g. on an empty
+    /// ring) is a caller bug: it is a `debug_assert!` failure in debug builds
+    /// and a no-op in release builds. Silently releasing a non-READY slot
+    /// would store a future lap into a seq word the producer still owns,
+    /// wedging the ring permanently (`try_push` full forever).
     pub fn advance(&self) {
         let hdr = self.header();
         let pos = hdr.read_pos.load(Ordering::Relaxed);
         let idx = (pos & self.mask) as usize;
-        // Release the slot for reuse `capacity` laps ahead, then advance.
-        self.seq_at(idx)
-            .store(pos.wrapping_add(self.capacity as u64), Ordering::Release);
-        hdr.read_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
+        let seq = self.seq_at(idx).load(Ordering::Acquire);
+        if seq.wrapping_sub(pos.wrapping_add(1)) as i64 != 0 {
+            debug_assert!(
+                false,
+                "SlotConsumer::advance() without a READY slot (no matching peek_frame)"
+            );
+            return;
+        }
+        self.release_slot(pos, idx);
     }
 
     /// Payload capacity of one slot.
@@ -852,6 +868,45 @@ mod tests {
             consumer.advance();
             assert!(consumer.peek_frame().is_none());
         }
+    }
+
+    #[test]
+    fn advance_without_ready_slot_is_rejected_and_ring_survives() {
+        let (_c, _d, producer, consumer) = make(4, segment_size_for(64));
+        // Empty ring: advance() must not release anything. Debug builds trip
+        // the misuse debug_assert; release builds no-op. Either way the ring
+        // must remain functional (a silent release would wedge it: the
+        // producer would see Full forever).
+        let misuse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consumer.advance()));
+        if cfg!(debug_assertions) {
+            assert!(misuse.is_err(), "debug build must assert on misuse");
+        } else {
+            assert!(misuse.is_ok(), "release build must no-op on misuse");
+        }
+        assert_eq!(
+            producer.try_push(7, b"abc").unwrap(),
+            PushOutcome::Pushed { was_empty: true }
+        );
+        assert_eq!(consumer.try_pop().unwrap(), (7, b"abc".to_vec()));
+        assert!(consumer.try_pop().is_none());
+    }
+
+    #[test]
+    fn advance_after_peek_consumes_exactly_one() {
+        let (_c, _d, producer, consumer) = make(8, segment_size_for(64));
+        assert_eq!(
+            producer.try_push(1, b"first").unwrap(),
+            PushOutcome::Pushed { was_empty: true }
+        );
+        assert_eq!(
+            producer.try_push(2, b"second").unwrap(),
+            PushOutcome::Pushed { was_empty: false }
+        );
+        assert!(consumer.peek_frame().is_some());
+        consumer.advance();
+        // Exactly one frame consumed: the second is still there.
+        assert_eq!(consumer.try_pop().unwrap(), (2, b"second".to_vec()));
+        assert!(consumer.try_pop().is_none());
     }
 
     #[test]

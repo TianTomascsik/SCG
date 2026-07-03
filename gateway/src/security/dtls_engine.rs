@@ -6,8 +6,8 @@
 
 use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 use crate::networking::socket_manager::{
-    apply_safety_priority, bind_udp_socket, peek_from_with_dscp, recvmsg_from_with_dscp,
-    set_nonblocking_fd, tune_socket_buffers, write_all_nb,
+    apply_safety_priority, bind_udp_socket, peek_from_with_dscp, poll_two_fds,
+    recvmsg_from_with_dscp, set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
 use crate::processing::RuleContext;
 use crate::security::relay::apply_geo_delay;
@@ -352,21 +352,40 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
     // `&one`, a live `libc::c_int` that outlives the calls, and the length
     // passed is exactly `size_of::<c_int>()`, matching the pointee — so the
     // kernel reads a correctly-sized, fully-initialised option value.
-    unsafe {
-        libc::setsockopt(
+    // (L19): both results are checked — the decrypt accept loop re-binds the
+    // listen address every iteration alongside per-peer connected sockets, so
+    // a silently-failed REUSEADDR/REUSEPORT would surface later as a confusing
+    // AddrInUse that kills the whole rule after one session.
+    let opt_ret = unsafe {
+        let r1 = libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEADDR,
             &one as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
-        libc::setsockopt(
+        let r2 = libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEPORT,
             &one as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+        if r1 == 0 {
+            r2
+        } else {
+            r1
+        }
+    };
+    if opt_ret != 0 {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fd` is the valid descriptor from `libc::socket` above and is
+        // not used after this call; closing it exactly once on the error path
+        // avoids leaking the descriptor.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
     }
 
     let bind_result = match parsed {
@@ -437,6 +456,31 @@ fn create_reuseport_udp(addr: &str) -> io::Result<UdpSocket> {
     // transferred anywhere else. `from_raw_fd` takes sole ownership, so the
     // resulting `UdpSocket` is the unique owner responsible for closing `fd`.
     Ok(unsafe { UdpSocket::from_raw_fd(fd) })
+}
+
+/// Poll `revents` mask meaning "there is something to service on this fd":
+/// data, hangup, **or an error condition** (H6). `poll()` reports `POLLERR`
+/// and `POLLNVAL` regardless of the requested `events`; on a connected UDP
+/// socket a pending ICMP error (e.g. port-unreachable from a restarted
+/// upstream) sets `POLLERR`, and the error is only cleared by a subsequent
+/// recv/send. Masking on `POLLIN|POLLHUP` alone would leave `poll()` returning
+/// immediately every iteration → a 100%-CPU busy-spin that also pins the
+/// socket and its bounded session slot. Including the error bits lets the
+/// following read surface the pending error and hit the teardown path.
+#[inline]
+fn revents_ready(revents: libc::c_short) -> bool {
+    revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+/// Classify a non-blocking DTLS `ssl_write` error: a transient
+/// `WANT_READ`/`WANT_WRITE` (send-buffer backpressure or a renegotiation read)
+/// means "drop this one datagram, keep the session" (M23); anything else is a
+/// fatal session error. For UDP a blocked record cannot be resumed mid-write,
+/// so dropping the datagram is the correct recovery — tearing the whole DTLS
+/// session down on momentary backpressure would force a full re-handshake.
+#[inline]
+fn dtls_write_is_fatal(err: &openssl::ssl::Error) -> bool {
+    !matches!(err.code(), ErrorCode::WANT_READ | ErrorCode::WANT_WRITE)
 }
 
 // =============================================================================
@@ -513,15 +557,30 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
     ctx.apply_egress_qos(plain_socket.as_raw_fd(), plain_is_v6, None);
     ctx.enable_inbound_dscp_sampling(plain_socket.as_raw_fd(), plain_is_v6);
 
-    // Resolve upstream for DTLS
-    let dtls_target = if ctx.upstream_addr == "auto" {
-        debug!(
-            "[{}] DTLS auto mode -- will use per-packet original dst",
+    // Resolve the upstream ONCE for the whole relay (M4/#73, H5/M21).
+    // `auto` is rejected at config validation because DTLS has no
+    // original-destination recovery (TRA #74); this defensive guard stops a
+    // stray "auto" that somehow reached runtime from being dialled literally.
+    // A DNS-name upstream is resolved here (never per datagram) so both the
+    // policy gate and session setup use the concrete address; an unresolvable
+    // name fails closed (the rule cannot forward).
+    if ctx.upstream_addr == "auto" {
+        error!(
+            "[{}] DTLS does not support upstream_addr=\"auto\" (rejected at validation); \
+             not relaying",
             ctx.rule_name
         );
-        None
-    } else {
-        Some(ctx.upstream_addr.clone())
+        return;
+    }
+    let target_addr = match ctx.resolve_upstream_target(&ctx.upstream_addr) {
+        Some(a) => a,
+        None => {
+            error!(
+                "[{}] cannot resolve DTLS upstream '{}'; not relaying",
+                ctx.rule_name, ctx.upstream_addr
+            );
+            return;
+        }
     };
 
     // Resolve typed security parameters and build the DTLS connector.
@@ -558,6 +617,12 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
     let mut rev_buf = vec![0u8; UDP_BUF_SIZE];
     let plain_fd = plain_socket.as_raw_fd();
 
+    // Reused across iterations so a steady-state wakeup does not allocate two
+    // fresh Vecs proportional to the session count every loop (L26). `clear()`
+    // keeps the capacity.
+    let mut pollfds: Vec<libc::pollfd> = Vec::new();
+    let mut session_snapshot: Vec<(SocketAddr, RawFd)> = Vec::new();
+
     while !ctx.shutdown.load(Ordering::Relaxed) {
         // Reclaim idle sessions at most ~once per second so a flood of
         // short-lived peers cannot pin resources between admissions.
@@ -568,15 +633,18 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         }
 
         // Build dynamic pollfd array: [plain_socket, ...dtls_upstream_fds]
-        let mut pollfds = vec![libc::pollfd {
+        pollfds.clear();
+        pollfds.push(libc::pollfd {
             fd: plain_fd,
             events: libc::POLLIN,
             revents: 0,
-        }];
-        let session_snapshot: Vec<(SocketAddr, RawFd)> = sessions
-            .iter()
-            .map(|(peer, (ssl, _))| (*peer, ssl.get_ref().sock.as_raw_fd()))
-            .collect();
+        });
+        session_snapshot.clear();
+        session_snapshot.extend(
+            sessions
+                .iter()
+                .map(|(peer, (ssl, _))| (*peer, ssl.get_ref().sock.as_raw_fd())),
+        );
         for &(_, fd) in &session_snapshot {
             pollfds.push(libc::pollfd {
                 fd,
@@ -624,14 +692,10 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                             continue;
                         }
 
-                        // Policy check per datagram (fail closed on an unparseable
-                        // upstream target — DP-07).
-                        let target = match &dtls_target {
-                            Some(addr) => addr.clone(),
-                            None => ctx.upstream_addr.clone(),
-                        };
-                        if !ctx.classify_and_check_policy_target(&peer_addr, &target) {
-                            continue; // Drop datagram — policy denied or unresolvable
+                        // Policy check per datagram against the pre-resolved
+                        // upstream address (DP-07, fail closed).
+                        if !ctx.classify_and_check_policy(&peer_addr, &target_addr) {
+                            continue; // Drop datagram — policy denied
                         }
 
                         conn_metrics.record_read(n);
@@ -640,16 +704,6 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             sessions.entry(peer_addr)
                         {
-                            let target_addr: SocketAddr = match target.parse() {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    error!(
-                                        "[{}] Invalid upstream '{}': {}",
-                                        ctx.rule_name, target, e
-                                    );
-                                    continue;
-                                }
-                            };
                             // Bind the upstream UDP socket in the target's address
                             // family so IPv6 upstreams are first-class.
                             let bind_addr = if target_addr.is_ipv6() {
@@ -679,13 +733,18 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                                 target_addr.is_ipv6(),
                                 inbound_dscp,
                             );
-                            // Blocking during DTLS handshake
+                            // Bound the blocking handshake read at
+                            // DTLS_HANDSHAKE_TIMEOUT (M22): a black-hole
+                            // upstream then stalls this relay for at most that
+                            // window instead of the former 30 s, mirroring the
+                            // decrypt side (#37). Reverse traffic for
+                            // established peers is still served after the bound.
                             upstream_sock
-                                .set_read_timeout(Some(Duration::from_secs(30)))
+                                .set_read_timeout(Some(DTLS_HANDSHAKE_TIMEOUT))
                                 .ok();
 
                             let dtls_stream = DtlsUdpStream::new(upstream_sock);
-                            let sni = tls_params.sni_name(&target);
+                            let sni = tls_params.sni_name(&ctx.upstream_addr);
                             match connector.connect(&sni, dtls_stream) {
                                 Ok(ssl_stream) => {
                                     info!(
@@ -714,6 +773,16 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                                     dtls.1 = Instant::now();
                                     conn_metrics.record_relay(n);
                                 }
+                                // Transient backpressure (M23): drop this one
+                                // datagram, keep the session — a full teardown +
+                                // re-handshake on a momentarily-full send buffer
+                                // would be far worse for UDP.
+                                Err(ref e) if !dtls_write_is_fatal(e) => {
+                                    debug!(
+                                        "[{}] DTLS write backpressure for {}; dropping datagram",
+                                        ctx.rule_name, peer_addr
+                                    );
+                                }
                                 Err(e) => {
                                     error!(
                                         "[{}] DTLS write error for {}: {}",
@@ -737,7 +806,9 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
         // -- Reverse: DTLS -> plain UDP (decrypt responses back to clients) ---
         let mut to_remove = Vec::new();
         for (i, &(peer_addr, _fd)) in session_snapshot.iter().enumerate() {
-            if pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            // Include POLLERR/POLLNVAL (H6) so a pending socket error surfaces
+            // through the ssl_read below instead of spinning the poll loop.
+            if revents_ready(pollfds[i + 1].revents) {
                 if let Some(dtls) = sessions.get_mut(&peer_addr) {
                     loop {
                         match dtls.0.ssl_read(&mut rev_buf) {
@@ -748,8 +819,17 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                             Ok(n) => {
                                 dtls.1 = Instant::now();
                                 conn_metrics.record_read(n);
-                                let _ = plain_socket.send_to(&rev_buf[..n], peer_addr);
-                                conn_metrics.record_relay(n);
+                                // Count only what was actually sent to the
+                                // client; a failed send is logged, not tallied
+                                // as relayed (L20).
+                                match plain_socket.send_to(&rev_buf[..n], peer_addr) {
+                                    Ok(sent) => conn_metrics.record_relay(sent),
+                                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                                    Err(e) => debug!(
+                                        "[{}] client send error to {}: {}",
+                                        ctx.rule_name, peer_addr, e
+                                    ),
+                                }
                             }
                             Err(ref e) if e.code() == ErrorCode::WANT_READ => break,
                             Err(e) => {
@@ -907,14 +987,34 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
         // DTLS accept, matching the DTLS encrypt path (run_dtls_encrypt_relay)
         // and the TLS decrypt path (tls_engine::decrypt). A denied peer is
         // dropped without spending handshake CPU or opening an upstream socket.
-        let upstream_target = if ctx.upstream_addr == "auto" {
-            peer_addr.to_string()
-        } else {
-            ctx.upstream_addr.clone()
+        //
+        // `auto` is rejected at config validation for DTLS (no
+        // original-destination recovery — TRA #74); the former behaviour
+        // reflected decrypted plaintext back to the peer's own source address
+        // on the untrusted segment (H5). This defensive guard drops a stray
+        // "auto" rather than dialling it. A DNS-name upstream is resolved here
+        // once (never per datagram) and both the policy gate and the worker's
+        // connect use the resolved address (M4/#73); an unresolvable name
+        // fails closed.
+        if ctx.upstream_addr == "auto" {
+            error!(
+                "[{}] DTLS does not support upstream_addr=\"auto\"; dropping peer {}",
+                ctx.rule_name, peer_addr
+            );
+            continue;
+        }
+        let upstream_addr = match ctx.resolve_upstream_target(&ctx.upstream_addr) {
+            Some(a) => a,
+            None => {
+                warn!(
+                    "[{}] cannot resolve upstream '{}' for peer {}; dropping",
+                    ctx.rule_name, ctx.upstream_addr, peer_addr
+                );
+                continue;
+            }
         };
-        // Fail closed on an unparseable upstream target (DP-07).
-        if !ctx.classify_and_check_policy_target(&peer_addr, &upstream_target) {
-            continue; // policy denied or unresolvable -- drop and re-arm the listener
+        if !ctx.classify_and_check_policy(&peer_addr, &upstream_addr) {
+            continue; // policy denied -- drop and re-arm the listener
         }
 
         // Connect socket to this peer -- recv()/send() now locked to this
@@ -952,7 +1052,8 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
         let dtls_stream = DtlsUdpStream::new(listen_socket);
 
         // Clone context fields for the spawned thread (shadowing avoids _2 suffixes).
-        // `upstream_target` was already resolved (and policy-checked) above.
+        // `upstream_addr` was already resolved (and policy-checked) above, so the
+        // worker connects straight to it — no second resolution.
         let rule_name = ctx.rule_name.clone();
         let upstream_proto = ctx.upstream_proto;
         let shutdown = ctx.shutdown.clone();
@@ -1027,16 +1128,7 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                         return;
                     }
                     Proto::Udp => {
-                        let target: SocketAddr = match upstream_target.parse() {
-                            Ok(a) => a,
-                            Err(e) => {
-                                error!(
-                                    "[{}] Invalid upstream '{}': {}",
-                                    rule_name, upstream_target, e
-                                );
-                                return;
-                            }
-                        };
+                        let target = upstream_addr;
                         let bind_addr = if target.is_ipv6() {
                             "[::]:0"
                         } else {
@@ -1070,33 +1162,15 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                             if shutdown.load(Ordering::Relaxed) {
                                 break;
                             }
-                            let mut fds = [
-                                libc::pollfd {
-                                    fd: dtls_fd,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                },
-                                libc::pollfd {
-                                    fd: up_fd,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                },
-                            ];
-                            // SAFETY: `fds` is a live, fully-initialised
-                            // `[libc::pollfd; 2]` array; `as_mut_ptr()` points to
-                            // its first element and the passed count `2` matches
-                            // the array length exactly, so `poll` only reads and
-                            // writes the two in-bounds entries for the duration of
-                            // the call (the array outlives it). `ret` is checked below.
-                            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
-                            if ret < 0 {
-                                let err = io::Error::last_os_error();
-                                if err.kind() == io::ErrorKind::Interrupted {
-                                    continue;
-                                }
-                                break;
-                            }
-                            if ret == 0 {
+                            // Shared two-fd poll (M30): POLLERR/POLLNVAL-aware
+                            // (H6) so a pending ICMP error is reported ready and
+                            // surfaced by the following recv/send.
+                            let (dtls_ready, up_ready) = match poll_two_fds(dtls_fd, up_fd, 0, 1000)
+                            {
+                                Ok(r) => r,
+                                Err(_) => break 'relay,
+                            };
+                            if !dtls_ready && !up_ready {
                                 if let Some(ttl) = idle_deadline {
                                     if last_activity.elapsed() >= ttl {
                                         debug!(
@@ -1108,18 +1182,30 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                 }
                                 continue;
                             }
-                            last_activity = Instant::now();
 
-                            // Forward: DTLS -> upstream UDP (decrypt)
-                            if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                            // Forward: DTLS -> upstream UDP (decrypt).
+                            if dtls_ready {
                                 loop {
                                     match ssl.ssl_read(&mut fwd_buf) {
                                         Ok(0) => break 'relay,
                                         Ok(n) => {
+                                            // last_activity only advances on real
+                                            // byte movement (H6) so a POLLERR spin
+                                            // cannot defeat idle eviction.
+                                            last_activity = Instant::now();
                                             conn.record_read(n);
                                             apply_geo_delay(simulated_delay_ms);
-                                            let _ = upstream.send(&fwd_buf[..n]);
-                                            conn.record_relay(n);
+                                            // Count only bytes actually sent
+                                            // upstream (L20).
+                                            match upstream.send(&fwd_buf[..n]) {
+                                                Ok(sent) => conn.record_relay(sent),
+                                                Err(ref e)
+                                                    if e.kind() == io::ErrorKind::WouldBlock => {}
+                                                Err(e) => debug!(
+                                                    "[{}] upstream send error: {}",
+                                                    rule_name, e
+                                                ),
+                                            }
                                         }
                                         Err(ref e) if e.code() == ErrorCode::WANT_READ => break,
                                         Err(e) => {
@@ -1131,14 +1217,24 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                             }
 
                             // Reverse: upstream UDP -> DTLS (encrypt response)
-                            if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                            if up_ready {
                                 loop {
                                     match upstream.recv(&mut rev_buf) {
                                         Ok(n) if n > 0 => {
+                                            last_activity = Instant::now();
                                             conn.record_read(n);
                                             match ssl.ssl_write(&rev_buf[..n]) {
                                                 Ok(_) => {
                                                     conn.record_relay(n);
+                                                }
+                                                // Transient backpressure (M23):
+                                                // drop the datagram, keep the
+                                                // session.
+                                                Err(ref e) if !dtls_write_is_fatal(e) => {
+                                                    debug!(
+                                                        "[{}] DTLS write backpressure; dropping",
+                                                        rule_name
+                                                    );
                                                 }
                                                 Err(e) => {
                                                     error!(
@@ -1149,20 +1245,31 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                                 }
                                             }
                                         }
+                                        // A legitimate zero-length datagram from
+                                        // the trusted upstream is NOT a teardown
+                                        // signal (L21): ssl_write(&[]) is a no-op,
+                                        // so we simply keep the session.
+                                        Ok(_) => {}
                                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                             break
                                         }
                                         Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
                                             continue
                                         }
-                                        _ => break 'relay,
+                                        // Real upstream recv error: log it (the
+                                        // former catch-all swallowed it) and end
+                                        // the session (L21).
+                                        Err(e) => {
+                                            error!("[{}] upstream recv error: {}", rule_name, e);
+                                            break 'relay;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                     Proto::Tcp => {
-                        let mut upstream = match TcpStream::connect(&upstream_target) {
+                        let mut upstream = match TcpStream::connect(upstream_addr) {
                             Ok(s) => s,
                             Err(e) => {
                                 error!("[{}] Upstream TCP connect error: {}", rule_name, e);
@@ -1187,33 +1294,13 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                             if shutdown.load(Ordering::Relaxed) {
                                 break;
                             }
-                            let mut fds = [
-                                libc::pollfd {
-                                    fd: dtls_fd,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                },
-                                libc::pollfd {
-                                    fd: up_fd,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                },
-                            ];
-                            // SAFETY: `fds` is a live, fully-initialised
-                            // `[libc::pollfd; 2]` array; `as_mut_ptr()` points to
-                            // its first element and the passed count `2` matches
-                            // the array length exactly, so `poll` only reads and
-                            // writes the two in-bounds entries for the duration of
-                            // the call (the array outlives it). `ret` is checked below.
-                            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
-                            if ret < 0 {
-                                let err = io::Error::last_os_error();
-                                if err.kind() == io::ErrorKind::Interrupted {
-                                    continue;
-                                }
-                                break;
-                            }
-                            if ret == 0 {
+                            // Shared two-fd poll (M30), POLLERR/POLLNVAL-aware (H6).
+                            let (dtls_ready, up_ready) = match poll_two_fds(dtls_fd, up_fd, 0, 1000)
+                            {
+                                Ok(r) => r,
+                                Err(_) => break 'relay,
+                            };
+                            if !dtls_ready && !up_ready {
                                 if let Some(ttl) = idle_deadline {
                                     if last_activity.elapsed() >= ttl {
                                         debug!(
@@ -1225,10 +1312,9 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                 }
                                 continue;
                             }
-                            last_activity = Instant::now();
 
-                            // Forward: DTLS -> upstream TCP (decrypt)
-                            if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                            // Forward: DTLS -> upstream TCP (decrypt).
+                            if dtls_ready {
                                 loop {
                                     match ssl.ssl_read(&mut fwd_buf) {
                                         Ok(0) => {
@@ -1236,6 +1322,7 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                                             break 'relay;
                                         }
                                         Ok(n) => {
+                                            last_activity = Instant::now();
                                             conn.record_read(n);
                                             apply_geo_delay(simulated_delay_ms);
                                             if write_all_nb(&mut upstream, &fwd_buf[..n]).is_err() {
@@ -1253,14 +1340,22 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
                             }
 
                             // Reverse: upstream TCP -> DTLS (encrypt response)
-                            if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                            if up_ready {
                                 match upstream.read(&mut rev_buf) {
                                     Ok(0) => break 'relay,
                                     Ok(n) => {
+                                        last_activity = Instant::now();
                                         conn.record_read(n);
                                         match ssl.ssl_write(&rev_buf[..n]) {
                                             Ok(_) => {
                                                 conn.record_relay(n);
+                                            }
+                                            // Transient backpressure (M23).
+                                            Err(ref e) if !dtls_write_is_fatal(e) => {
+                                                debug!(
+                                                    "[{}] DTLS write backpressure; dropping",
+                                                    rule_name
+                                                );
                                             }
                                             Err(e) => {
                                                 error!("[{}] DTLS write error: {}", rule_name, e);
@@ -1388,5 +1483,20 @@ mod cookie_tests {
             "secret must be the same cached instance"
         );
         assert_ne!(a, &[0u8; 32], "a real secret must not be all-zero");
+    }
+
+    // H6: an error-only wake (POLLERR / POLLNVAL, e.g. a pending ICMP error on
+    // a connected UDP socket) must count as "ready" so the following recv/send
+    // surfaces the error — otherwise the poll loop busy-spins at 100% CPU.
+    #[test]
+    fn revents_ready_includes_error_conditions() {
+        assert!(revents_ready(libc::POLLIN));
+        assert!(revents_ready(libc::POLLHUP));
+        assert!(revents_ready(libc::POLLERR));
+        assert!(revents_ready(libc::POLLNVAL));
+        assert!(revents_ready(libc::POLLERR | libc::POLLIN));
+        // No relevant bit set → not ready.
+        assert!(!revents_ready(0));
+        assert!(!revents_ready(libc::POLLOUT));
     }
 }

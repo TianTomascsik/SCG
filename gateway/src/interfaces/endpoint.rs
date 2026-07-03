@@ -7,7 +7,7 @@
 //! so a UDS client on one gateway can interoperate with a SHM client on a peer
 //! gateway: both sides see the same length-prefixed frame stream inside TLS.
 
-use crate::management::config::{PerfKnobs, QosPolicy, TlsMode, TrafficClass};
+use crate::management::config::{Direction, PerfKnobs, QosPolicy, TlsMode, TrafficClass};
 use crate::management::telemetry::ConnectionMetrics;
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
@@ -25,7 +25,7 @@ use crate::security::{HANDSHAKE_TIMEOUT, RELAY_BUF_SIZE};
 
 use foreign_types_shared::ForeignTypeRef;
 use ktls_pipe::{enable_ktls_ssl, get_tcp_ulp, ktls_privilege_hint, KtlsSession};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use openssl::ssl::{Ssl, SslAcceptor};
 
 use scg_ipc::handshake::{Hello, HELLO_LEN};
@@ -188,9 +188,11 @@ pub fn authenticate_peer(
     let hello = Hello::decode(&hello_buf).map_err(|e| format!("decoding HELLO: {e}"))?;
 
     // Consume the single-use token under the lock so a racing connection cannot
-    // reuse it.
+    // reuse it. Recover a poisoned guard rather than panicking in library code
+    // (L29): the token Option is a well-formed value regardless of any prior
+    // panic, so continuing is safe.
     {
-        let mut guard = token.lock().unwrap();
+        let mut guard = token.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(tok) if tok.ct_eq(hello.token.as_bytes()) => {
                 *guard = None; // consume
@@ -606,6 +608,95 @@ pub fn accept_plain_upstream(
     apply_egress_qos(fd, qos.egress_dscp(None), qos.so_priority(), is_v6);
     info!("[{label}] routing downstream accepted from {peer_addr} (plaintext, no TLS)");
     Ok(ProxyStream::Plain(stream))
+}
+
+/// Establish the upstream leg for a local (UDS/SHM) endpoint, collapsing the
+/// 4-way `(routing, direction)` dispatch and its error-verb logging that
+/// `uds::serve` and `shm::serve` previously duplicated verbatim (M27).
+///
+/// Returns `None` after logging on failure so the caller simply `return`s from
+/// its serve loop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn establish_upstream(
+    label: &str,
+    routing: bool,
+    direction: Direction,
+    upstream_addr: &str,
+    tls_mode: TlsMode,
+    provider_params: &HashMap<String, serde_json::Value>,
+    protocol_version: Option<&str>,
+    sock_buf_size: usize,
+    qos: QosPolicy,
+    policy: Option<&EndpointPolicy>,
+    shutdown: &AtomicBool,
+) -> Option<ProxyStream> {
+    // Routing endpoints relay plaintext (no TLS) on the upstream leg, exactly
+    // like the TCP routing provider (TRA #58); the local-caller auth already
+    // passed before this call. TLS/kTLS endpoints take the encrypted path.
+    let result = match (routing, direction) {
+        (true, Direction::Encrypt) => {
+            connect_plain_upstream(label, upstream_addr, sock_buf_size, qos, policy, shutdown)
+        }
+        (true, Direction::Decrypt) => {
+            accept_plain_upstream(label, upstream_addr, sock_buf_size, qos, policy, shutdown)
+        }
+        (false, Direction::Encrypt) => connect_tls_upstream(
+            label,
+            upstream_addr,
+            tls_mode,
+            provider_params,
+            protocol_version,
+            sock_buf_size,
+            qos,
+            policy,
+            shutdown,
+        ),
+        (false, Direction::Decrypt) => accept_tls_upstream(
+            label,
+            upstream_addr,
+            tls_mode,
+            provider_params,
+            protocol_version,
+            sock_buf_size,
+            qos,
+            policy,
+            shutdown,
+        ),
+    };
+    match result {
+        Ok(t) => Some(t),
+        Err(e) => {
+            let verb = match direction {
+                Direction::Encrypt => "connect",
+                Direction::Decrypt => "accept",
+            };
+            error!("[{label}] upstream {verb} failed: {e}");
+            None
+        }
+    }
+}
+
+/// Poll a single fd for readability with a timeout; retries on `EINTR`.
+/// Shared by the UDS and SHM serve loops (M27).
+pub(crate) fn poll_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pfd` is a live, fully-initialised single `pollfd`; the
+        // pointer/count pair (1) is valid for the call and `poll` only writes
+        // `revents`. The negative return is checked and `EINTR` retried below.
+        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+        if ret < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+        return ret > 0 && (pfd.revents & libc::POLLIN) != 0;
+    }
 }
 
 /// Whether the UDS relay may use the zero-copy `splice(2)` fast-path.

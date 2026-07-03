@@ -20,7 +20,7 @@ use crate::security::ACCEPT_TIMEOUT;
 use log::{debug, error, info, warn};
 
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -65,9 +65,7 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
         // A transparent rule with an *explicit* upstream is a fixed-forward
         // interceptor and forwards there directly.
         let target = if ctx.transparent && is_auto_upstream(&ctx.upstream_addr) {
-            let so_orig = tproxy::get_original_dst(client_stream.as_raw_fd()).ok();
-            let local = client_stream.local_addr().ok();
-            match local.and_then(|l| transparent_target(so_orig, l, listen_port)) {
+            match tproxy::recover_transparent_dst(client_stream.as_raw_fd(), listen_port) {
                 Some(dst) => {
                     debug!(
                         "[{}] transparent {} \u{2192} {} (recovered original dst)",
@@ -211,43 +209,14 @@ fn is_auto_upstream(upstream: &str) -> bool {
     upstream.trim().eq_ignore_ascii_case("auto")
 }
 
-/// Resolve the original destination of a transparent (TPROXY / REDIRECT)
-/// connection, or `None` when it cannot be determined (the caller must then fail
-/// closed).
-///
-/// * `so_original_dst` — the `SO_ORIGINAL_DST` result; `Some` for conntrack
-///   REDIRECT/DNAT, `None` for TPROXY (the sockopt is NAT-only).
-/// * `local_addr` — `getsockname` on the accepted socket. For a TPROXY-redirected
-///   connection the IP_TRANSPARENT socket's local address *is* the original
-///   destination; for a direct connection it is the listener's own address.
-/// * `listen_port` — the listener's bound port, used to tell a genuine redirect
-///   (different port) from a direct connection (same port).
-fn transparent_target(
-    so_original_dst: Option<SocketAddr>,
-    local_addr: SocketAddr,
-    listen_port: Option<u16>,
-) -> Option<SocketAddr> {
-    // REDIRECT/DNAT: conntrack returns the pre-translation destination, which
-    // `getsockname` cannot (the kernel rewrote it to the local socket address).
-    if let Some(orig) = so_original_dst {
-        return Some(orig);
-    }
-    // TPROXY: a local port matching the listener's own port means this is a
-    // direct, non-redirected connection that carries no original-destination
-    // information — nothing to recover.
-    match listen_port {
-        Some(p) if local_addr.port() != p => Some(local_addr),
-        _ => None,
-    }
-}
+// The original-destination recovery logic (SO_ORIGINAL_DST → getsockname →
+// fail-closed) now lives in `interfaces::tproxy::recover_transparent_dst`,
+// shared with the TLS encrypt/decrypt paths (M10). Its pure decision core is
+// unit-tested there.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sa(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
 
     #[test]
     fn auto_upstream_detection() {
@@ -255,35 +224,5 @@ mod tests {
         assert!(is_auto_upstream("  AUTO "));
         assert!(!is_auto_upstream("127.0.0.1:8080"));
         assert!(!is_auto_upstream(""));
-    }
-
-    #[test]
-    fn redirect_uses_so_original_dst() {
-        // REDIRECT/DNAT: SO_ORIGINAL_DST wins regardless of the local address.
-        let orig = sa("10.0.0.9:443");
-        assert_eq!(
-            transparent_target(Some(orig), sa("127.0.0.1:20002"), Some(20002)),
-            Some(orig)
-        );
-    }
-
-    #[test]
-    fn tproxy_recovers_original_dst_from_local_addr() {
-        // TPROXY: no SO_ORIGINAL_DST; the transparent socket's local addr (a port
-        // other than the listener's) is the original destination.
-        let local = sa("127.0.0.1:20001");
-        assert_eq!(transparent_target(None, local, Some(20002)), Some(local));
-    }
-
-    #[test]
-    fn direct_connection_fails_closed() {
-        // A direct connection to the listener (local port == listener port) carries
-        // no original-destination info → None → caller drops it.
-        assert_eq!(
-            transparent_target(None, sa("127.0.0.1:20002"), Some(20002)),
-            None
-        );
-        // Unknown listener port is also not recoverable.
-        assert_eq!(transparent_target(None, sa("127.0.0.1:20001"), None), None);
     }
 }
