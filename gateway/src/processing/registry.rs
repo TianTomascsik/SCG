@@ -71,3 +71,28 @@ impl ProviderRegistry {
         Arc::new(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_protocols::ale_provider::AleProtocolProvider;
+    use crate::security::providers::tls_provider::TlsProvider;
+
+    #[test]
+    fn register_find_and_list() {
+        let mut reg = ProviderRegistry::default();
+        reg.register_crypto(Box::new(TlsProvider));
+        reg.register_app_protocol(Box::new(AleProtocolProvider));
+
+        assert!(reg.find_crypto("tls").is_some());
+        assert!(reg.find_crypto("nope").is_none());
+        assert_eq!(reg.crypto_names(), vec!["tls"]);
+
+        assert!(reg.find_app_protocol("ale").is_some());
+        assert!(reg.find_app_protocol("missing").is_none());
+        assert_eq!(reg.app_protocol_names(), vec!["ale"]);
+
+        let arc = reg.into_arc();
+        assert!(arc.find_crypto("tls").is_some());
+    }
+}

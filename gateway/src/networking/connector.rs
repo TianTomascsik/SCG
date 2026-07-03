@@ -68,3 +68,65 @@ pub fn sleep_with_shutdown_check(delay: Duration, shutdown: &AtomicBool) -> bool
         std::thread::sleep(Duration::from_millis(500).min(deadline - now));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_returns_true_when_already_shutdown() {
+        let flag = AtomicBool::new(true);
+        assert!(sleep_with_shutdown_check(Duration::from_secs(10), &flag));
+    }
+
+    #[test]
+    fn sleep_returns_false_after_deadline() {
+        let flag = AtomicBool::new(false);
+        assert!(!sleep_with_shutdown_check(Duration::from_millis(1), &flag));
+    }
+
+    #[test]
+    fn connect_rejects_unparseable_addr() {
+        let flag = AtomicBool::new(false);
+        let e = connect_with_retry(
+            "not-an-address",
+            1,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &flag,
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn connect_interrupted_when_shutdown_set() {
+        let flag = AtomicBool::new(true);
+        let e = connect_with_retry(
+            "127.0.0.1:9",
+            1,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            &flag,
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn connect_gives_up_after_retrying() {
+        // 127.0.0.1:1 has no listener, so every attempt is refused immediately.
+        // Two attempts exercises the backoff-sleep + delay-doubling path before
+        // the final error is returned with the address annotated.
+        let flag = AtomicBool::new(false);
+        let e = connect_with_retry(
+            "127.0.0.1:1",
+            2,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            &flag,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("127.0.0.1:1"));
+    }
+}

@@ -60,3 +60,28 @@ impl CryptoProvider for TlsProvider {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_description() {
+        assert_eq!(TlsProvider.name(), "tls");
+        assert!(TlsProvider.description().contains("TLS"));
+    }
+
+    #[test]
+    fn supports_tcp_and_udp_both_directions() {
+        let modes = TlsProvider.supported_modes();
+        assert_eq!(modes.len(), 4);
+        for proto in [Proto::Tcp, Proto::Udp] {
+            assert!(modes
+                .iter()
+                .any(|m| m.direction == Direction::Encrypt && m.listen_proto == proto));
+            assert!(modes
+                .iter()
+                .any(|m| m.direction == Direction::Decrypt && m.listen_proto == proto));
+        }
+    }
+}

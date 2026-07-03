@@ -55,3 +55,23 @@ fn route_tcp(ctx: &RuleContext) -> Result<(), String> {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_description() {
+        assert_eq!(RoutingProvider.name(), "routing");
+        assert!(RoutingProvider.description().contains("plaintext"));
+    }
+
+    #[test]
+    fn modes_are_tcp_only() {
+        let modes = RoutingProvider.supported_modes();
+        assert_eq!(modes.len(), 2);
+        assert!(modes.iter().all(|m| m.listen_proto == Proto::Tcp));
+        assert!(modes.iter().any(|m| m.direction == Direction::Encrypt));
+        assert!(modes.iter().any(|m| m.direction == Direction::Decrypt));
+    }
+}

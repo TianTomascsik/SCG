@@ -211,3 +211,113 @@ impl FramingSession for AleSession {
         stream.write_all(&buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AleProtocolProvider;
+    use crate::app_protocols::provider::AppProtocolProvider;
+    use std::io::{self, Read};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn provider_metadata_is_stable() {
+        let p = AleProtocolProvider;
+        assert_eq!(p.name(), "ale");
+        assert!(p.description().contains("ALE"));
+        // create_session yields a usable framing session.
+        let mut s = p.create_session();
+        let mut out = Vec::new();
+        s.frame_datagram(b"x", &mut out).unwrap();
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn frame_then_deframe_roundtrips_chunked() {
+        let p = AleProtocolProvider;
+        let mut tx = p.create_session();
+        let mut out = Vec::new();
+        tx.frame_datagram(b"HELLO-ALE-DATA", &mut out).unwrap();
+
+        // Feed one byte at a time: no datagram surfaces until the frame completes.
+        let mut rx = p.create_session();
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for b in &out {
+            let res = rx.deframe(&[*b]).unwrap();
+            assert!(!res.disconnected);
+            all.extend(res.datagrams);
+        }
+        assert_eq!(all, vec![b"HELLO-ALE-DATA".to_vec()]);
+    }
+
+    #[test]
+    fn disconnect_frame_is_reported() {
+        let p = AleProtocolProvider;
+        let mut tx = p.create_session();
+        // write_disconnect needs a Read+Write sink; Cursor<Vec<u8>> is both.
+        let mut wire = io::Cursor::new(Vec::new());
+        tx.write_disconnect(&mut wire).unwrap();
+
+        let mut rx = p.create_session();
+        let res = rx.deframe(&wire.into_inner()).unwrap();
+        assert!(res.disconnected, "DI packet should set disconnected");
+    }
+
+    #[test]
+    fn corrupted_frame_is_rejected() {
+        let p = AleProtocolProvider;
+        let mut tx = p.create_session();
+        let mut out = Vec::new();
+        tx.frame_datagram(b"payload-under-checksum", &mut out)
+            .unwrap();
+        // The ALEPKT CRC covers header bytes 0..8 (not the payload), so flip a
+        // checksum-covered header byte to force a mismatch. DeframeResult is not
+        // Debug, so match on the error.
+        out[5] ^= 0xFF;
+        let mut rx = p.create_session();
+        match rx.deframe(&out) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected a checksum/frame error on a corrupted packet"),
+        }
+    }
+
+    #[test]
+    fn handshake_initiator_and_responder_complete() {
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let responder = std::thread::spawn(move || {
+            let p = AleProtocolProvider;
+            let mut s = p.create_session();
+            s.handshake_responder(&mut b)
+        });
+
+        let p = AleProtocolProvider;
+        let mut s = p.create_session();
+        let init = s.handshake_initiator(&mut a);
+        let resp = responder.join().expect("responder thread");
+
+        assert!(init.is_ok(), "initiator handshake failed: {init:?}");
+        assert!(resp.is_ok(), "responder handshake failed: {resp:?}");
+    }
+
+    #[test]
+    fn handshake_initiator_errors_on_early_eof() {
+        // Peer reads the AU1 request then closes without sending AU2, so the
+        // initiator observes EOF and fails closed.
+        let (mut a, b) = UnixStream::pair().expect("socketpair");
+        let peer = std::thread::spawn(move || {
+            let mut b = b;
+            let mut buf = [0u8; 256];
+            let _ = b.read(&mut buf); // consume AU1
+            drop(b); // close → initiator's next read returns 0
+        });
+
+        let p = AleProtocolProvider;
+        let mut s = p.create_session();
+        let res = s.handshake_initiator(&mut a);
+        peer.join().expect("peer thread");
+
+        match res {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            Ok(()) => panic!("expected EOF error when AU2 never arrives"),
+        }
+    }
+}

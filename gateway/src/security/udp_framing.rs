@@ -242,4 +242,41 @@ mod tests {
         f.deframe_each("t", &full[split..], |d| out.push(d.to_vec()));
         assert_eq!(out, vec![b"abcdef".to_vec()]);
     }
+
+    #[test]
+    fn ale_default_and_frame_deframe_roundtrip() {
+        let mut tx = UdpFraming::for_app_protocol("ale");
+        assert!(tx.is_ale(), "ale (the default) selects ALE framing");
+        let mut wire = Vec::new();
+        tx.frame_into(b"telemetry", &mut wire);
+
+        let mut rx = UdpFraming::for_app_protocol("ale");
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let disconnect = rx.deframe_each("t", &wire, |d| got.push(d.to_vec()));
+        assert!(!disconnect);
+        assert_eq!(got, vec![b"telemetry".to_vec()]);
+    }
+
+    #[test]
+    fn ale_write_disconnect_signals_disconnect() {
+        let mut tx = UdpFraming::for_app_protocol("ale");
+        let mut wire: Vec<u8> = Vec::new();
+        tx.write_disconnect(&mut wire); // emits an ALE DI packet
+
+        let mut rx = UdpFraming::for_app_protocol("ale");
+        let disconnect = rx.deframe_each("t", &wire, |_| panic!("DI carries no datagram"));
+        assert!(disconnect, "an ALE DI packet must request disconnect");
+    }
+
+    #[test]
+    fn ale_checksum_mismatch_disconnects() {
+        let mut tx = UdpFraming::for_app_protocol("ale");
+        let mut wire = Vec::new();
+        tx.frame_into(b"payload", &mut wire);
+        wire[5] ^= 0xFF; // corrupt a checksum-covered header byte
+
+        let mut rx = UdpFraming::for_app_protocol("ale");
+        let disconnect = rx.deframe_each("t", &wire, |_| {});
+        assert!(disconnect, "an ALE checksum mismatch must disconnect");
+    }
 }

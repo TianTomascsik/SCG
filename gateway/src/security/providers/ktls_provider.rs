@@ -59,3 +59,28 @@ impl CryptoProvider for KtlsProvider {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_description() {
+        assert_eq!(KtlsProvider.name(), "ktls");
+        assert!(KtlsProvider.description().contains("kTLS"));
+    }
+
+    #[test]
+    fn supports_tcp_and_udp_both_directions() {
+        let modes = KtlsProvider.supported_modes();
+        assert_eq!(modes.len(), 4);
+        for proto in [Proto::Tcp, Proto::Udp] {
+            assert!(modes
+                .iter()
+                .any(|m| m.direction == Direction::Encrypt && m.listen_proto == proto));
+            assert!(modes
+                .iter()
+                .any(|m| m.direction == Direction::Decrypt && m.listen_proto == proto));
+        }
+    }
+}

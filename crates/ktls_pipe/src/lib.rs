@@ -279,7 +279,11 @@ pub fn kernel_supports_ktls() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_unclean_eof;
+    use super::{get_tcp_ulp, is_unclean_eof, ktls_privilege_hint, KtlsSession};
+    use openssl::ssl::{Ssl, SslContext, SslMethod};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn syscall_ret0_with_errno0_is_unclean_eof() {
@@ -297,5 +301,42 @@ mod tests {
         assert!(!is_unclean_eof(-1, Some(0)));
         assert!(!is_unclean_eof(-1, None));
         assert!(!is_unclean_eof(-1, Some(libc::EPIPE)));
+    }
+
+    #[test]
+    fn privilege_hint_is_nonempty_when_unprivileged() {
+        // The test process is not root, so the operator hint is emitted.
+        assert!(ktls_privilege_hint().contains("CAP_NET_ADMIN"));
+    }
+
+    #[test]
+    fn get_tcp_ulp_on_plain_socket_is_not_tls() {
+        // A plain loopback socket has no `tls` ULP attached. Depending on the
+        // kernel, the query returns either an empty name or ENOPROTOOPT — either
+        // way it is never "tls", and both paths exercise `get_tcp_ulp`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Ok(empty) or Err(ENOPROTOOPT) depending on the kernel — never "tls".
+        if let Ok(ulp) = get_tcp_ulp(&stream) {
+            assert_ne!(ulp, "tls");
+        }
+    }
+
+    #[test]
+    fn session_new_getters_and_empty_io() {
+        // Build an SSL bound to a real fd (no handshake) to cover construction,
+        // the accessors, and the empty-buffer early returns of Read/Write.
+        let ctx = SslContext::builder(SslMethod::tls()).unwrap().build();
+        let ssl = Ssl::new(&ctx).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+        let mut session = KtlsSession::new(ssl, stream.as_raw_fd()).unwrap();
+        let _ = session.ssl_ref();
+        assert!(!session.as_ptr().is_null());
+        assert_eq!(session.read(&mut []).unwrap(), 0);
+        assert_eq!(session.write(&[]).unwrap(), 0);
+        assert!(session.flush().is_ok());
+        session.shutdown();
     }
 }

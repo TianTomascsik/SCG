@@ -51,3 +51,36 @@ impl From<tonic::transport::Error> for ScgError {
 
 /// Convenience alias for results in this crate.
 pub type Result<T> = std::result::Result<T, ScgError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn display_covers_all_variants() {
+        assert!(ScgError::Management("boom".into())
+            .to_string()
+            .contains("management"));
+        assert!(ScgError::Closed.to_string().contains("closed"));
+        assert!(ScgError::FrameTooLarge.to_string().contains("maximum size"));
+        assert!(ScgError::BadOffer("nope".into())
+            .to_string()
+            .contains("offer"));
+        let io = ScgError::Io(io::Error::other("disk"));
+        assert!(io.to_string().contains("io error"));
+    }
+
+    #[test]
+    fn from_io_error_wraps_io_variant() {
+        let e: ScgError = io::Error::from(io::ErrorKind::BrokenPipe).into();
+        assert!(matches!(e, ScgError::Io(_)));
+    }
+
+    #[test]
+    fn from_tonic_status_maps_to_management() {
+        let e: ScgError = tonic::Status::not_found("gone").into();
+        assert!(matches!(e, ScgError::Management(_)));
+        assert!(e.to_string().contains("gone"));
+    }
+}

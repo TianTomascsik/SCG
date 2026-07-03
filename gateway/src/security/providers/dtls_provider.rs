@@ -46,3 +46,23 @@ impl CryptoProvider for DtlsProvider {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_description() {
+        assert_eq!(DtlsProvider.name(), "dtls");
+        assert!(DtlsProvider.description().contains("DTLS"));
+    }
+
+    #[test]
+    fn modes_are_udp_only() {
+        let modes = DtlsProvider.supported_modes();
+        assert_eq!(modes.len(), 2);
+        assert!(modes.iter().all(|m| m.listen_proto == Proto::Udp));
+        assert!(modes.iter().any(|m| m.direction == Direction::Encrypt));
+        assert!(modes.iter().any(|m| m.direction == Direction::Decrypt));
+    }
+}
