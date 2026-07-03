@@ -351,6 +351,14 @@ fn configure_bench_crypto(
     Ok(())
 }
 
+/// Build a kTLS-offload **server** acceptor for the crate's own benchmark lanes.
+///
+/// Benchmark-only: it presents a cached self-signed certificate and performs **no
+/// client verification**. It is used solely by `KtlsPipeLane` to measure kTLS
+/// record-layer throughput on loopback. The gateway data plane must NOT use it —
+/// it builds its kTLS acceptor via
+/// [`security::tls_engine::build_ktls_acceptor`](../../gateway) so the rule's
+/// verify/CA/cert and PSK setup are applied (DP-01).
 pub fn build_server_acceptor(
     version: Option<&str>,
 ) -> Result<SslAcceptor, openssl::error::ErrorStack> {
@@ -370,21 +378,21 @@ pub fn build_server_acceptor(
     Ok(builder.build())
 }
 
-/// Build a kTLS-offload **client** connector.
+/// Build a kTLS-offload **client** connector for the crate's own benchmark lanes.
 ///
-/// Peer verification is intentionally `NONE`: kTLS only offloads the default
-/// AES-GCM, server-authentication-disabled path. Callers MUST only route a rule
-/// here when its parameters are kTLS-offloadable (default profile, `verify` =
-/// none, no PSK) — the gateway enforces this in
-/// `interfaces::endpoint::upstream_tls_mode`, which falls back to the userspace
-/// `Tls` connector (honouring `verify`/cert/CA) for any verification-requiring
-/// rule. Do not call this for a rule that requested peer verification.
+/// Benchmark-only: peer verification is intentionally `NONE`, so this offloads the
+/// default AES-GCM, server-authentication-disabled path only. It exists purely to
+/// let `KtlsPipeLane` measure kTLS record-layer throughput on loopback. **The
+/// gateway data plane must NOT use it** — it builds its kTLS connector via
+/// [`security::tls_engine::build_ktls_connector`](../../gateway) so the rule's
+/// `verify`/CA/cert and PSK setup are honoured identically to userspace TLS
+/// (DP-01). Do not route a gateway rule through this helper.
 pub fn build_client_connector(
     version: Option<&str>,
 ) -> Result<SslConnector, openssl::error::ErrorStack> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
-    // SAFETY (security): NONE is correct only for the offloadable path; see the
-    // doc comment above. The caller (upstream_tls_mode) guarantees this.
+    // SAFETY (security): NONE is correct only for this benchmark lane; the gateway
+    // uses the verify-honouring tls_engine builders instead. See the doc above.
     builder.set_verify(SslVerifyMode::NONE);
     // SAFETY: `builder.as_ptr()` returns the valid, non-null `SSL_CTX*` owned by
     // the live `builder` on the stack, so it outlives this call and is not

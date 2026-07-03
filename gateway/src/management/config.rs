@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 // ─── Top-level config ────────────────────────────────────────────────────────
 
@@ -74,6 +75,20 @@ pub struct GatewayConfig {
     /// reserved minimum regardless of this value.
     #[serde(default)]
     pub conn_pool_size: Option<usize>,
+
+    /// Downgrade the unverified-transport preflight **errors** back to warnings
+    /// (M-13): `verify: none` to a non-loopback upstream, or a non-mutual decrypt
+    /// listener on a non-loopback bind. Default `false` (fail-secure) — an
+    /// operator who deliberately runs an unverified posture on a routable endpoint
+    /// must opt in, so `--validate` fails the config until they do.
+    #[serde(default)]
+    pub allow_unverified_transport: bool,
+
+    /// Filesystem path this config was loaded from (classic mode), captured so the
+    /// preflight can advise on the file's permissions (CP-06). Not part of the
+    /// JSON; `None` for configs built in memory or via the lite path.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 /// Management API (gRPC) configuration.
@@ -410,6 +425,8 @@ impl PerfKnobs {
 
     /// Apply explicit rule-level low-level overrides on top of the profile
     /// defaults. `notsent_lowat = Some(0)` deliberately disables the option.
+    // Private builder-style setter; the overrides map 1:1 to tuning knobs.
+    #[allow(clippy::too_many_arguments)]
     fn with_rule_overrides(
         mut self,
         sock_buf_size: Option<usize>,
@@ -600,6 +617,7 @@ pub struct RuleConfig {
     /// Protocol version for TLS/DTLS. Valid values:
     /// - "tls1.2", "tls1.3" (for tls/ktls security providers)
     /// - "dtls1.0", "dtls1.2" (for dtls security provider)
+    ///
     /// Default: None (TLS 1.2 for tls/ktls, DTLS 1.2 for dtls).
     #[serde(default)]
     pub protocol_version: Option<String>,
@@ -1087,14 +1105,20 @@ impl AddressPattern {
 
     /// Check if a socket address matches this pattern.
     pub fn matches(&self, addr: &SocketAddr) -> bool {
+        // Canonicalize the peer IP so an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
+        // as seen on a dual-stack `[::]` listener) matches IPv4 patterns (DP-09).
+        // Exact/IpOnly pattern IPs are canonicalized too, so a pattern *written* in
+        // mapped form still matches. Cidr networks are matched literally — a v6
+        // prefix over a mapped network does not translate to a v4 prefix.
+        let ip = addr.ip().to_canonical();
         match self {
             AddressPattern::Any => true,
-            AddressPattern::Exact(sa) => addr == sa,
-            AddressPattern::IpOnly(ip) => &addr.ip() == ip,
+            AddressPattern::Exact(sa) => ip == sa.ip().to_canonical() && addr.port() == sa.port(),
+            AddressPattern::IpOnly(p) => ip == p.to_canonical(),
             AddressPattern::Cidr {
                 network,
                 prefix_len,
-            } => cidr_contains(*network, *prefix_len, addr.ip()),
+            } => cidr_contains(*network, *prefix_len, ip),
         }
     }
 }
@@ -1131,8 +1155,11 @@ impl GatewayConfig {
     pub fn load(path: &str) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file '{}': {}", path, e))?;
-        let config: GatewayConfig = serde_json::from_str(&content)
+        let mut config: GatewayConfig = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse config file '{}': {}", path, e))?;
+        // Remember where we loaded from so the preflight can advise on the file's
+        // permissions (CP-06).
+        config.source_path = Some(PathBuf::from(path));
         config.validate()?;
         Ok(config)
     }
@@ -1654,21 +1681,20 @@ impl GatewayConfig {
                 .rules
                 .iter()
                 .any(|r| matches!(&r.intercept, Some(ic) if ic.mode == InterceptMode::Tproxy));
-            if has_tproxy_intercept {
-                if std::process::Command::new("ip")
+            if has_tproxy_intercept
+                && std::process::Command::new("ip")
                     .arg("rule")
                     .arg("show")
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
                     .is_err()
-                {
-                    errors.push(
-                        "Intercept mode 'tproxy' configured but 'ip' command not found. \
-                         Install iproute2 or remove the tproxy intercept configuration."
-                            .to_string(),
-                    );
-                }
+            {
+                errors.push(
+                    "Intercept mode 'tproxy' configured but 'ip' command not found. \
+                     Install iproute2 or remove the tproxy intercept configuration."
+                        .to_string(),
+                );
             }
         }
 
@@ -1758,10 +1784,14 @@ impl GatewayConfig {
             }
         }
 
-        // ── TLS/DTLS verification-posture warnings (advisory, never fatal) ──
+        // ── TLS/DTLS verification-posture advisories ─────────────────────────
         // `verify: none` stays legal for back-compat, but unverified upstreams
         // (MITM, CWE-295) and decrypt listeners that do not authenticate clients
-        // (CWE-306) are surfaced at --validate and startup so operators notice.
+        // (CWE-306) are ERRORS on a non-loopback endpoint (M-13) unless the
+        // operator opts in via `allow_unverified_transport`, in which case they
+        // stay warnings. A loopback/local endpoint always stays a warning. The
+        // per-rule KEY-file permission advisory (KC-01) is emitted here too, where
+        // the TLS params (and thus the key path) are already resolved.
         for rule in &self.rules {
             let provider = rule.effective_security_provider();
             if provider != "tls" && provider != "ktls" && provider != "dtls" {
@@ -1774,28 +1804,54 @@ impl GatewayConfig {
                 Ok(p) => p,
                 Err(_) => continue, // parse errors are reported by validate()
             };
+
+            // KC-01: over-permissive private-key file mode.
+            if let Some(key) = params.key_path.as_ref() {
+                if let Ok(md) = std::fs::metadata(key) {
+                    use std::os::unix::fs::MetadataExt;
+                    if let Some(w) = crate::management::cert_store::key_perm_warning(key, md.mode())
+                    {
+                        warnings.push(format!("Rule '{}': {w}", rule.name));
+                    }
+                }
+            }
+
             use crate::security::tls_engine::params::VerifyMode;
             match rule.direction {
                 Direction::Encrypt => {
                     if params.verify == VerifyMode::None
                         && !upstream_is_loopback(&rule.upstream_addr)
                     {
-                        warnings.push(format!(
+                        let msg = format!(
                             "Rule '{}': encrypt upstream '{}' is contacted without peer \
                              verification (verify: none) — an on-path attacker can impersonate \
-                             it. Set verify: server (or mutual) with ca_path to authenticate it.",
+                             it. Set verify: server (or mutual) with ca_path to authenticate it, \
+                             or set allow_unverified_transport: true to accept this risk.",
                             rule.name, rule.upstream_addr
-                        ));
+                        );
+                        if self.allow_unverified_transport {
+                            warnings.push(msg);
+                        } else {
+                            errors.push(msg);
+                        }
                     }
                 }
                 Direction::Decrypt => {
                     if params.verify != VerifyMode::Mutual {
-                        warnings.push(format!(
+                        let msg = format!(
                             "Rule '{}': decrypt listener does not require client certificates \
                              (verify != mutual) — the plaintext relayed upstream originates from \
-                             unauthenticated peers. Set verify: mutual to require client auth.",
+                             unauthenticated peers. Set verify: mutual, or set \
+                             allow_unverified_transport: true to accept this risk.",
                             rule.name
-                        ));
+                        );
+                        if listen_is_non_loopback(&rule.listen_addr)
+                            && !self.allow_unverified_transport
+                        {
+                            errors.push(msg);
+                        } else {
+                            warnings.push(msg);
+                        }
                     }
                 }
             }
@@ -1841,6 +1897,60 @@ impl GatewayConfig {
                  over TCP). Prefer UDS-only, or place the bind behind mTLS/loopback.",
                 tcp, scope
             ));
+        }
+
+        // ── Unix-socket path-length (SUN_LEN) check ─────────────────────────
+        // The management socket and every UDS/SHM endpoint socket are bound as
+        // Unix sockets, whose path must fit `sockaddr_un.sun_path` (108 bytes on
+        // Linux, incl. the NUL terminator). Catch an over-long path here so the
+        // operator gets a clear `--validate` error instead of a confusing runtime
+        // "path must be shorter than SUN_LEN" bind failure.
+        if let Some(api) = self.api.as_ref() {
+            const SUN_MAX: usize = 108; // Linux sockaddr_un.sun_path incl. NUL
+            if api.uds_path.len() >= SUN_MAX {
+                errors.push(format!(
+                    "api.uds_path '{}' is {} bytes, but a Unix socket path must be \
+                     under {} (SUN_LEN) — use a shorter management-socket path (e.g. \
+                     under /run)",
+                    api.uds_path,
+                    api.uds_path.len(),
+                    SUN_MAX
+                ));
+            }
+            // Endpoint sockets are laid out as
+            // `<runtime_dir>/<uid>/<app_id>.<class>.<direction>.<id>.sock`. Estimate
+            // the longest (10-digit uid + id, the longest configured local app_id,
+            // and the longest class/direction tokens) and warn before it bites at
+            // endpoint-create time.
+            let longest_app = self
+                .rules
+                .iter()
+                .filter(|r| matches!(r.listen_proto, Proto::Uds | Proto::Shm))
+                .filter_map(|r| r.app_id.as_deref().map(str::len))
+                .max();
+            if let Some(app_len) = longest_app {
+                // runtime_dir + '/' + uid(≤10) + '/' + app + '.' + "safety"(6) +
+                // '.' + "encrypt"(7) + '.' + id(≤10) + ".sock"(5)
+                let est = api.runtime_dir.len() + 1 + 10 + 1 + app_len + 1 + 6 + 1 + 7 + 1 + 10 + 5;
+                if est >= SUN_MAX {
+                    warnings.push(format!(
+                        "api.runtime_dir '{}' plus a UDS/SHM endpoint filename can reach \
+                         ~{} bytes, near/over the {}-byte Unix-socket limit — endpoint \
+                         creation may fail at runtime; use a shorter runtime_dir",
+                        api.runtime_dir, est, SUN_MAX
+                    ));
+                }
+            }
+        }
+
+        // ── Config-file writability advisory (CP-06) ────────────────────────
+        // The classic config path has no integrity control; at minimum warn if
+        // the file itself is group/other-writable, so a co-located actor cannot
+        // silently rewrite the running posture on the next reload.
+        if let Some(path) = &self.source_path {
+            if let Some(w) = world_or_group_writable_warning(path, "config file") {
+                warnings.push(w);
+            }
         }
 
         (warnings, errors)
@@ -2026,12 +2136,41 @@ impl GatewayConfig {
             .map(|r| r.name.clone())
             .collect();
 
+        // Whether the set of intercept-bearing rules changed at all (added,
+        // removed, or an intercept/listen edit) — drives firewall reconciliation
+        // on hot-reload (CP-09). `removed` carries names only, so this is computed
+        // here where both full configs are in scope.
+        let intercept_changed = Self::intercept_projection(self) != Self::intercept_projection(new);
+
         ConfigDiff {
             added,
             removed,
             changed,
             unchanged,
+            intercept_changed,
         }
+    }
+
+    /// Sorted `(name, listen_addr, listen_proto, intercept)` projection of the
+    /// intercept-bearing rules, so two configs compare equal iff their firewall
+    /// interception posture is identical (CP-09).
+    fn intercept_projection(cfg: &GatewayConfig) -> Vec<(String, String, Proto, InterceptConfig)> {
+        let mut v: Vec<_> = cfg
+            .rules
+            .iter()
+            .filter_map(|r| {
+                r.intercept.as_ref().map(|ic| {
+                    (
+                        r.name.clone(),
+                        r.listen_addr.clone(),
+                        r.listen_proto,
+                        ic.clone(),
+                    )
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
     }
 }
 
@@ -2046,6 +2185,32 @@ pub struct ConfigDiff {
     pub changed: Vec<RuleConfig>,
     /// Same-name rules with no security-relevant change (leave running).
     pub unchanged: Vec<String>,
+    /// Whether the firewall interception posture (the set of intercept-bearing
+    /// rules and their intercept/listen fields) changed — drives firewall
+    /// reconciliation on hot-reload (CP-09).
+    pub intercept_changed: bool,
+}
+
+impl ConfigDiff {
+    /// One greppable `AUDIT reload …` summary line naming the rules a hot-reload
+    /// added / changed / removed, so a posture-loosening reload leaves a positive
+    /// audit trail (CP-05), not just the per-rule start/stop `info` lines.
+    pub fn format_reload_audit(&self) -> String {
+        let names = |rules: &[RuleConfig]| {
+            rules
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "AUDIT reload added=[{}] changed=[{}] removed=[{}] unchanged={}",
+            names(&self.added),
+            names(&self.changed),
+            self.removed.join(","),
+            self.unchanged.len()
+        )
+    }
 }
 
 /// Best-effort: does this `host:port` upstream point at loopback? Used only to
@@ -2066,6 +2231,34 @@ fn upstream_is_loopback(upstream_addr: &str) -> bool {
     host.parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
+}
+
+/// Whether a decrypt rule's `listen_addr` is a routable (non-loopback) bind, used
+/// to decide whether an unauthenticated-decrypt posture is an error (M-13). A
+/// local UDS/SHM listener (unparseable as `SocketAddr`) is treated as loopback —
+/// its callers are already kernel-authenticated, so it never escalates.
+fn listen_is_non_loopback(listen_addr: &str) -> bool {
+    listen_addr
+        .parse::<std::net::SocketAddr>()
+        .map(|a| !a.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+/// Describe a config/anchor file that is group- or other-writable
+/// (`st_mode & 0o022 != 0`), so a co-located actor cannot silently rewrite the
+/// posture it feeds (CP-06/CP-07). `None` for a correctly-restricted file. Pure
+/// (mode read via `MetadataExt`) so the message is testable.
+pub(crate) fn world_or_group_writable_warning(path: &Path, what: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = std::fs::metadata(path).ok()?.mode();
+    (mode & 0o022 != 0).then(|| {
+        format!(
+            "{what} '{}' is group/other-writable (mode {:o}) — a co-located actor \
+             could rewrite it; restrict it to 0644 or tighter (owner-writable only)",
+            path.display(),
+            mode & 0o7777
+        )
+    })
 }
 
 /// Heuristic for the safety-classification warning: a source pattern that is
@@ -2113,6 +2306,55 @@ pub fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
             u8::from_str_radix(pair, 16).map_err(|e| format!("invalid hex byte '{pair}': {e}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod address_pattern_tests {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    // DP-09: an IPv4-mapped IPv6 peer (dual-stack `[::]` listener) matches an
+    // IPv4 CIDR / IP-only / exact whitelist entry after canonicalization.
+    #[test]
+    fn mapped_v4_peer_matches_v4_patterns() {
+        let cidr = AddressPattern::parse("10.0.0.0/8").unwrap();
+        let ip_only = AddressPattern::parse("10.0.0.5").unwrap();
+        let exact = AddressPattern::parse("10.0.0.5:5000").unwrap();
+
+        let mapped = sa("[::ffff:10.0.0.5]:5000");
+        assert!(cidr.matches(&mapped), "mapped v4 must match v4 CIDR");
+        assert!(ip_only.matches(&mapped), "mapped v4 must match v4 IP-only");
+        assert!(exact.matches(&mapped), "mapped v4 must match v4 exact");
+
+        // A native v4 peer still matches (regression guard).
+        let native = sa("10.0.0.5:5000");
+        assert!(cidr.matches(&native));
+        assert!(ip_only.matches(&native));
+        assert!(exact.matches(&native));
+    }
+
+    // A mapped v4 peer whose address is outside the pattern still does not match.
+    #[test]
+    fn mapped_v4_peer_respects_pattern_bounds() {
+        let cidr = AddressPattern::parse("10.0.0.0/8").unwrap();
+        assert!(!cidr.matches(&sa("[::ffff:192.168.1.1]:1")));
+        let exact = AddressPattern::parse("10.0.0.5:5000").unwrap();
+        // Right IP, wrong port.
+        assert!(!exact.matches(&sa("[::ffff:10.0.0.5]:5001")));
+    }
+
+    // Native IPv6 matching is unaffected, and a v4 peer never matches a v6 pattern.
+    #[test]
+    fn native_v6_and_cross_family_unaffected() {
+        let v6 = AddressPattern::parse("2001:db8::/32").unwrap();
+        assert!(v6.matches(&sa("[2001:db8::1]:443")));
+        assert!(!v6.matches(&sa("[2001:dead::1]:443")));
+        // A genuine v4 peer must not match a v6 whitelist.
+        assert!(!v6.matches(&sa("10.0.0.1:1")));
+    }
 }
 
 #[cfg(test)]
@@ -2352,37 +2594,117 @@ mod dscp_tests {
         assert_eq!(d.added[0].name, "r");
     }
 
+    // CP-09: the diff flags whether the firewall interception posture changed.
+    #[test]
+    fn diff_sets_intercept_changed() {
+        let with_intercept = |mode: &str| -> GatewayConfig {
+            serde_json::from_value(serde_json::json!({
+                "rules": [{
+                    "name": "r",
+                    "direction": "decrypt",
+                    "listen_addr": "0.0.0.0:9443",
+                    "upstream_addr": "auto",
+                    "transparent": true,
+                    "intercept": { "mode": mode, "match_dports": "443" }
+                }]
+            }))
+            .unwrap()
+        };
+        let plain = config_with_rule(serde_json::json!({}));
+        let tp = with_intercept("tproxy");
+
+        // Add an intercept rule (plain → tproxy) and remove it (tproxy → plain).
+        assert!(plain.diff(&tp).intercept_changed, "adding intercept");
+        assert!(tp.diff(&plain).intercept_changed, "removing intercept");
+        // Edit the intercept mode.
+        assert!(
+            tp.diff(&with_intercept("ingress_redirect"))
+                .intercept_changed,
+            "changing intercept mode"
+        );
+        // A non-intercept edit leaves it unchanged.
+        assert!(
+            !plain
+                .diff(&config_with_rule(serde_json::json!({ "sni": "x" })))
+                .intercept_changed,
+            "non-intercept edit must not flag intercept_changed"
+        );
+        // Identical config → no change.
+        assert!(!tp.diff(&with_intercept("tproxy")).intercept_changed);
+    }
+
+    // CP-05: the reload audit line names the added/changed/removed rules.
+    #[test]
+    fn reload_audit_line_lists_rule_names() {
+        let base = config_with_rule(serde_json::json!({}));
+        let empty: GatewayConfig =
+            serde_json::from_value(serde_json::json!({ "rules": [] })).unwrap();
+        let added = empty.diff(&base).format_reload_audit();
+        assert!(added.starts_with("AUDIT reload"), "{added}");
+        assert!(added.contains("added=[r]"), "{added}");
+        assert!(added.contains("removed=[]"), "{added}");
+
+        let removed = base.diff(&empty).format_reload_audit();
+        assert!(removed.contains("removed=[r]"), "{removed}");
+        assert!(removed.contains("added=[]"), "{removed}");
+    }
+
     fn warnings_of(cfg: &GatewayConfig) -> Vec<String> {
         cfg.preflight_check().0
     }
 
+    fn errors_of(cfg: &GatewayConfig) -> Vec<String> {
+        cfg.preflight_check().1
+    }
+
+    // M-13: verify:none to a non-loopback upstream is now a preflight ERROR
+    // (fails --validate) rather than a warning.
     #[test]
-    fn preflight_warns_on_unverified_remote_encrypt() {
-        // encrypt + verify:none + non-loopback upstream → MITM warning.
+    fn preflight_errors_on_unverified_remote_encrypt() {
         let cfg = config_with_rule(serde_json::json!({ "upstream_addr": "backend:443" }));
+        assert!(
+            errors_of(&cfg)
+                .iter()
+                .any(|w| w.contains("without peer verification")),
+            "expected an unverified-upstream ERROR"
+        );
+    }
+
+    // M-13: the opt-in downgrades that error back to a warning.
+    #[test]
+    fn preflight_downgrades_unverified_encrypt_with_opt_in() {
+        let cfg = config_with_rule(serde_json::json!({
+            "upstream_addr": "backend:443",
+        }));
+        let cfg = GatewayConfig {
+            allow_unverified_transport: true,
+            ..cfg
+        };
+        assert!(
+            !errors_of(&cfg)
+                .iter()
+                .any(|w| w.contains("without peer verification")),
+            "opt-in must remove the error"
+        );
         assert!(
             warnings_of(&cfg)
                 .iter()
                 .any(|w| w.contains("without peer verification")),
-            "expected an unverified-upstream warning"
+            "opt-in keeps a warning"
         );
     }
 
     #[test]
     fn preflight_silent_on_loopback_encrypt() {
-        // A loopback upstream is trusted — no MITM warning.
+        // A loopback upstream is trusted — no MITM warning or error.
         let cfg = config_with_rule(serde_json::json!({ "upstream_addr": "127.0.0.1:9000" }));
-        assert!(
-            !warnings_of(&cfg)
-                .iter()
-                .any(|w| w.contains("without peer verification")),
-            "loopback upstream should not warn"
-        );
+        let has = |v: Vec<String>| v.iter().any(|w| w.contains("without peer verification"));
+        assert!(!has(warnings_of(&cfg)) && !has(errors_of(&cfg)));
     }
 
     #[test]
     fn preflight_warns_on_unauthenticated_decrypt() {
-        // decrypt + non-mutual verify → unauthenticated-client warning.
+        // decrypt + non-mutual verify on a LOOPBACK listen → warning (not error).
         let cfg = config_with_rule(serde_json::json!({
             "direction": "decrypt",
             "verify": "server"
@@ -2392,6 +2714,28 @@ mod dscp_tests {
                 .iter()
                 .any(|w| w.contains("does not require client certificates")),
             "expected an unauthenticated-decrypt warning"
+        );
+        assert!(
+            !errors_of(&cfg)
+                .iter()
+                .any(|w| w.contains("does not require client certificates")),
+            "loopback decrypt must not escalate to an error"
+        );
+    }
+
+    // M-13: non-mutual decrypt on a NON-loopback listen is an error.
+    #[test]
+    fn preflight_errors_on_nonloopback_unauthenticated_decrypt() {
+        let cfg = config_with_rule(serde_json::json!({
+            "direction": "decrypt",
+            "listen_addr": "0.0.0.0:8443",
+            "verify": "server"
+        }));
+        assert!(
+            errors_of(&cfg)
+                .iter()
+                .any(|w| w.contains("does not require client certificates")),
+            "expected a non-loopback unauthenticated-decrypt ERROR"
         );
     }
 
@@ -2407,6 +2751,97 @@ mod dscp_tests {
                 .any(|w| w.contains("does not require client certificates")),
             "mutual decrypt should not warn"
         );
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("scg-cfg-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    // CP-06: a group/other-writable config file is flagged.
+    #[test]
+    fn preflight_warns_on_group_writable_config_file() {
+        let dir = tmp_dir("gwritable");
+        let path = dir.join("gw.json");
+        std::fs::write(&path, r#"{"rules":[]}"#).unwrap();
+        chmod(&path, 0o664);
+        let mut cfg: GatewayConfig = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
+        cfg.source_path = Some(path);
+        assert!(warnings_of(&cfg)
+            .iter()
+            .any(|w| w.contains("group/other-writable")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preflight_silent_on_0644_config_file() {
+        let dir = tmp_dir("g644");
+        let path = dir.join("gw.json");
+        std::fs::write(&path, r#"{"rules":[]}"#).unwrap();
+        chmod(&path, 0o644);
+        let mut cfg: GatewayConfig = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
+        cfg.source_path = Some(path);
+        assert!(!warnings_of(&cfg)
+            .iter()
+            .any(|w| w.contains("group/other-writable")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SUN_LEN: an over-long management socket path is a preflight error, so the
+    // operator sees it at --validate rather than as a runtime bind failure.
+    #[test]
+    fn preflight_errors_on_overlong_mgmt_socket_path() {
+        let long_path = format!("/tmp/{}/mgmt.sock", "x".repeat(120));
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [],
+            "api": { "enabled": true, "uds_path": long_path, "runtime_dir": "/run/scg" }
+        }))
+        .unwrap();
+        assert!(errors_of(&cfg)
+            .iter()
+            .any(|e| e.contains("SUN_LEN") && e.contains("uds_path")));
+    }
+
+    #[test]
+    fn preflight_silent_on_short_mgmt_socket_path() {
+        let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "rules": [],
+            "api": { "enabled": true, "uds_path": "/run/scg/mgmt.sock", "runtime_dir": "/run/scg" }
+        }))
+        .unwrap();
+        assert!(!errors_of(&cfg).iter().any(|e| e.contains("SUN_LEN")));
+    }
+
+    // KC-01: a world-readable/writable private key file is flagged in preflight.
+    #[test]
+    fn preflight_warns_on_world_readable_key() {
+        let dir = tmp_dir("keyperm");
+        let key = dir.join("k.pem");
+        let cert = dir.join("c.pem");
+        std::fs::write(&key, b"x").unwrap();
+        std::fs::write(&cert, b"x").unwrap();
+        chmod(&key, 0o644);
+        let cfg = config_with_rule(serde_json::json!({
+            "verify": "server",
+            "upstream_addr": "127.0.0.1:9000",
+            // cert_path/key_path are flattened into provider_params.
+            "cert_path": cert.to_str().unwrap(),
+            "key_path": key.to_str().unwrap(),
+        }));
+        assert!(warnings_of(&cfg)
+            .iter()
+            .any(|w| w.contains("private key") && w.contains("644")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn uds_rule(provider: &str) -> GatewayConfig {

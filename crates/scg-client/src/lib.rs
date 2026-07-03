@@ -243,19 +243,56 @@ impl ScgClient {
     /// only under SHM backpressure); the caller should retry from that index.
     ///
     /// SHM pushes every message then signals the gateway **once** for the whole
-    /// batch. UDS writes each message individually (its stream send already
-    /// blocks until accepted) and always reports the full count on success.
+    /// batch. UDS coalesces the batch into vectored `writev` syscalls (its
+    /// stream send blocks until accepted) and always reports the full count on
+    /// success.
     pub fn try_send_batch(&mut self, traffic_id: u32, msgs: &[&[u8]]) -> Result<usize> {
         match &mut self.inner {
-            Inner::Uds(c) => {
-                for (i, m) in msgs.iter().enumerate() {
-                    if let Err(e) = c.send(traffic_id, m) {
-                        return if i == 0 { Err(e) } else { Ok(i) };
+            Inner::Uds(c) => c.send_batch(traffic_id, msgs),
+            Inner::Shm(c) => c.try_send_batch(traffic_id, msgs),
+        }
+    }
+
+    /// Receive up to `lens.len()` messages in one call: message `i`'s payload
+    /// lands at `out[i*stride..]` (truncated to `stride`) with its length in
+    /// `lens[i]`. Waits up to `timeout` for the first message, then drains
+    /// whatever is already available without further blocking, so one wake can
+    /// service a whole burst. Returns `Ok(None)` on timeout. No per-message
+    /// heap allocation.
+    pub fn recv_batch_into(
+        &mut self,
+        out: &mut [u8],
+        stride: usize,
+        lens: &mut [usize],
+        timeout: Option<Duration>,
+    ) -> Result<Option<usize>> {
+        match &mut self.inner {
+            Inner::Uds(c) => c.recv_batch_into(out, stride, lens, timeout),
+            Inner::Shm(c) => {
+                if stride == 0 || lens.is_empty() || out.len() < stride {
+                    return Ok(None);
+                }
+                let cap = lens.len().min(out.len() / stride);
+                // Block (bounded) for the first message, then drain the ring.
+                let mut count = match c.recv_into(&mut out[..stride], timeout)? {
+                    Some((_tid, len)) => {
+                        lens[0] = len;
+                        1
+                    }
+                    None => return Ok(None),
+                };
+                while count < cap {
+                    let base = count * stride;
+                    match c.try_recv_into(&mut out[base..base + stride])? {
+                        Some((_tid, len)) => {
+                            lens[count] = len;
+                            count += 1;
+                        }
+                        None => break,
                     }
                 }
-                Ok(msgs.len())
+                Ok(Some(count))
             }
-            Inner::Shm(c) => c.try_send_batch(traffic_id, msgs),
         }
     }
 

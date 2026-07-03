@@ -104,6 +104,29 @@ impl RuleContext {
         true
     }
 
+    /// Classify + policy-gate a flow whose destination is still a `target` string
+    /// (e.g. the configured `upstream_addr`). Fails **closed** when the target is
+    /// not a parseable `IP:port` (DP-07): the flow is dropped and an `AUDIT deny`
+    /// line is emitted, rather than silently skipping the default-deny/source
+    /// whitelist gate. Callers must treat `false` as "drop this connection".
+    pub fn classify_and_check_policy_target(
+        &self,
+        src: &std::net::SocketAddr,
+        target: &str,
+    ) -> bool {
+        match target.parse::<std::net::SocketAddr>() {
+            Ok(dst) => self.classify_and_check_policy(src, &dst),
+            Err(_) => {
+                warn!(
+                    "[{}] AUDIT deny op=policy_gate src={src}: upstream target '{target}' \
+                     is not an IP:port; failing closed",
+                    self.rule_name
+                );
+                false
+            }
+        }
+    }
+
     /// Apply this rule's egress QoS (DSCP tag/preservation + SO_PRIORITY) to a
     /// socket. `is_v6` selects the IPv4/IPv6 option family; `sampled_inbound`
     /// is the DSCP read from the ingress side for preservation (pass `None`
@@ -402,4 +425,82 @@ pub fn start_single_rule(
         .ok();
 
     handle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::management::config::GatewayConfig;
+    use std::net::SocketAddr;
+
+    fn ctx_with_policy(policy: Option<Arc<RwLock<PolicyManager>>>) -> RuleContext {
+        let json = r#"{"rules":[{
+            "name":"dp07","direction":"encrypt",
+            "listen_addr":"127.0.0.1:0","listen_proto":"tcp",
+            "upstream_addr":"127.0.0.1:9","upstream_proto":"tcp",
+            "security_provider":"routing"
+        }]}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        let rule = &cfg.rules[0];
+        let perf = rule.perf_knobs(cfg.perf_profile, cfg.sock_buf_size);
+        RuleContext {
+            rule_name: rule.name.clone(),
+            listen_addr: rule.listen_addr.clone(),
+            listen_proto: rule.listen_proto,
+            upstream_addr: rule.upstream_addr.clone(),
+            upstream_proto: rule.upstream_proto,
+            tls_mode: TlsMode::Tls,
+            security_provider: rule.security_provider.clone(),
+            transparent: rule.transparent,
+            sock_buf_size: perf.sock_buf_size,
+            metrics: Arc::new(RuleMetrics::new(&rule.name, "encrypt", "routing")),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            provider_params: rule.provider_params.clone(),
+            traffic_class: rule.traffic_class,
+            qos: rule.qos(),
+            traffic_analyzer: None,
+            policy_manager: policy,
+            simulated_delay_ms: 0,
+            protocol_version: None,
+            app_protocol: "raw".to_string(),
+            perf,
+            conn_pool: Arc::new(ConnectionPool::new(1, "dp07-test")),
+        }
+    }
+
+    // DP-07: an upstream target that is not a parseable IP:port must fail closed
+    // (drop), not silently skip the policy gate. With no policy manager the
+    // delegate path would *allow*, so a `false` here proves the fail-closed branch.
+    #[test]
+    fn unparseable_target_fails_closed() {
+        let ctx = ctx_with_policy(None);
+        let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        assert!(!ctx.classify_and_check_policy_target(&src, "backend.example.com:443"));
+        assert!(!ctx.classify_and_check_policy_target(&src, "not-an-address"));
+    }
+
+    // A parseable target delegates to the normal gate (allow when no policy set).
+    #[test]
+    fn parseable_target_delegates() {
+        let ctx = ctx_with_policy(None);
+        let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        assert!(ctx.classify_and_check_policy_target(&src, "127.0.0.1:9000"));
+    }
+
+    // A parseable target that a default-deny policy rejects is still dropped.
+    #[test]
+    fn parseable_target_denied_by_policy() {
+        let cfg: GatewayConfig = serde_json::from_str(
+            r#"{"rules":[],"policy":{"default_action":"deny","whitelist":[
+                {"source":"10.0.0.1/32","destination":"127.0.0.1:1"}
+            ]}}"#,
+        )
+        .unwrap();
+        let pm = Arc::new(RwLock::new(PolicyManager::new(cfg.policy.as_ref())));
+        let ctx = ctx_with_policy(Some(pm));
+        let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        // Destination not whitelisted → denied; unparseable → also denied.
+        assert!(!ctx.classify_and_check_policy_target(&src, "127.0.0.1:9000"));
+        assert!(!ctx.classify_and_check_policy_target(&src, "backend:443"));
+    }
 }

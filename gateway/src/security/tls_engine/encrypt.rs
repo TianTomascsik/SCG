@@ -5,7 +5,10 @@
 //! - `run_udp_encrypt_relay` -- receive UDP datagrams, tunnel through TLS with framing
 
 use super::params::TlsSecurityParams;
-use super::{build_ktls_connector, build_tls_connector, write_all_nb_proxy, ProxyStream};
+use super::{
+    build_ktls_connector, build_tls_connector, set_handshake_timeouts, write_all_nb_proxy,
+    ProxyStream,
+};
 use crate::networking::connector::{connect_with_retry, sleep_with_shutdown_check};
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
@@ -17,7 +20,7 @@ use crate::security::relay::{
     apply_geo_delay, relay_bidirectional_splice, relay_encrypt_bidirectional,
 };
 use crate::security::udp_framing::UdpFraming;
-use crate::security::{ACCEPT_TIMEOUT, RELAY_BUF_SIZE, UDP_BUF_SIZE};
+use crate::security::{ACCEPT_TIMEOUT, HANDSHAKE_TIMEOUT, RELAY_BUF_SIZE, UDP_BUF_SIZE};
 use ale_pipe::{
     AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_CLASS_D, ALE_PKT_AU1, ALE_PKT_AU2,
 };
@@ -117,11 +120,10 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
             ctx.upstream_addr.clone()
         };
 
-        // Traffic classification + policy check
-        if let Ok(dst_addr) = target.parse::<SocketAddr>() {
-            if !ctx.classify_and_check_policy(&peer_addr, &dst_addr) {
-                continue; // Drop connection — policy denied
-            }
+        // Traffic classification + policy check (fail closed on an unparseable
+        // upstream target — DP-07).
+        if !ctx.classify_and_check_policy_target(&peer_addr, &target) {
+            continue; // Drop connection — policy denied or target unresolvable
         }
 
         let fd = client_stream.as_raw_fd();
@@ -199,6 +201,8 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
 ///
 /// Connects to the upstream with retry, performs TLS/kTLS handshake,
 /// then runs bidirectional relay between the plain client and encrypted upstream.
+// Internal engine entry point; a param struct is a larger refactor than warranted here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_tcp_encrypt(
     rule_name: &str,
     client: TcpStream,
@@ -235,6 +239,11 @@ pub(crate) fn handle_tcp_encrypt(
     // SNI / verification hostname for the upstream connection.
     let sni = params.sni_name(upstream_addr);
 
+    // Bound the blocking handshake window so a black-holed or hijacked upstream
+    // that accepts the TCP connection but stalls the handshake cannot pin this
+    // worker (DoS-01). Cleared once the handshake completes, below.
+    set_handshake_timeouts(&upstream_tcp, Some(HANDSHAKE_TIMEOUT))?;
+
     // Establish TLS on the upstream connection
     let hs_start = Instant::now();
     // True only when kTLS actually activates (ULP=tls) on the connect arm below.
@@ -252,6 +261,8 @@ pub(crate) fn handle_tcp_encrypt(
                 rule_name,
                 hs_start.elapsed().as_secs_f64() * 1000.0
             );
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(ssl_stream.get_ref(), None)?;
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
@@ -292,6 +303,8 @@ pub(crate) fn handle_tcp_encrypt(
                 );
             }
 
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(&upstream_tcp, None)?;
             ProxyStream::Ktls {
                 session,
                 _stream: upstream_tcp,
@@ -478,6 +491,10 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                     .unwrap_or(false);
                 ctx.apply_egress_qos(upstream_tcp.as_raw_fd(), up_is_v6, None);
 
+                // Bound the handshake window so a stalled upstream cannot wedge
+                // this rule thread (DoS-01); best-effort, cleared on success below.
+                let _ = set_handshake_timeouts(&upstream_tcp, Some(HANDSHAKE_TIMEOUT));
+
                 let hs_start = Instant::now();
                 let stream = match ctx.tls_mode {
                     TlsMode::Tls => {
@@ -504,6 +521,8 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                                     ctx.rule_name,
                                     hs_start.elapsed().as_secs_f64() * 1000.0
                                 );
+                                // Restore blocking I/O for the relay phase.
+                                let _ = set_handshake_timeouts(s.get_ref(), None);
                                 ProxyStream::Tls(s)
                             }
                             Err(e) => {
@@ -597,6 +616,8 @@ pub(crate) fn run_udp_encrypt_relay(ctx: &RuleContext) {
                             ctx.rule_name,
                             hs_start.elapsed().as_secs_f64() * 1000.0
                         );
+                        // Restore blocking I/O for the relay phase.
+                        let _ = set_handshake_timeouts(&upstream_tcp, None);
                         ProxyStream::Ktls {
                             session,
                             _stream: upstream_tcp,

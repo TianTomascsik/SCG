@@ -87,11 +87,10 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
             ctx.upstream_addr.clone()
         };
 
-        // Traffic classification + policy check.
-        if let Ok(dst_addr) = target.parse::<SocketAddr>() {
-            if !ctx.classify_and_check_policy(&peer_addr, &dst_addr) {
-                continue; // Drop connection — policy denied
-            }
+        // Traffic classification + policy check (fail closed on an unparseable
+        // target — DP-07).
+        if !ctx.classify_and_check_policy_target(&peer_addr, &target) {
+            continue; // Drop connection — policy denied or target unresolvable
         }
 
         let fd = client_stream.as_raw_fd();
@@ -156,6 +155,8 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
 }
 
 /// Handle a single plaintext TCP → TCP passthrough connection.
+// Internal engine entry point; a param struct is a larger refactor than warranted here.
+#[allow(clippy::too_many_arguments)]
 fn handle_tcp_routing(
     _rule_name: &str,
     client: TcpStream,

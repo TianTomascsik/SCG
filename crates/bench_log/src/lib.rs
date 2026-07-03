@@ -28,8 +28,8 @@ pub struct LatencyStats {
 }
 
 /// Compute comprehensive latency statistics from nanosecond samples.
-/// The input vector is sorted in-place.  Returns `None` if empty.
-pub fn compute_latency_stats(samples: &mut Vec<u64>) -> Option<LatencyStats> {
+/// The input slice is sorted in-place.  Returns `None` if empty.
+pub fn compute_latency_stats(samples: &mut [u64]) -> Option<LatencyStats> {
     if samples.is_empty() {
         return None;
     }

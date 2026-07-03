@@ -1,7 +1,7 @@
 //! Decrypt direction: accept TLS/kTLS connections and relay to plain TCP/UDP upstream.
 
 use super::params::TlsSecurityParams;
-use super::{build_ktls_acceptor, build_tls_acceptor, ProxyStream};
+use super::{build_ktls_acceptor, build_tls_acceptor, set_handshake_timeouts, ProxyStream};
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, apply_safety_priority, apply_tcp_latency_opts,
@@ -10,7 +10,7 @@ use crate::networking::socket_manager::{
 use crate::processing::RuleContext;
 use crate::security::relay::{relay_bidirectional, relay_bidirectional_splice, relay_tls_to_udp};
 use crate::security::udp_framing::UdpFraming;
-use crate::security::ACCEPT_TIMEOUT;
+use crate::security::{ACCEPT_TIMEOUT, HANDSHAKE_TIMEOUT};
 use ale_pipe::{AleAu1Info, AleAu2Info, AleFrameReader, AleFrameWriter, ALE_PKT_AU1, ALE_PKT_AU2};
 
 use crate::interfaces::tproxy;
@@ -113,11 +113,10 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
             ctx.upstream_addr.clone()
         };
 
-        // Traffic classification + policy check
-        if let Ok(dst_addr) = resolved_upstream.parse::<SocketAddr>() {
-            if !ctx.classify_and_check_policy(&peer_addr, &dst_addr) {
-                continue; // Drop connection — policy denied
-            }
+        // Traffic classification + policy check (fail closed on an unparseable
+        // upstream target — DP-07).
+        if !ctx.classify_and_check_policy_target(&peer_addr, &resolved_upstream) {
+            continue; // Drop connection — policy denied or target unresolvable
         }
 
         ctx.metrics.connection_opened();
@@ -192,6 +191,8 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
 /// Performs the TLS/kTLS handshake on the accepted stream, connects to the
 /// plain upstream (TCP or UDP), and runs the bidirectional relay until one
 /// side closes or the shutdown flag is set.
+// Internal engine entry point; a param struct is a larger refactor than warranted here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_tcp_decrypt(
     rule_name: &str,
     stream: TcpStream,
@@ -211,6 +212,12 @@ pub(crate) fn handle_tcp_decrypt(
     // ── TLS handshake ────────────────────────────────────────────────────────
     let hs_start = Instant::now();
     let fd = stream.as_raw_fd();
+
+    // Bound the blocking handshake window so an unauthenticated peer that opens
+    // the TCP connection but stalls the ClientHello cannot pin this Normal-pool
+    // worker indefinitely (DoS-01). Cleared once the handshake completes, below,
+    // so the relay phase runs with the pre-existing (blocking) semantics.
+    set_handshake_timeouts(&stream, Some(HANDSHAKE_TIMEOUT))?;
 
     // True only when kTLS actually activates (ULP=tls) on the accept arm below.
     // The splice relay MUST gate on this, not on `tls_mode` — see TRA #56.
@@ -233,6 +240,8 @@ pub(crate) fn handle_tcp_decrypt(
                 hs_start.elapsed().as_secs_f64() * 1000.0,
                 resumed,
             );
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(ssl_stream.get_ref(), None)?;
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
@@ -274,6 +283,8 @@ pub(crate) fn handle_tcp_decrypt(
                 );
             }
 
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(&stream, None)?;
             ProxyStream::Ktls {
                 session,
                 _stream: stream,

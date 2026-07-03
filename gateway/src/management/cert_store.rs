@@ -46,6 +46,24 @@ pub fn get_or_init_cert() -> Result<&'static CachedCert, openssl::error::ErrorSt
 
 // ─── PEM identity loading ────────────────────────────────────────────────────
 
+/// Describe an over-permissive **private key** file mode (KC-01).
+///
+/// Returns a warning string when the key is readable or writable by group/other
+/// (`st_mode & 0o077 != 0`), so a mode-0644 operator key does not load silently
+/// readable by a co-located process. Returns `None` for a correctly-restricted
+/// key (e.g. `0600`, mirroring the WireGuard key-dir discipline). Never includes
+/// the key contents — only the path and the permission bits. Pure for testing.
+pub(crate) fn key_perm_warning(path: &Path, mode: u32) -> Option<String> {
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "private key '{}' is readable/writable by group/other (mode {:o}); \
+             restrict it to 0600",
+            path.display(),
+            mode & 0o7777
+        )
+    })
+}
+
 /// Load a PEM identity (certificate + private key) from disk.
 ///
 /// The certificate file may contain a single leaf certificate (additional
@@ -55,6 +73,16 @@ pub fn load_identity_pem(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(PKey<Private>, X509), String> {
+    // KC-01: warn (never fail) on an over-permissive key file, mirroring the
+    // WireGuard 0600 discipline. Externally-provisioned keys must not brick
+    // startup, so this is advisory only.
+    if let Ok(md) = std::fs::metadata(key_path) {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(w) = key_perm_warning(key_path, md.mode()) {
+            log::warn!("{w}");
+        }
+    }
+
     let cert_pem = std::fs::read(cert_path)
         .map_err(|e| format!("failed to read cert_path '{}': {}", cert_path.display(), e))?;
     let key_pem = std::fs::read(key_path)
@@ -93,4 +121,27 @@ pub fn generate_self_signed_ecdsa(
     builder.sign(&pkey, MessageDigest::sha256())?;
 
     Ok((pkey, builder.build()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // KC-01: flag a group/other-readable or -writable key file; stay silent on 0600.
+    #[test]
+    fn key_perm_warning_flags_over_permissive_modes() {
+        let p = Path::new("/tmp/k.pem");
+        assert!(key_perm_warning(p, 0o100644).is_some(), "0644 must warn");
+        assert!(key_perm_warning(p, 0o100640).is_some(), "0640 must warn");
+        assert!(key_perm_warning(p, 0o100604).is_some(), "0604 must warn");
+        let w = key_perm_warning(p, 0o100644).unwrap();
+        assert!(w.contains("private key"), "{w}");
+        assert!(w.contains("644"), "{w}");
+    }
+
+    #[test]
+    fn key_perm_warning_silent_on_0600() {
+        assert!(key_perm_warning(Path::new("/tmp/k.pem"), 0o100600).is_none());
+        assert!(key_perm_warning(Path::new("/tmp/k.pem"), 0o100400).is_none());
+    }
 }

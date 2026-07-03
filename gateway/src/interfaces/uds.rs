@@ -8,11 +8,12 @@
 
 use crate::interfaces::endpoint::{
     accept_plain_upstream, accept_tls_upstream, authenticate_peer, connect_plain_upstream,
-    connect_tls_upstream, relay_uds_tls,
+    connect_tls_upstream, relay_uds_tls, EndpointPolicy,
 };
 use crate::management::config::{Direction, PerfKnobs, QosPolicy, TlsMode};
 use crate::management::telemetry::ConnectionMetrics;
 use crate::networking::socket_manager::apply_safety_priority;
+use crate::processing::policy::PolicyManager;
 
 use scg_ipc::os::{self, PeerCred};
 use scg_ipc::token::CapabilityToken;
@@ -24,7 +25,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// Everything a UDS endpoint thread needs to authenticate clients and relay.
@@ -63,6 +64,9 @@ pub struct UdsEndpointTask {
     pub owner_uid: u32,
     /// Single-use capability token; consumed on the first valid HELLO.
     pub token: Arc<Mutex<Option<CapabilityToken>>>,
+    /// Shared policy manager for the second gate on the network leg (DP-08).
+    /// `None` disables the gate (used by tests / policy-less deployments).
+    pub policy: Option<Arc<RwLock<PolicyManager>>>,
     /// Per-endpoint shutdown flag (set by the manager on close/shutdown).
     pub shutdown: Arc<AtomicBool>,
 }
@@ -184,6 +188,14 @@ fn authenticate(stream: &UnixStream, task: &UdsEndpointTask) -> Result<PeerCred,
 /// Establish the TLS upstream (dial for encrypt, accept for decrypt) and run the
 /// bidirectional relay for one client.
 fn serve(task: &UdsEndpointTask, stream: UnixStream) {
+    // Second gate (DP-08): a shared, hot-reloadable policy handle, applied on the
+    // network leg (destination for encrypt, network peer for decrypt).
+    let endpoint_policy = task.policy.as_ref().map(|p| EndpointPolicy {
+        policy: p.clone(),
+        traffic_class: task.qos.traffic_class,
+    });
+    let policy = endpoint_policy.as_ref();
+
     // Routing endpoints relay plaintext (no TLS) on the upstream leg, exactly
     // like the TCP routing provider (TRA #58); the local-caller auth already
     // passed above. TLS/kTLS endpoints take the encrypted path unchanged.
@@ -193,6 +205,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
             &task.upstream_addr,
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
         (true, Direction::Decrypt) => accept_plain_upstream(
@@ -200,6 +213,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
             &task.upstream_addr,
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
         (false, Direction::Encrypt) => connect_tls_upstream(
@@ -210,6 +224,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
             task.protocol_version.as_deref(),
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
         (false, Direction::Decrypt) => accept_tls_upstream(
@@ -220,6 +235,7 @@ fn serve(task: &UdsEndpointTask, stream: UnixStream) {
             task.protocol_version.as_deref(),
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
     };

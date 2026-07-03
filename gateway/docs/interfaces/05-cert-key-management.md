@@ -72,6 +72,31 @@ on a missing/invalid file — without the rotation/epoch semantics the traits ad
 See the per-profile runnable configs in
 [examples/configs/](../../examples/configs/).
 
+## Authenticated upstream identity (TB2)
+
+When the gateway connects to an upstream (the encrypt/connector leg), the
+**identity that is cryptographically authenticated is the SNI / verification
+name** — `server_name` if set, otherwise the host part of `upstream_addr`,
+resolved by
+[`TlsSecurityParams::sni_name`](../../src/security/tls_engine/params.rs). Under
+`verify = server`/`mutual` the connector checks the upstream certificate chain
+against `ca_path` **and** matches this name against the certificate (SAN/CN).
+
+It is deliberately **not**:
+
+- the raw socket connect target (an IP, or for `transparent`/`"auto"` rules the
+  `SO_ORIGINAL_DST` address recovered from the kernel); nor
+- the policy-whitelist `destination` (`policy.whitelist[].destination`), which is
+  an **unauthenticated routing filter** applied before/independent of the
+  handshake, not a cryptographic identity.
+
+Operators pinning an upstream identity should therefore set `server_name`
+(matching a SAN on the upstream certificate) together with `verify` + `ca_path`,
+rather than relying on the connect target or the policy destination. The
+key/certificate material never leaks: private keys are masked in `Debug`
+(`TlsSecurityParams`), compared/loaded fail-closed, and PSK bytes are zeroized on
+drop.
+
 ## Traits
 
 ```rust

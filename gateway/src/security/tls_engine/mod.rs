@@ -229,6 +229,21 @@ fn build_connector(
     Ok(builder.build())
 }
 
+/// Bound (or clear) the blocking window of a TLS/kTLS handshake on `stream`
+/// (DoS-01). Pass `Some(timeout)` before `accept()`/`connect()` so a peer that
+/// opens the TCP connection but stalls the handshake cannot pin the worker (or
+/// rule thread) indefinitely; pass `None` afterwards to restore blocking I/O for
+/// the relay phase. Both the read and write directions are bounded — a zero-window
+/// peer can otherwise stall the server/client flight on the write side.
+pub(crate) fn set_handshake_timeouts(
+    stream: &TcpStream,
+    timeout: Option<Duration>,
+) -> io::Result<()> {
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    Ok(())
+}
+
 // ─── Builder helpers ─────────────────────────────────────────────────────────
 
 /// Load the file-based identity if configured, otherwise the cached self-signed
@@ -551,10 +566,138 @@ pub fn write_nb_proxy_timed(
 
 #[cfg(test)]
 mod tests {
-    use super::ProxyStream;
+    use super::{
+        build_ktls_acceptor, build_ktls_connector, build_tls_acceptor, build_tls_connector,
+        set_handshake_timeouts, ProxyStream,
+    };
+    use crate::security::tls_engine::params::TlsSecurityParams;
+    use openssl::ssl::SslVerifyMode;
+    use serde_json::json;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn params_from(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    // DP-01: the kTLS connector used by the UDS/SHM local-interface path must
+    // apply the rule's verify mode, exactly like the userspace connector — the
+    // former bench builder hardcoded SslVerifyMode::NONE.
+    #[test]
+    fn ktls_connector_applies_verify_mode() {
+        let server =
+            TlsSecurityParams::from_params(&params_from(&[("verify", json!("server"))]), None)
+                .unwrap();
+        let c = build_ktls_connector(&server).unwrap();
+        assert_eq!(c.context().verify_mode(), SslVerifyMode::PEER);
+
+        let none = TlsSecurityParams::from_params(&params_from(&[("verify", json!("none"))]), None)
+            .unwrap();
+        let ck = build_ktls_connector(&none).unwrap();
+        let cu = build_tls_connector(&none).unwrap();
+        assert_eq!(ck.context().verify_mode(), SslVerifyMode::NONE);
+        // kTLS and userspace connectors must agree on the verify wiring.
+        assert_eq!(ck.context().verify_mode(), cu.context().verify_mode());
+    }
+
+    // DP-01/KC-05: a `verify=mutual` kTLS acceptor must demand a client cert
+    // (PEER | FAIL_IF_NO_PEER_CERT), not accept any client.
+    #[test]
+    fn ktls_acceptor_mutual_requires_client_cert() {
+        let mutual =
+            TlsSecurityParams::from_params(&params_from(&[("verify", json!("mutual"))]), None)
+                .unwrap();
+        let a = build_ktls_acceptor(&mutual).unwrap();
+        assert_eq!(
+            a.context().verify_mode(),
+            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+        );
+
+        let none = TlsSecurityParams::from_params(&params_from(&[("verify", json!("none"))]), None)
+            .unwrap();
+        let a = build_ktls_acceptor(&none).unwrap();
+        assert_eq!(a.context().verify_mode(), SslVerifyMode::NONE);
+    }
+
+    // DoS-01: the handshake-timeout helper sets both directions and clears them.
+    #[test]
+    fn handshake_timeouts_set_and_cleared() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let t = Duration::from_secs(5);
+        set_handshake_timeouts(&server, Some(t)).unwrap();
+        assert_eq!(server.read_timeout().unwrap(), Some(t));
+        assert_eq!(server.write_timeout().unwrap(), Some(t));
+
+        set_handshake_timeouts(&server, None).unwrap();
+        assert_eq!(server.read_timeout().unwrap(), None);
+        assert_eq!(server.write_timeout().unwrap(), None);
+    }
+
+    // DoS-01: a stalled client cannot pin a decrypt worker — with SO_RCVTIMEO the
+    // blocking TLS accept aborts instead of blocking forever. Uses a short timeout
+    // so the test is fast; production uses `HANDSHAKE_TIMEOUT` (5 s).
+    #[test]
+    fn stalled_client_handshake_aborts_within_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Client connects and then sends nothing (stalls the ClientHello).
+        let _client = TcpStream::connect(addr).unwrap();
+
+        let (server, _) = listener.accept().unwrap();
+        let params =
+            TlsSecurityParams::from_params(&params_from(&[("verify", json!("none"))]), None)
+                .unwrap();
+        let acceptor = build_tls_acceptor(&params).unwrap();
+        set_handshake_timeouts(&server, Some(Duration::from_millis(300))).unwrap();
+
+        let start = Instant::now();
+        let result = acceptor.accept(server);
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "stalled handshake must abort, not hang");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "handshake should abort near the timeout, took {elapsed:?}"
+        );
+    }
+
+    // DoS-01 (connect side): a fake upstream that accepts TCP but never speaks TLS
+    // must not pin the connector past the handshake timeout.
+    #[test]
+    fn stalled_upstream_handshake_aborts_within_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the TCP connection but never respond to the TLS handshake.
+        let _srv = thread::spawn(move || {
+            let (_s, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        set_handshake_timeouts(&stream, Some(Duration::from_millis(300))).unwrap();
+        let params =
+            TlsSecurityParams::from_params(&params_from(&[("verify", json!("none"))]), None)
+                .unwrap();
+        let connector = build_tls_connector(&params).unwrap();
+
+        let start = Instant::now();
+        let result = connector.connect("localhost", stream);
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "stalled upstream handshake must abort");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "connect should abort near the timeout, took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn plain_proxy_stream_round_trips_plaintext() {

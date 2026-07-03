@@ -30,9 +30,12 @@
 //! region is sealed read-only for the client so a malicious client cannot
 //! corrupt the gateway's in-flight writes — but the consumer must *write* `seq`
 //! to release a slot. We therefore keep the `seq` array in the **control page**
-//! (mapped read/write by both sides and validated/clamped by the gateway) and
-//! keep only `[len][traffic_id][payload]` in the sealable data segment. The
-//! consumer thus writes nothing into the producer's payload region.
+//! (mapped read/write by both sides) and keep only `[len][traffic_id][payload]`
+//! in the sealable data segment. The consumer thus writes nothing into the
+//! producer's payload region. Because the peer owns `seq`, the producer validates
+//! it against its valid window on every push (free or one-lap-back full) and
+//! returns [`ShmError::RingCorrupt`] otherwise, rather than trusting a hostile
+//! value that would wedge it on a false Full (DP-11).
 //!
 //! The structure is single-producer / single-consumer today; the `seq`
 //! protocol is the standard MPMC one, so it can be relaxed to MPSC later
@@ -159,6 +162,7 @@ pub struct SlotProducer {
     hdr: *const SlotRingHeader,
     seq: *const AtomicU64,
     data: *mut u8,
+    capacity: u64,
     mask: u64,
     segment_size: usize,
 }
@@ -211,6 +215,7 @@ impl SlotProducer {
             hdr,
             seq,
             data,
+            capacity: capacity as u64,
             mask: (capacity - 1) as u64,
             segment_size,
         }
@@ -251,10 +256,17 @@ impl SlotProducer {
         let pos = hdr.write_pos.load(Ordering::Relaxed);
         let idx = (pos & self.mask) as usize;
         let seq = self.seq_at(idx).load(Ordering::Acquire);
-        // diff == 0 → slot free; diff < 0 → consumer hasn't released it yet.
+        // The consumer (a possibly-hostile peer) owns `seq` on the shared control
+        // page, so validate it against the only two states legal at this producer
+        // position (DP-11): `seq == pos` (slot free) or `seq == pos + 1 - capacity`
+        // (occupied one lap back → genuinely full). Any other value means the peer
+        // corrupted the ring; report it so the endpoint tears down instead of
+        // spinning on a perpetual (false) Full.
         let diff = seq.wrapping_sub(pos) as i64;
-        if diff != 0 {
-            return Ok(PushOutcome::Full);
+        match diff {
+            0 => {} // slot free — proceed
+            d if d == 1 - self.capacity as i64 => return Ok(PushOutcome::Full),
+            _ => return Err(ShmError::RingCorrupt),
         }
 
         // Was the ring empty before this push? (consumer has caught up)
@@ -759,6 +771,33 @@ mod tests {
         ));
         // Both slots occupied.
         assert_eq!(producer.try_push(3, &[3u8; 16]).unwrap(), PushOutcome::Full);
+    }
+
+    // DP-11: a hostile consumer that writes a `seq` outside the {free, full}
+    // window must yield RingCorrupt (so the endpoint tears down) rather than a
+    // false Full (which would wedge the producer forever).
+    #[test]
+    fn corrupt_seq_yields_ring_corrupt_not_full() {
+        let (control, _d, producer, _consumer) = make(8, segment_size_for(64));
+        // Next write position is 0 (slot 0). Legal seq at pos 0 is 0 (free) or
+        // 1 - capacity (full). Inject a value in neither state.
+        let seq0 = unsafe { control.ptr.add(SLOT_HEADER_SIZE) } as *const AtomicU64;
+        // SAFETY: `seq0` points at the first seq entry of the live control page.
+        unsafe { (*seq0).store(7, Ordering::Release) };
+        assert_eq!(producer.try_push(1, b"x"), Err(ShmError::RingCorrupt));
+
+        // A wildly large seq is corrupt too (would otherwise read as diff != 0).
+        // SAFETY: same live control-page entry.
+        unsafe { (*seq0).store(u64::MAX, Ordering::Release) };
+        assert_eq!(producer.try_push(1, b"x"), Err(ShmError::RingCorrupt));
+
+        // Restoring the legal "free" value (== pos) lets the push proceed again.
+        // SAFETY: same live control-page entry.
+        unsafe { (*seq0).store(0, Ordering::Release) };
+        assert!(matches!(
+            producer.try_push(1, b"x").unwrap(),
+            PushOutcome::Pushed { .. }
+        ));
     }
 
     #[test]

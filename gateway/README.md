@@ -198,12 +198,18 @@ use. Keys are never logged or `Debug`-printed.
 mode in `provider_params`: `none` (legacy, no verification), `server` (verify the
 upstream certificate against `ca_path`), or `mutual` (mTLS — both sides present
 X.509). The `default` and `subset146-psk` profiles require `verify` to be set
-explicitly (fail-secure); `subset146-pki` implies `mutual`. `--validate` and
-startup emit a **warning** when an encrypt rule contacts a non-loopback upstream
-with `verify: none` (MITM exposure) or a decrypt listener uses a non-`mutual`
-mode (it relays traffic from unauthenticated clients). Prefer `verify: server`
-(or `mutual`) with a `ca_path` for remote upstreams — see the
-`web-encrypt-tls-verified` rule in `gateway.example.json`. `ktls` rules keep the
+explicitly (fail-secure); `subset146-pki` implies `mutual`. An encrypt rule that
+contacts a **non-loopback** upstream with `verify: none` (MITM exposure), or a
+decrypt listener on a **non-loopback** bind that uses a non-`mutual` mode (it
+relays traffic from unauthenticated clients), is a **preflight error** — it fails
+`--validate` and is logged loudly at startup. Set `verify: server` (or `mutual`)
+with a `ca_path` for remote upstreams (see the `web-encrypt-tls-verified` rule in
+`gateway.example.json`), or, to deliberately accept an unverified posture, set the
+top-level `"allow_unverified_transport": true` opt-in, which downgrades these
+errors back to warnings. Loopback and local UDS/SHM endpoints stay warnings
+regardless. See *Authenticated upstream identity (TB2)* in
+[docs/interfaces/05-cert-key-management.md](docs/interfaces/05-cert-key-management.md)
+for which name is actually authenticated. `ktls` rules keep the
 zero-copy kernel offload **even with `verify: server`/`mutual`**: verification
 runs on the kTLS context exactly as on the userspace path and completes during
 the handshake before kTLS activates, so the secure path is also the fast path.
@@ -360,6 +366,25 @@ The `RUST_LOG` environment variable is also supported for fine-grained per-modul
 ```bash
 RUST_LOG=gateway::security=trace gateway --config gateway.json
 ```
+
+### Data minimization & retention
+
+The gateway sits on a signaling chokepoint, so its logs are themselves a
+privacy/linkability surface (a train-movement metadata source). Operate them
+accordingly (KC-07):
+
+- **ETCS identifiers** (`calling`/`called` ETCS-IDs) are emitted **only at
+  `debug`** and must stay debug-only; do not raise the ALE provider to `debug` in
+  production unless you accept logging railway signaling identifiers.
+- **`AUDIT` lines** carry caller `uid`/`pid`/`app_id` and peer addresses (endpoint
+  create/close/deny and reload deltas). Treat them as operational,
+  personal-adjacent data: rotate and retain per site policy (a ≤90-day default is
+  a reasonable starting point), and restrict who may read them.
+- **Secrets are never logged**: private keys, PSKs and capability tokens are
+  masked in `Debug` (`***`) and zeroized on drop; the management-API version
+  string is disclosed only to peer-authenticated (UDS) callers, not over the
+  optional TCP bind.
+- Consider hashing/truncating any identifiers you persist to long-term storage.
 
 ## Provider Architecture
 

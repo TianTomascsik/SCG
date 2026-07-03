@@ -3,15 +3,14 @@
 //! Exercises the verify/identity wiring added in WP1 end-to-end against a real
 //! CA-issued certificate chain (see [`common::pki::TestPki`]):
 //!
-//!   * `server_verify_round_trip`        — gateway verifies a trusted upstream.
-//!   * `server_verify_wrong_ca_fails`    — gateway rejects an untrusted upstream.
-//!   * `mutual_tls_round_trip`           — gateway presents a client cert (mTLS).
-//!   * `mutual_tls_missing_client_cert_fails` — upstream rejects a gateway with
-//!                                         no client cert.
-//!   * `https_frontend_terminate_to_plain_backend` — a raw TLS client speaks
-//!                                         HTTPS to the gateway, which decrypts
-//!                                         and relays plaintext to a plain
-//!                                         backend (TLS termination).
+//! * `server_verify_round_trip` — gateway verifies a trusted upstream.
+//! * `server_verify_wrong_ca_fails` — gateway rejects an untrusted upstream.
+//! * `mutual_tls_round_trip` — gateway presents a client cert (mTLS).
+//! * `mutual_tls_missing_client_cert_fails` — upstream rejects a gateway with no
+//!   client cert.
+//! * `https_frontend_terminate_to_plain_backend` — a raw TLS client speaks HTTPS
+//!   to the gateway, which decrypts and relays plaintext to a plain backend (TLS
+//!   termination).
 //!
 //! All tests run unprivileged on loopback.
 

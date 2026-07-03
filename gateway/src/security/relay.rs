@@ -103,6 +103,9 @@ fn round_page(bytes: usize) -> usize {
 
 /// Bidirectional relay between a TLS ProxyStream and a plain TcpStream.
 /// Uses poll()-based I/O for full-duplex forwarding in a single thread.
+// Internal relay entry point; the parameter list mirrors the per-connection
+// tuning surface and a param struct is a larger refactor than warranted here.
+#[allow(clippy::too_many_arguments)]
 pub fn relay_bidirectional(
     tls_stream: &mut ProxyStream,
     mut upstream: TcpStream,
@@ -298,6 +301,8 @@ pub fn relay_tls_to_udp(
 }
 
 /// Bidirectional relay for encrypt direction: client (plain TCP) <-> upstream (TLS).
+// Internal relay entry point; a param struct is a larger refactor than warranted here.
+#[allow(clippy::too_many_arguments)]
 pub fn relay_encrypt_bidirectional(
     client: TcpStream,
     upstream: &mut ProxyStream,
@@ -536,6 +541,8 @@ fn splice_one_direction(
 /// - Loop-drain each direction until WouldBlock before polling again
 /// - Separate WouldBlock from EOF to avoid unnecessary recv(MSG_PEEK)
 /// - 16 MiB pipe buffers for fewer splice calls per data volume
+// Internal relay entry point; a param struct is a larger refactor than warranted here.
+#[allow(clippy::too_many_arguments)]
 pub fn relay_bidirectional_splice(
     tls_fd: RawFd,
     upstream_fd: RawFd,

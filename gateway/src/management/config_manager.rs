@@ -94,6 +94,21 @@ impl SharedConfig {
         let old_config = self.read();
         let diff = old_config.diff(&new_config);
 
+        // Advisory-only (M-6/CP-08): surface preflight findings *introduced by
+        // this reload*. Diffing against the pre-reload advisories suppresses
+        // steady-state noise and false positives from live-system probes — e.g.
+        // the port-conflict check binds each running rule's port, so without the
+        // diff every reload would spam "port in use". A loosening reload is thus
+        // recorded, but the reload itself is never blocked.
+        let (old_w, old_e) = old_config.preflight_check();
+        let (new_w, new_e) = new_config.preflight_check();
+        for w in new_advisories(&old_w, &new_w) {
+            warn!("[reload advisory] {w}");
+        }
+        for e in new_advisories(&old_e, &new_e) {
+            error!("[reload advisory (error-severity)] {e}");
+        }
+
         // Update stored mtime
         if let Ok(mtime) = fs::metadata(&self.config_path).and_then(|m| m.modified()) {
             *self
@@ -107,6 +122,12 @@ impl SharedConfig {
 
         Ok(diff)
     }
+}
+
+/// Advisories present in `new` but not in `old` (order-preserving set difference).
+/// Used to log only the preflight findings a reload newly introduces (CP-08).
+fn new_advisories(old: &[String], new: &[String]) -> Vec<String> {
+    new.iter().filter(|w| !old.contains(w)).cloned().collect()
 }
 
 /// Spawn a background thread that watches for config changes via file mtime
@@ -187,4 +208,28 @@ where
             }
         })
         .expect("Failed to spawn config watcher thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_advisories;
+
+    // CP-08: only advisories the reload *introduces* are reported.
+    #[test]
+    fn new_advisories_reports_only_introduced() {
+        let old = vec!["a".to_string(), "b".to_string()];
+        let new = vec!["b".to_string(), "c".to_string(), "d".to_string()];
+        assert_eq!(
+            new_advisories(&old, &new),
+            vec!["c".to_string(), "d".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_advisories_empty_when_unchanged() {
+        let same = vec!["x".to_string(), "y".to_string()];
+        assert!(new_advisories(&same, &same).is_empty());
+        // A reload that *removes* an advisory introduces nothing new.
+        assert!(new_advisories(&same, &["x".to_string()]).is_empty());
+    }
 }

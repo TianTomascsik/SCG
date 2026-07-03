@@ -26,10 +26,11 @@
 
 use crate::interfaces::endpoint::{
     accept_plain_upstream, accept_tls_upstream, authenticate_peer, connect_plain_upstream,
-    connect_tls_upstream,
+    connect_tls_upstream, EndpointPolicy,
 };
 use crate::management::config::{Direction, QosPolicy, ShmNotify, ShmRingKind, TlsMode};
 use crate::networking::socket_manager::{apply_safety_priority, set_nodelay, set_nonblocking_fd};
+use crate::processing::policy::PolicyManager;
 use crate::security::tls_engine::{write_all_nb_proxy, ProxyStream};
 use crate::security::RELAY_BUF_SIZE;
 
@@ -58,7 +59,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// Everything a SHM endpoint thread needs to authenticate a client, hand it the
@@ -110,6 +111,9 @@ pub struct ShmEndpointTask {
     pub owner_uid: u32,
     /// Single-use capability token; consumed on the first valid HELLO.
     pub token: Arc<Mutex<Option<CapabilityToken>>>,
+    /// Shared policy manager for the second gate on the network leg (DP-08).
+    /// `None` disables the gate (used by tests / policy-less deployments).
+    pub policy: Option<Arc<RwLock<PolicyManager>>>,
     /// Per-endpoint shutdown flag (set by the manager on close/shutdown).
     pub shutdown: Arc<AtomicBool>,
 }
@@ -269,6 +273,13 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
         task.label
     );
 
+    // Second gate (DP-08): shared, hot-reloadable policy on the network leg.
+    let endpoint_policy = task.policy.as_ref().map(|p| EndpointPolicy {
+        policy: p.clone(),
+        traffic_class: task.qos.traffic_class,
+    });
+    let policy = endpoint_policy.as_ref();
+
     // Routing endpoints relay plaintext (no TLS) on the upstream leg, like the
     // TCP routing provider (TRA #58); local-caller auth already passed above.
     let tls = match (task.routing, task.direction) {
@@ -277,6 +288,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
             &task.upstream_addr,
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
         (true, Direction::Decrypt) => accept_plain_upstream(
@@ -284,6 +296,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
             &task.upstream_addr,
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
         (false, Direction::Encrypt) => connect_tls_upstream(
@@ -294,6 +307,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
             task.protocol_version.as_deref(),
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
         (false, Direction::Decrypt) => accept_tls_upstream(
@@ -304,6 +318,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
             task.protocol_version.as_deref(),
             task.sock_buf_size,
             task.qos,
+            policy,
             &task.shutdown,
         ),
     };
@@ -461,6 +476,11 @@ fn relay(
 /// success path therefore does **not** signal; the caller signals once after the
 /// batch. A *full* ring is the exception: the producer cannot make progress until
 /// the client drains, so it nudges the client there before backing off.
+/// Push one frame into the gateway→client ring, blocking (with backoff) while it
+/// is legitimately full. A [`ShmError::RingCorrupt`] from the producer — the peer
+/// moved the control-page `read_idx`/`seq` outside its valid window — surfaces as
+/// an error so the caller tears the endpoint down, rather than spinning forever on
+/// a false Full (DP-11).
 fn push_g2c(
     seg: &ShmSegment,
     traffic_id: u32,
@@ -952,6 +972,7 @@ mod tests {
             allowed_pids: Arc::new(Vec::new()),
             owner_uid: 0,
             token: Arc::new(Mutex::new(None)),
+            policy: None,
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         ShmSegment::create(&task).expect("create byte-stream segment")

@@ -38,7 +38,7 @@ fn psk_echo(identity: &str, psk_hex: &str) -> EchoServer {
         version: Some("tls1.2".to_string()),
         profile: TlsProfile::Subset146Psk,
         psk_identity: Some(identity.to_string()),
-        psk_key: Some(hex(psk_hex)),
+        psk_key: Some(zeroize::Zeroizing::new(hex(psk_hex))),
         ..Default::default()
     })
 }

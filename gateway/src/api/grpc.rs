@@ -32,6 +32,37 @@ use tonic::transport::server::UdsConnectInfo;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+// ── HTTP/2 resource limits for the management server (CP-01 / DoS-09) ──────────
+// Conservative bounds so an unauthenticated client on the optional TCP bind
+// cannot exhaust the (2-worker) runtime via HTTP/2 stream/frame/keepalive/reset
+// floods before `caller_cred` ever runs. Applied to both binds — the same limits
+// contain a buggy or hostile *authorised* UDS client, and a uniform posture is
+// simpler than a TCP-only branch. Deliberately not config-tunable (YAGNI): the
+// management surface issues small serial unary RPCs, so these ceilings never bind
+// on legitimate traffic.
+const MGMT_MAX_CONCURRENT_STREAMS: u32 = 16;
+const MGMT_CONCURRENCY_PER_CONN: usize = 16;
+const MGMT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MGMT_MAX_FRAME_SIZE: u32 = 16 * 1024;
+const MGMT_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+const MGMT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const MGMT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const MGMT_MAX_PENDING_RESET_STREAMS: usize = 32;
+
+/// A `Server` builder pre-configured with the management-API HTTP/2 limits
+/// (CP-01). All bind sites go through this so no listener is created unbounded.
+fn hardened_server() -> Server {
+    Server::builder()
+        .concurrency_limit_per_connection(MGMT_CONCURRENCY_PER_CONN)
+        .max_concurrent_streams(Some(MGMT_MAX_CONCURRENT_STREAMS))
+        .max_frame_size(Some(MGMT_MAX_FRAME_SIZE))
+        .http2_max_header_list_size(Some(MGMT_MAX_HEADER_LIST_SIZE))
+        .http2_keepalive_interval(Some(MGMT_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(MGMT_KEEPALIVE_TIMEOUT))
+        .http2_max_pending_accept_reset_streams(Some(MGMT_MAX_PENDING_RESET_STREAMS))
+        .timeout(MGMT_REQUEST_TIMEOUT)
+}
+
 /// The management API service implementation.
 #[derive(Clone)]
 pub struct ManagementService {
@@ -136,11 +167,18 @@ impl ManagementApi for ManagementService {
 
     async fn health(
         &self,
-        _request: Request<HealthRequest>,
+        request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        // Liveness stays unauthenticated (probes need it), but the exact version
+        // string is fingerprinting material (CP-03 / M-3): disclose it only to a
+        // peer-authenticated UDS caller, leaving it empty for the optional TCP bind.
+        let version = match caller_cred(&request) {
+            Ok(_) => self.manager.version().to_string(),
+            Err(_) => String::new(),
+        };
         Ok(Response::new(HealthResponse {
             healthy: true,
-            version: self.manager.version().to_string(),
+            version,
         }))
     }
 
@@ -222,17 +260,17 @@ async fn serve(
              (no peer-cred auth; endpoint creation is refused over TCP)"
         );
         let tcp_shutdown = wait_for_shutdown(shutdown.clone());
-        let uds_server = Server::builder()
+        let uds_server = hardened_server()
             .add_service(ManagementApiServer::new(svc.clone()))
             .serve_with_incoming_shutdown(uds_stream, uds_shutdown);
-        let tcp_server = Server::builder()
+        let tcp_server = hardened_server()
             .add_service(ManagementApiServer::new(svc))
             .serve_with_shutdown(addr, tcp_shutdown);
         let (uds_res, tcp_res) = tokio::join!(uds_server, tcp_server);
         uds_res?;
         tcp_res?;
     } else {
-        Server::builder()
+        hardened_server()
             .add_service(ManagementApiServer::new(svc))
             .serve_with_incoming_shutdown(uds_stream, uds_shutdown)
             .await?;
@@ -247,5 +285,43 @@ async fn serve(
 async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
     while !shutdown.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::management::config::GatewayConfig;
+    use scg_proto::v1::management_api_server::ManagementApi;
+
+    fn service(version: &str) -> ManagementService {
+        let cfg: GatewayConfig = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
+        let manager = InterfaceManager::new(&cfg, version, Arc::new(AtomicBool::new(false)), None);
+        ManagementService { manager }
+    }
+
+    // M-3 / CP-03: a caller with no UDS peer credentials (i.e. the optional TCP
+    // bind) gets liveness but not the version fingerprint.
+    #[tokio::test]
+    async fn health_without_peer_cred_omits_version() {
+        let svc = service("secret-9.9");
+        let resp = svc.health(Request::new(HealthRequest {})).await.unwrap();
+        let body = resp.into_inner();
+        assert!(body.healthy);
+        assert!(
+            body.version.is_empty(),
+            "version must not be disclosed to an unauthenticated caller"
+        );
+    }
+
+    // The hardened builder must construct without panicking and stay usable — a
+    // regression guard for the CP-01 limit wiring (the constants are valid tonic
+    // arguments and the builder still accepts a service).
+    #[test]
+    fn hardened_server_builds() {
+        let cfg: GatewayConfig = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
+        let manager = InterfaceManager::new(&cfg, "t", Arc::new(AtomicBool::new(false)), None);
+        let _router =
+            hardened_server().add_service(ManagementApiServer::new(ManagementService { manager }));
     }
 }

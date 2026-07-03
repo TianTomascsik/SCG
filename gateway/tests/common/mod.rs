@@ -242,9 +242,12 @@ pub fn build_config_provider(
     // kTLS pins min=max to the negotiated version and offload-capable ciphers; pin
     // TLS 1.3 (TLS_AES_128_GCM_SHA256) so the upstream handshake against the
     // userspace echo server succeeds *and* the kernel `tls` ULP activates,
-    // exercising the splice fast-path.
+    // exercising the splice fast-path. Use the canonical "tls1.3" form: the local
+    // endpoint now builds its kTLS connector through the same verify-honouring
+    // tls_engine builder as the TCP path, whose `is_tls13()` keys on "tls1.3"
+    // (DP-01) — the former bench connector accepted the invalid short "1.3".
     let proto_ver = if provider == "ktls" {
-        r#""protocol_version": "1.3","#
+        r#""protocol_version": "tls1.3","#
     } else {
         ""
     };

@@ -4,7 +4,7 @@
 //! avoiding repeated rule matching for known flows. Uses RwLock for
 //! concurrent read access and TTL-based expiry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::RwLock;
 use std::time::Instant;
@@ -31,9 +31,19 @@ pub struct CacheEntry {
     inserted_at: Instant,
 }
 
+/// Cache state behind the lock: the entry map plus an insertion-ordered queue
+/// used for amortized-O(1) oldest-first eviction.
+struct CacheInner {
+    map: HashMap<CacheKey, CacheEntry>,
+    /// Keys in insertion order. May contain stale entries after a key is
+    /// re-inserted (its old queue entry lingers); those are skipped lazily by
+    /// comparing the queued `Instant` against the live entry's `inserted_at`.
+    order: VecDeque<(CacheKey, Instant)>,
+}
+
 /// Thread-safe traffic classification cache with TTL-based expiry.
 pub struct TrafficCache {
-    entries: RwLock<HashMap<CacheKey, CacheEntry>>,
+    inner: RwLock<CacheInner>,
     max_entries: usize,
     ttl: std::time::Duration,
 }
@@ -42,7 +52,10 @@ impl TrafficCache {
     /// Create a new cache with the given capacity and TTL.
     pub fn new(max_entries: usize, ttl_secs: u64) -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            inner: RwLock::new(CacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
             max_entries,
             ttl: std::time::Duration::from_secs(ttl_secs),
         }
@@ -50,8 +63,8 @@ impl TrafficCache {
 
     /// Look up a cached classification. Returns `None` if not found or expired.
     pub fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
-        let entries = self.entries.read().unwrap();
-        if let Some(entry) = entries.get(key) {
+        let inner = self.inner.read().unwrap();
+        if let Some(entry) = inner.map.get(key) {
             if entry.inserted_at.elapsed() < self.ttl {
                 return Some(entry.clone());
             }
@@ -60,6 +73,12 @@ impl TrafficCache {
     }
 
     /// Insert a classification result into the cache.
+    ///
+    /// Eviction is amortized O(1): when at capacity, the oldest live entry is
+    /// popped from the insertion queue (stale queue records — left behind by a
+    /// re-insert of the same key — are skipped without touching the map). The
+    /// TTL check in [`get`](Self::get) still filters out expired-but-present
+    /// entries, so the queue never needs a full O(n) expiry sweep.
     pub fn insert(
         &self,
         key: CacheKey,
@@ -67,48 +86,56 @@ impl TrafficCache {
         app_id: String,
         traffic_class: TrafficClass,
     ) {
-        let mut entries = self.entries.write().unwrap();
-        // Evict expired entries if at capacity
-        if entries.len() >= self.max_entries {
-            let now = Instant::now();
-            entries.retain(|_, v| now.duration_since(v.inserted_at) < self.ttl);
-        }
-        // If still at capacity after eviction, drop oldest
-        if entries.len() >= self.max_entries {
-            if let Some(oldest_key) = entries
-                .iter()
-                .min_by_key(|(_, v)| v.inserted_at)
-                .map(|(k, _)| k.clone())
-            {
-                entries.remove(&oldest_key);
+        let now = Instant::now();
+        let mut inner = self.inner.write().unwrap();
+
+        // Evict oldest-first until below capacity (unless we are replacing an
+        // existing key, which does not grow the map).
+        if !inner.map.contains_key(&key) {
+            while inner.map.len() >= self.max_entries {
+                match inner.order.pop_front() {
+                    Some((k, queued_at)) => {
+                        // Only remove if this queue record is the live one for k;
+                        // a later re-insert would have pushed a newer record.
+                        if inner.map.get(&k).map(|e| e.inserted_at) == Some(queued_at) {
+                            inner.map.remove(&k);
+                        }
+                        // else: stale record, already superseded — skip it.
+                    }
+                    None => break, // queue drained (map and queue diverged) — stop
+                }
             }
         }
-        entries.insert(
-            key,
+
+        inner.map.insert(
+            key.clone(),
             CacheEntry {
                 traffic_id,
                 app_id,
                 traffic_class,
-                inserted_at: Instant::now(),
+                inserted_at: now,
             },
         );
+        inner.order.push_back((key, now));
     }
 
     /// Clear all entries (called by lifecycle orchestrator on rekey/config-change).
     pub fn clear(&self) {
-        self.entries.write().unwrap().clear();
+        let mut inner = self.inner.write().unwrap();
+        inner.map.clear();
+        inner.order.clear();
     }
 
     /// Number of entries currently in the cache.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.entries.read().unwrap().len()
+        self.inner.read().unwrap().map.len()
     }
 
     /// Whether the cache currently holds no entries.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.entries.read().unwrap().is_empty()
+        self.inner.read().unwrap().map.is_empty()
     }
 }
 
@@ -182,21 +209,17 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
+    fn key(port: u16) -> CacheKey {
+        CacheKey {
+            src: addr(&format!("127.0.0.1:{port}")),
+            dst: addr("10.0.0.1:443"),
+        }
+    }
+
     #[test]
     fn test_capacity_eviction() {
         let cache = TrafficCache::new(2, 300);
-        let k1 = CacheKey {
-            src: addr("127.0.0.1:1001"),
-            dst: addr("10.0.0.1:443"),
-        };
-        let k2 = CacheKey {
-            src: addr("127.0.0.1:1002"),
-            dst: addr("10.0.0.1:443"),
-        };
-        let k3 = CacheKey {
-            src: addr("127.0.0.1:1003"),
-            dst: addr("10.0.0.1:443"),
-        };
+        let (k1, k2, k3) = (key(1001), key(1002), key(1003));
         cache.insert(k1.clone(), TrafficId(1), "a".into(), TrafficClass::Normal);
         cache.insert(k2.clone(), TrafficId(2), "b".into(), TrafficClass::Normal);
         cache.insert(k3.clone(), TrafficId(3), "c".into(), TrafficClass::Normal);
@@ -204,5 +227,58 @@ mod tests {
         assert!(cache.len() <= 2);
         // k3 should be present since it was just inserted
         assert!(cache.get(&k3).is_some());
+    }
+
+    // DoS-06: eviction drops the oldest-inserted entry first.
+    #[test]
+    fn eviction_is_oldest_first() {
+        let cache = TrafficCache::new(2, 300);
+        let (k1, k2, k3) = (key(1), key(2), key(3));
+        cache.insert(k1.clone(), TrafficId(1), "a".into(), TrafficClass::Normal);
+        cache.insert(k2.clone(), TrafficId(2), "b".into(), TrafficClass::Normal);
+        cache.insert(k3.clone(), TrafficId(3), "c".into(), TrafficClass::Normal);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&k1).is_none(), "oldest (k1) must be evicted");
+        assert!(cache.get(&k2).is_some());
+        assert!(cache.get(&k3).is_some());
+    }
+
+    // DoS-06: capacity is never exceeded under a unique-key flood.
+    #[test]
+    fn capacity_never_exceeded_under_churn() {
+        let cache = TrafficCache::new(8, 300);
+        for i in 0..80u16 {
+            cache.insert(
+                key(i),
+                TrafficId(i as u64),
+                "x".into(),
+                TrafficClass::Normal,
+            );
+            assert!(cache.len() <= 8, "capacity exceeded at insert {i}");
+        }
+        assert_eq!(cache.len(), 8);
+    }
+
+    // DoS-06: a re-inserted key survives eviction even though its earlier queue
+    // record is now stale (it must not be double-evicted).
+    #[test]
+    fn reinserted_key_survives_stale_queue_entry() {
+        let cache = TrafficCache::new(3, 300);
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        cache.insert(a.clone(), TrafficId(1), "a".into(), TrafficClass::Normal);
+        cache.insert(b.clone(), TrafficId(2), "b".into(), TrafficClass::Normal);
+        cache.insert(c.clone(), TrafficId(3), "c".into(), TrafficClass::Normal);
+        // Ensure the re-insert gets a distinct Instant from a's first insert.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Re-insert a → a is now the newest; its old queue record is stale.
+        cache.insert(a.clone(), TrafficId(9), "a2".into(), TrafficClass::Normal);
+        // Insert d at capacity → the stale a-record is skipped, b (true oldest) evicted.
+        cache.insert(d.clone(), TrafficId(4), "d".into(), TrafficClass::Normal);
+
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(&a).is_some(), "re-inserted key a must survive");
+        assert!(cache.get(&b).is_none(), "true-oldest key b must be evicted");
+        assert!(cache.get(&c).is_some());
+        assert!(cache.get(&d).is_some());
     }
 }

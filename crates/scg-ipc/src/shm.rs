@@ -18,7 +18,10 @@
 //!
 //! * a **control** memfd ([`ShmControl`]) holding both rings' indices/notify
 //!   words — mapped read/write by both sides, but every value the gateway reads
-//!   from it is validated and clamped (never trusted);
+//!   from it is validated (never trusted) on **both** the consume side (frame
+//!   length clamped to the slot) and the produce side (the peer-written
+//!   `read_idx`/`seq` is bounded to its valid window, else [`ShmError::RingCorrupt`]
+//!   — DP-11);
 //! * two **data** memfds holding only the ring bytes.
 //!
 //! The data memfd the gateway *produces* into (`g2c`) is sealed with
@@ -94,6 +97,10 @@ pub enum ShmError {
     BadGeometry,
     /// A frame is larger than the ring can ever hold (`capacity - header`).
     FrameTooLarge,
+    /// The peer-writable ring control state (slot `seq` / `read_idx`) is outside
+    /// its valid window — a corrupt or hostile peer. The producer tears the ring
+    /// down instead of stalling forever (DP-11).
+    RingCorrupt,
 }
 
 impl std::fmt::Display for ShmError {
@@ -104,6 +111,7 @@ impl std::fmt::Display for ShmError {
             ShmError::BadVersion => "shm control version mismatch",
             ShmError::BadGeometry => "shm data mapping smaller than advertised capacity",
             ShmError::FrameTooLarge => "frame larger than ring capacity",
+            ShmError::RingCorrupt => "shared ring control state outside its valid window",
         };
         f.write_str(s)
     }
@@ -220,8 +228,16 @@ impl RingProducer {
         }
         let ix = self.indices();
         let write = ix.write_idx.load(Ordering::Relaxed);
+        // `read_idx` is written by the (possibly hostile) consumer on the shared
+        // control page. A legal `used` is in `[0, cap]`; anything larger means the
+        // peer moved `read_idx` outside its window, which would otherwise underflow
+        // `cap - used` (silent wrap) or wedge the producer on a perpetual Full.
+        // Report it so the endpoint tears down instead of stalling (DP-11).
         let read = ix.read_idx.load(Ordering::Acquire);
         let used = write.wrapping_sub(read) as usize;
+        if used > self.cap {
+            return Err(ShmError::RingCorrupt);
+        }
         if self.cap - used < total {
             return Ok(false);
         }
@@ -545,10 +561,13 @@ mod tests {
         Aligned::new(len)
     }
 
+    /// The control page must be cache-line aligned and at least one line big
+    /// (checked at compile time; a runtime assert on a constant is a lint).
+    const _: () = assert!(SHM_CONTROL_SIZE >= 64);
+
     #[test]
     fn control_layout_is_aligned() {
         assert_eq!(std::mem::align_of::<ShmControl>(), 64);
-        assert!(SHM_CONTROL_SIZE >= 64);
     }
 
     #[test]
@@ -584,6 +603,36 @@ mod tests {
         assert_eq!(tid, 22);
         assert_eq!(payload, b"defgh");
         assert!(consumer.try_pop().is_none());
+    }
+
+    // DP-11: a hostile consumer that moves `read_idx` outside `[write - cap, write]`
+    // must yield RingCorrupt (endpoint teardown) instead of underflowing `cap - used`
+    // or wedging the producer on a false Full.
+    #[test]
+    fn bytestream_bogus_read_idx_is_ring_corrupt() {
+        let cap = 256usize;
+        let control = buf(SHM_CONTROL_SIZE);
+        let data = buf(cap);
+        // SAFETY: `control` is a 64-byte-aligned writable `SHM_CONTROL_SIZE` region.
+        unsafe { ShmControl::init(control.as_mut_ptr(), cap, cap, 0) };
+        // SAFETY: `control` outlives `ctl` and is a live readable mapping.
+        let ctl = unsafe { ShmControl::attach(control.as_ptr(), control.len()).unwrap() };
+        // SAFETY: `&ctl.c2g` points into the live control mapping; `data` is writable.
+        let producer = unsafe { RingProducer::new(&ctl.c2g, data.as_mut_ptr(), cap) };
+
+        // read_idx ahead of write_idx (write == 0) → used wraps huge → corrupt.
+        ctl.c2g.read_idx.store(1, Ordering::Release);
+        assert_eq!(producer.try_push(1, b"x"), Err(ShmError::RingCorrupt));
+
+        // read_idx more than a lap behind → used > cap → corrupt.
+        ctl.c2g
+            .read_idx
+            .store(0u64.wrapping_sub(cap as u64 + 1), Ordering::Release);
+        assert_eq!(producer.try_push(1, b"x"), Err(ShmError::RingCorrupt));
+
+        // A legal read_idx (== write) lets the push proceed again.
+        ctl.c2g.read_idx.store(0, Ordering::Release);
+        assert!(producer.try_push(1, b"x").unwrap());
     }
 
     #[test]

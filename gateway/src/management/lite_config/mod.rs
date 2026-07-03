@@ -91,6 +91,28 @@ pub fn load_with_warnings(
         pubkey_override,
     )?;
 
+    // ── Trust-anchor posture advisories (CP-07) ─────────────────────────────
+    // Signature verification passed; still surface the weak-default posture so a
+    // loud operator can move the anchor out of the writable config dir.
+    let mut integrity_warnings = Vec::new();
+    if pubkey_override.is_none() {
+        integrity_warnings.push(format!(
+            "[integrity] config signing key resolved to the co-located fallback '{}' \
+             — it lives inside the config directory it authenticates, so an actor who \
+             can write that directory can also replace the key and re-sign a tampered \
+             config. Prefer an anchor outside the config dir via --config-pubkey.",
+            dir.join(TRUST_PUBKEY_REL).display()
+        ));
+    }
+    if let Ok(pubkey_path) = resolve_pubkey(dir, pubkey_override) {
+        if let Some(w) = crate::management::config::world_or_group_writable_warning(
+            &pubkey_path,
+            "config signing public key",
+        ) {
+            integrity_warnings.push(w);
+        }
+    }
+
     // ── Map connections → rules ─────────────────────────────────────────────
     let MappedRules { rules, warnings } = mapping::map_connections_to_rules(&merged)?;
     if rules.is_empty() {
@@ -111,7 +133,9 @@ pub fn load_with_warnings(
 
     let config = GatewayConfig::from_value(Value::Object(root))?;
 
-    Ok((config, warnings))
+    // Surface the trust-anchor advisories ahead of the mapping warnings.
+    integrity_warnings.extend(warnings);
+    Ok((config, integrity_warnings))
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -356,6 +380,30 @@ mod tests {
 
         // No deferred features in this fixture → no warnings.
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    // CP-07: resolving the signing key via the co-located fallback (no
+    // --config-pubkey) emits a posture advisory; an explicit anchor does not.
+    #[test]
+    fn colocated_anchor_warns_but_explicit_does_not() {
+        let fx = make_fixture();
+        // Place the anchor at the co-located default path and load with no override.
+        let trust_dir = fx.dir.join("trust");
+        fs::create_dir_all(&trust_dir).unwrap();
+        fs::copy(&fx.pubkey, trust_dir.join("config-signing.pub.pem")).unwrap();
+
+        let (_cfg, warnings) = load_with_warnings(&fx.dir, None).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("co-located fallback")),
+            "expected a co-located-anchor advisory: {warnings:?}"
+        );
+
+        // Explicit anchor → no co-located advisory.
+        let (_cfg, warnings) = load_with_warnings(&fx.dir, Some(&fx.pubkey)).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("co-located fallback")),
+            "explicit anchor must not warn: {warnings:?}"
+        );
     }
 
     #[test]

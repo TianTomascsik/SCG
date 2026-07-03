@@ -62,6 +62,27 @@ impl std::fmt::Debug for CapabilityToken {
     }
 }
 
+impl Drop for CapabilityToken {
+    fn drop(&mut self) {
+        zeroize_token_bytes(&mut self.0);
+    }
+}
+
+/// Best-effort volatile wipe of a token buffer (KC-02).
+///
+/// `scg-ipc` is deliberately libc-only, so this hand-rolls what the `zeroize`
+/// crate would do rather than taking a dependency: a `write_volatile` the
+/// optimiser may not elide, plus a `compiler_fence` so the wipe is not reordered
+/// after the memory is released.
+fn zeroize_token_bytes(bytes: &mut [u8; TOKEN_LEN]) {
+    // SAFETY: `bytes` is a valid, uniquely-borrowed, properly-aligned
+    // `[u8; TOKEN_LEN]`; `write_volatile` stores a value of the exact same type
+    // through it. The volatile write prevents the compiler from eliding the wipe
+    // as a dead store before the backing memory is freed.
+    unsafe { core::ptr::write_volatile(bytes, [0u8; TOKEN_LEN]) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +113,22 @@ mod tests {
         let token = CapabilityToken::from_bytes(bytes);
         bytes[TOKEN_LEN - 1] ^= 0x01;
         assert!(!token.ct_eq(&bytes));
+    }
+
+    // KC-02: the wipe helper clears the buffer (drop uses the same routine).
+    #[test]
+    fn zeroize_token_bytes_clears_buffer() {
+        let mut bytes = [0xA5u8; TOKEN_LEN];
+        zeroize_token_bytes(&mut bytes);
+        assert_eq!(bytes, [0u8; TOKEN_LEN]);
+    }
+
+    // KC-02: the token never prints its material (guards against accidental log leaks).
+    #[test]
+    fn debug_masks_token_material() {
+        let s = format!("{:?}", CapabilityToken::from_bytes([0xAB; TOKEN_LEN]));
+        // Exact masked form → no token material (0xAB / 171 / "AB" hex) can appear.
+        assert_eq!(s, "CapabilityToken(***)");
+        assert!(!s.contains("171") && !s.contains("AB"), "{s}");
     }
 }

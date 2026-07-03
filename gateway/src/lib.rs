@@ -46,7 +46,7 @@ use security::providers::tls_provider::TlsProvider;
 use security::providers::wireguard_provider::WireguardProvider;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Run the gateway runtime.
 ///
@@ -246,7 +246,10 @@ pub fn run(
 
     // ── Firewall self-configuration (iptables intercept rules) ───────────────
     // Must run before listeners start so redirected traffic has somewhere to go.
-    let firewall = if config.rules.iter().any(|r| r.intercept.is_some()) {
+    // Held behind a shared, swappable slot so the config watcher can reconcile
+    // owned chains when an intercept-bearing rule changes on hot-reload (CP-09),
+    // and the shutdown path can tear down the currently-installed set.
+    let initial_fw = if config.rules.iter().any(|r| r.intercept.is_some()) {
         match FirewallManager::setup(&config) {
             Ok(fw) => {
                 info!("Firewall intercept rules installed (will tear down on shutdown)");
@@ -261,6 +264,7 @@ pub fn run(
     } else {
         None
     };
+    let firewall: Arc<Mutex<Option<FirewallManager>>> = Arc::new(Mutex::new(initial_fw));
 
     // Shutdown signal handling
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -336,6 +340,7 @@ pub fn run(
         &config,
         env!("CARGO_PKG_VERSION"),
         shutdown.clone(),
+        Some(policy_manager.clone()),
     );
     let api_cfg = config.api.clone().unwrap_or_default();
     let mgmt_handle = if api_cfg.enabled {
@@ -368,8 +373,14 @@ pub fn run(
     let watcher_pipeline = pipeline.clone();
     let watcher_lifecycle_tx = lifecycle_tx.clone();
     let watcher_interface_manager = interface_manager.clone();
+    let watcher_firewall = firewall.clone();
 
     let _watcher_handle = spawn_config_watcher(shared_config, watcher_shutdown, move |diff| {
+        // One positive audit line summarising this reload's posture delta, so a
+        // config reload is attributable — not only the per-rule start/stop lines
+        // and denials are recorded (CP-05).
+        info!("{}", diff.format_reload_audit());
+
         // Stop removed rules
         for name in &diff.removed {
             if let Some(flag) = watcher_rule_shutdowns.lock().unwrap().get(name) {
@@ -426,21 +437,38 @@ pub fn run(
             );
         }
 
-        // Firewall/iptables intercept rules are installed at startup only and are
-        // NOT reconciled here (the listener restart above does not touch the
-        // kernel chains). Warn loudly so an operator who edited an `intercept`
-        // block does not assume the new interception posture is live (#45).
-        if diff
-            .added
-            .iter()
-            .chain(diff.changed.iter())
-            .any(|r| r.intercept.is_some())
-        {
-            warn!(
-                "Config reload affected a rule with a transparent-intercept block; \
-                 firewall/iptables rules are applied at startup only and are NOT \
-                 hot-reloaded — RESTART the gateway for intercept changes to take effect."
-            );
+        // Reconcile the firewall/iptables interception posture when an
+        // intercept-bearing rule was added, changed, or REMOVED (CP-09). Tear
+        // down the chains/routing this process owns and re-run setup from the new
+        // config so interception hot-reloads like the listeners and UDS/SHM authz.
+        if diff.intercept_changed {
+            let mut slot = watcher_firewall.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = slot.take() {
+                old.teardown();
+            }
+            if current_config.rules.iter().any(|r| r.intercept.is_some()) {
+                match FirewallManager::setup(&current_config) {
+                    Ok(fw) => {
+                        info!("Firewall intercept rules reconciled from reloaded config");
+                        *slot = Some(fw);
+                    }
+                    // Fail-closed posture: leave the slot empty and log loudly. The
+                    // listeners are intentionally kept running — stopping them gives
+                    // no containment for the real hazard (egress-plaintext bypass
+                    // happens in the kernel, before any gateway socket), and the same
+                    // failing iptables channel could not install a DROP either.
+                    Err(e) => {
+                        error!("firewall reconcile FAILED after reload: {e}");
+                        error!(
+                            "intercept posture is NOT live — matching traffic may BYPASS the \
+                             gateway (egress plaintext / no TPROXY delivery) until the config is \
+                             fixed and reloaded, or the gateway is restarted"
+                        );
+                    }
+                }
+            } else {
+                info!("all intercept blocks removed; firewall rules torn down");
+            }
         }
     });
 
@@ -503,8 +531,9 @@ pub fn run(
     // Shutdown has fired: tear down any live UDS/SHM endpoints.
     interface_manager.shutdown_all();
 
-    // Tear down firewall intercept rules (iptables chains + routing policy).
-    if let Some(ref fw) = firewall {
+    // Tear down whatever firewall intercept rules are currently installed
+    // (the reload path may have reconciled them since startup).
+    if let Some(fw) = firewall.lock().unwrap_or_else(|e| e.into_inner()).take() {
         fw.teardown();
     }
 

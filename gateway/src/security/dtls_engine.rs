@@ -191,7 +191,9 @@ fn build_dtls_connector(params: &TlsSecurityParams) -> Result<SslConnector, Stri
 /// short so a peer that completes the stateless cookie exchange but then stalls
 /// the handshake cannot wedge the (serial) accept loop for long. Combined with
 /// the cookie exchange below, this bounds the spoofed-source DoS (CWE-400).
-const DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Shares the gateway-wide [`crate::security::HANDSHAKE_TIMEOUT`] with the TCP
+/// TLS/kTLS handshake bound (DoS-01).
+const DTLS_HANDSHAKE_TIMEOUT: Duration = crate::security::HANDSHAKE_TIMEOUT;
 
 thread_local! {
     /// Peer address the current DTLS accept is bound to. The decrypt accept loop
@@ -203,18 +205,19 @@ thread_local! {
 }
 
 /// Process-lifetime secret keying the DTLS HelloVerifyRequest cookie HMAC.
-fn dtls_cookie_secret() -> &'static [u8; 32] {
-    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    SECRET.get_or_init(|| {
-        let mut s = [0u8; 32];
-        // rand_bytes only fails if the RNG is unavailable; fall back to the
-        // zero key (still address-bound, still forces a round trip) rather than
-        // panicking in library code. The RNG essentially never fails here.
-        if openssl::rand::rand_bytes(&mut s).is_err() {
-            warn!("DTLS cookie RNG unavailable; using a weak fallback cookie secret");
-        }
-        s
-    })
+///
+/// Fails **closed** if the CSPRNG is unavailable (KC-03): the sticky `None` makes
+/// every cookie compute/verify error out rather than falling back to an all-zero
+/// (predictable) key. The DTLS rule refuses to start (see `build_dtls_acceptor`).
+fn dtls_cookie_secret() -> Result<&'static [u8; 32], openssl::error::ErrorStack> {
+    static SECRET: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            let mut s = [0u8; 32];
+            openssl::rand::rand_bytes(&mut s).ok().map(|_| s)
+        })
+        .as_ref()
+        .ok_or_else(openssl::error::ErrorStack::get)
 }
 
 /// Compute the stateless cookie `HMAC-SHA256(secret, peer)` into `out`,
@@ -226,7 +229,7 @@ fn compute_dtls_cookie(
     use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::sign::Signer;
-    let key = PKey::hmac(dtls_cookie_secret())?;
+    let key = PKey::hmac(dtls_cookie_secret()?)?;
     let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
     signer.update(peer.to_string().as_bytes())?;
     let mac = signer.sign_to_vec()?;
@@ -307,6 +310,10 @@ fn build_dtls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String
     // HelloVerifyRequest round-trip entirely and the callbacks below are never
     // invoked (the cookie protection would be silently inert).
     builder.set_options(SslOptions::COOKIE_EXCHANGE);
+    // Eagerly key the cookie secret so a DTLS rule fails to start on RNG failure
+    // (KC-03), rather than accepting handshakes with a predictable/zero cookie.
+    dtls_cookie_secret()
+        .map_err(|e| format!("DTLS cookie secret unavailable (RNG failure): {e}"))?;
     builder.set_cookie_generate_cb(dtls_cookie_generate);
     builder.set_cookie_verify_cb(dtls_cookie_verify);
     Ok(builder.build())
@@ -600,23 +607,13 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
             loop {
                 match recvmsg_from_with_dscp(plain_fd, &mut fwd_buf) {
                     Ok((n, peer_addr, inbound_dscp)) => {
-                        // Policy check per datagram
-                        let target = match &dtls_target {
-                            Some(addr) => addr.clone(),
-                            None => ctx.upstream_addr.clone(),
-                        };
-                        if let Ok(dst_addr) = target.parse::<SocketAddr>() {
-                            if !ctx.classify_and_check_policy(&peer_addr, &dst_addr) {
-                                continue; // Drop datagram
-                            }
-                        }
-
-                        conn_metrics.record_read(n);
-
-                        // Admission control: refuse a *new* peer once the
-                        // session cap is reached (idle sessions are reclaimed by
-                        // the periodic eviction above), bounding resource use
-                        // under a source-spoofing flood.
+                        // Admission control FIRST (DoS-06): refuse a *new* peer once
+                        // the session cap is reached, before spending any classify /
+                        // traffic-cache work on it. The cap only ever drops *more*
+                        // than the policy gate would, and every datagram that reaches
+                        // the policy check and session creation below still passes the
+                        // gate — so ordering admission first never bypasses policy.
+                        // Idle sessions are reclaimed by the periodic eviction above.
                         if !sessions.contains_key(&peer_addr)
                             && !session_admitted(sessions.len(), max_sessions)
                         {
@@ -626,6 +623,18 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                             );
                             continue;
                         }
+
+                        // Policy check per datagram (fail closed on an unparseable
+                        // upstream target — DP-07).
+                        let target = match &dtls_target {
+                            Some(addr) => addr.clone(),
+                            None => ctx.upstream_addr.clone(),
+                        };
+                        if !ctx.classify_and_check_policy_target(&peer_addr, &target) {
+                            continue; // Drop datagram — policy denied or unresolvable
+                        }
+
+                        conn_metrics.record_read(n);
 
                         // Get or create DTLS session for this peer
                         if let std::collections::hash_map::Entry::Vacant(e) =
@@ -903,10 +912,9 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
         } else {
             ctx.upstream_addr.clone()
         };
-        if let Ok(dst_addr) = upstream_target.parse::<SocketAddr>() {
-            if !ctx.classify_and_check_policy(&peer_addr, &dst_addr) {
-                continue; // policy denied -- drop and re-arm the listener
-            }
+        // Fail closed on an unparseable upstream target (DP-07).
+        if !ctx.classify_and_check_policy_target(&peer_addr, &upstream_target) {
+            continue; // policy denied or unresolvable -- drop and re-arm the listener
         }
 
         // Connect socket to this peer -- recv()/send() now locked to this
@@ -1364,5 +1372,21 @@ mod cookie_tests {
         compute_dtls_cookie(&p1, &mut a).unwrap();
         compute_dtls_cookie(&p2, &mut b).unwrap();
         assert_ne!(a, b, "a different peer must yield a different cookie");
+    }
+
+    // KC-03: on a functioning host the secret is available and stable (same
+    // pointer/bytes across calls). RNG failure is uninjectable without wrapping
+    // OpenSSL, so the fail-closed path is documented rather than unit-tested; the
+    // accessor now returns a `Result`, so a failure propagates instead of minting
+    // an all-zero cookie key.
+    #[test]
+    fn cookie_secret_is_ok_and_stable() {
+        let a = dtls_cookie_secret().expect("RNG available in tests");
+        let b = dtls_cookie_secret().expect("RNG available in tests");
+        assert!(
+            std::ptr::eq(a, b),
+            "secret must be the same cached instance"
+        );
+        assert_ne!(a, &[0u8; 32], "a real secret must not be all-zero");
     }
 }

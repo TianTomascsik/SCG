@@ -86,6 +86,26 @@ impl PolicyManager {
         self.default_action == PolicyAction::Allow
     }
 
+    /// Destination-only policy check for a flow whose source is authenticated
+    /// out-of-band — the UDS/SHM local endpoints, where the caller is identified
+    /// by uid + pid + single-use token rather than a network source (DP-08). An
+    /// entry matches on its `destination` pattern alone; `Safety` fail-open and
+    /// `default_action` semantics are identical to [`check_allowed`](Self::check_allowed).
+    pub fn check_allowed_destination(&self, dst: &SocketAddr, traffic_class: TrafficClass) -> bool {
+        if traffic_class == TrafficClass::Safety && !self.enforce_policy_on_safety {
+            return true;
+        }
+        if self.entries.is_empty() {
+            return self.default_action == PolicyAction::Allow;
+        }
+        for entry in &self.entries {
+            if entry.destination.matches(dst) {
+                return true;
+            }
+        }
+        self.default_action == PolicyAction::Allow
+    }
+
     /// Reload policy from new config.
     pub fn reload(&mut self, config: Option<&PolicyConfig>) {
         let new = PolicyManager::new(config);
@@ -198,6 +218,58 @@ mod tests {
         assert!(!pm.check_allowed(
             &addr("192.168.1.1:5000"),
             &addr("10.0.0.1:443"),
+            TrafficClass::Normal
+        ));
+    }
+
+    // DP-08: destination-only check matches on the destination pattern alone
+    // (the local endpoint's caller is authenticated out-of-band).
+    #[test]
+    fn destination_only_matches_dst_pattern() {
+        let cfg = policy(
+            PolicyAction::Deny,
+            vec![WhitelistEntry {
+                source: "203.0.113.0/24".into(), // deliberately not the caller
+                destination: "10.0.0.0/8".into(),
+            }],
+        );
+        let pm = PolicyManager::new(Some(&cfg));
+        // Destination in-range → allowed regardless of source.
+        assert!(pm.check_allowed_destination(&addr("10.1.2.3:443"), TrafficClass::Normal));
+        // Destination out-of-range → denied by default-deny.
+        assert!(!pm.check_allowed_destination(&addr("192.168.1.1:443"), TrafficClass::Normal));
+    }
+
+    // DP-08: destination-only check preserves the Safety fail-open default and the
+    // empty-whitelist default_action.
+    #[test]
+    fn destination_only_safety_and_default_action() {
+        let deny = policy(PolicyAction::Deny, vec![]);
+        let pm = PolicyManager::new(Some(&deny));
+        // No whitelist + default-deny → Normal denied, Safety still open.
+        assert!(!pm.check_allowed_destination(&addr("10.0.0.1:1"), TrafficClass::Normal));
+        assert!(pm.check_allowed_destination(&addr("10.0.0.1:1"), TrafficClass::Safety));
+
+        let allow = policy(PolicyAction::Allow, vec![]);
+        let pm = PolicyManager::new(Some(&allow));
+        assert!(pm.check_allowed_destination(&addr("10.0.0.1:1"), TrafficClass::Normal));
+    }
+
+    // DP-09: a dual-stack listener presents IPv4 peers as `::ffff:a.b.c.d`; the
+    // source whitelist (written in native v4) must still match after canonicalization.
+    #[test]
+    fn mapped_v4_source_passes_v4_whitelist() {
+        let cfg = policy(
+            PolicyAction::Deny,
+            vec![WhitelistEntry {
+                source: "10.0.0.0/8".into(),
+                destination: "any".into(),
+            }],
+        );
+        let pm = PolicyManager::new(Some(&cfg));
+        assert!(pm.check_allowed(
+            &addr("[::ffff:10.0.0.7]:5000"),
+            &addr("192.0.2.1:443"),
             TrafficClass::Normal
         ));
     }

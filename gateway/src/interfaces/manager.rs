@@ -19,6 +19,7 @@ use crate::management::config::{
     Direction, GatewayConfig, PerfKnobs, Proto, QosPolicy, ShmNotify, ShmRingKind, TlsMode,
     TrafficClass,
 };
+use crate::processing::policy::PolicyManager;
 
 use scg_ipc::handshake::SHM_NOTIFY_EVENTFD;
 use scg_ipc::token::CapabilityToken;
@@ -150,6 +151,12 @@ struct RateLimiter {
     buckets: HashMap<u32, (f64, Instant)>,
 }
 
+/// Idle time after which a per-uid bucket is evicted (DoS-07). A bucket refills to
+/// full in 60 s (`cap / refill_per_s`), so a bucket untouched for 2× that is
+/// indistinguishable from a fresh (full) one — dropping it never admits a request
+/// the un-evicted bucket would have denied.
+const BUCKET_IDLE_EVICT: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl RateLimiter {
     fn new() -> Self {
         RateLimiter {
@@ -161,9 +168,19 @@ impl RateLimiter {
     /// `true` if a token was available (request allowed), `false` otherwise.
     /// The bucket starts full so a fresh uid may burst up to `per_min`.
     fn allow(&mut self, uid: u32, per_min: u32) -> bool {
+        self.allow_at(uid, per_min, Instant::now())
+    }
+
+    /// [`allow`](Self::allow) with an injectable clock, so eviction is testable.
+    /// Evicts idle buckets on every call (DoS-07): the map is bounded to uids seen
+    /// within `BUCKET_IDLE_EVICT`, and the retain is O(#authorised uids), which is
+    /// small by construction (uids come from the rule allow-lists).
+    fn allow_at(&mut self, uid: u32, per_min: u32, now: Instant) -> bool {
+        self.buckets
+            .retain(|_, (_, touched)| now.duration_since(*touched) < BUCKET_IDLE_EVICT);
+
         let cap = per_min.max(1) as f64;
         let refill_per_s = per_min as f64 / 60.0;
-        let now = Instant::now();
         let entry = self.buckets.entry(uid).or_insert((cap, now));
         let elapsed = now.duration_since(entry.1).as_secs_f64();
         entry.1 = now;
@@ -192,15 +209,21 @@ pub struct InterfaceManager {
     max_create_per_min: u32,
     live: Mutex<LiveState>,
     rate: Mutex<RateLimiter>,
+    /// Shared, hot-reloadable policy manager threaded into every endpoint task so
+    /// the local-IPC relay carries the same default-deny second gate as the
+    /// network paths (DP-08). `None` disables the gate.
+    policy: Option<Arc<RwLock<PolicyManager>>>,
 }
 
 impl InterfaceManager {
     /// Build the manager from the gateway config, deriving UDS/SHM templates
-    /// from rules whose `listen_proto` is `uds` or `shm`.
+    /// from rules whose `listen_proto` is `uds` or `shm`. `policy` is the shared
+    /// policy manager applied to each endpoint's network leg (DP-08).
     pub fn new(
         config: &GatewayConfig,
         version: impl Into<String>,
         _global_shutdown: Arc<AtomicBool>,
+        policy: Option<Arc<RwLock<PolicyManager>>>,
     ) -> Arc<Self> {
         let api = config.api.clone().unwrap_or_default();
         let (templates, all_rules) = Self::build_templates(config);
@@ -224,6 +247,7 @@ impl InterfaceManager {
                 by_owner: HashMap::new(),
             }),
             rate: Mutex::new(RateLimiter::new()),
+            policy,
         })
     }
 
@@ -338,13 +362,39 @@ impl InterfaceManager {
         self.all_rules.read().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// Format one structured audit line. Kept pure so its columnar shape
+    /// (`AUDIT <decision> op=… uid=… pid=… app_id=…<detail>`) is unit-testable and
+    /// stays greppable across both the deny and allow paths (CP-05).
+    fn audit_line(
+        decision: &str,
+        op: &str,
+        caller: CallerCred,
+        app_id: &str,
+        detail: &str,
+    ) -> String {
+        format!(
+            "AUDIT {decision} op={op} uid={} pid={} app_id={app_id}{detail}",
+            caller.uid, caller.pid
+        )
+    }
+
     /// Emit a structured audit record for a denied control-plane request. All
     /// denial paths funnel through here so operators get one consistent,
     /// greppable line (`AUDIT deny`) carrying the caller identity and reason.
     fn audit_deny(op: &str, caller: CallerCred, app_id: &str, reason: &str) {
         warn!(
-            "AUDIT deny op={op} uid={} pid={} app_id={app_id}: {reason}",
-            caller.uid, caller.pid
+            "{}",
+            Self::audit_line("deny", op, caller, app_id, &format!(": {reason}"))
+        );
+    }
+
+    /// Emit a positive audit record for a successful endpoint create/replace or
+    /// close, so provisioning is attributable and not only denials are logged
+    /// (CP-05). `op` is `create_uds`/`create_shm`/`close`.
+    fn audit_allow(op: &str, caller: CallerCred, app_id: &str, id: u32) {
+        info!(
+            "{}",
+            Self::audit_line("allow", op, caller, app_id, &format!(" id={id}"))
         );
     }
 
@@ -477,6 +527,7 @@ impl InterfaceManager {
             allowed_pids: template.allowed_pids.clone(),
             owner_uid: caller.uid,
             token: Arc::new(Mutex::new(Some(token))),
+            policy: self.policy.clone(),
             shutdown: shutdown.clone(),
         };
 
@@ -502,6 +553,7 @@ impl InterfaceManager {
             &label,
         )?;
 
+        Self::audit_allow("create_uds", caller, app_id, id);
         info!(
             "[{label}] created UDS endpoint id={id} at {} for uid={}",
             socket_path.display(),
@@ -629,6 +681,7 @@ impl InterfaceManager {
             allowed_pids: template.allowed_pids.clone(),
             owner_uid: caller.uid,
             token: Arc::new(Mutex::new(Some(token))),
+            policy: self.policy.clone(),
             shutdown: shutdown.clone(),
         };
 
@@ -654,6 +707,7 @@ impl InterfaceManager {
         // The endpoint thread rounds the capacity up to a page; report the same
         // value to the client so its ring geometry matches the control page.
         let cap_reported = round_up_page(cap) as u64;
+        Self::audit_allow("create_shm", caller, app_id, id);
         info!(
             "[{label}] created SHM endpoint id={id} at {} for uid={} (rings {cap_reported}B/dir)",
             control_socket_path.display(),
@@ -690,6 +744,9 @@ impl InterfaceManager {
         // Detach: dropping the handle lets the endpoint thread wind down on its
         // own without blocking the control-plane runtime.
         ep.join.take();
+        // `app_id` is not carried on the close RPC; use "-" to keep the columns
+        // aligned with the create audit lines.
+        Self::audit_allow("close", caller, "-", endpoint_id);
         info!("closed endpoint id={endpoint_id} (uid={})", caller.uid);
         Ok(())
     }
@@ -877,7 +934,55 @@ fn sanitize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tonic::Code;
+
+    // DoS-07: idle buckets are evicted, bounding the per-uid map.
+    #[test]
+    fn rate_limiter_evicts_idle_buckets() {
+        let mut rl = RateLimiter::new();
+        let t0 = Instant::now();
+        assert!(rl.allow_at(1, 60, t0));
+        // uid 2 arrives well after uid 1 went idle → uid 1 is evicted.
+        assert!(rl.allow_at(
+            2,
+            60,
+            t0 + BUCKET_IDLE_EVICT + std::time::Duration::from_secs(1)
+        ));
+        assert_eq!(rl.buckets.len(), 1, "idle uid 1 should be gone");
+        assert!(rl.buckets.contains_key(&2));
+    }
+
+    // DoS-07: eviction must not reset an *active* bucket that is currently denying.
+    #[test]
+    fn rate_limiter_eviction_preserves_active_denial() {
+        let mut rl = RateLimiter::new();
+        let t0 = Instant::now();
+        // Drain the bucket to denial (cap = 1/min → first allow, second deny).
+        assert!(rl.allow_at(1, 1, t0));
+        assert!(!rl.allow_at(1, 1, t0));
+        // A moment later (well under the idle window) it is still denied — not a
+        // fresh full bucket.
+        assert!(!rl.allow_at(1, 1, t0 + std::time::Duration::from_secs(1)));
+    }
+
+    // CP-05: the audit line is columnar and stable across the allow/deny paths.
+    #[test]
+    fn audit_line_format_is_grep_stable() {
+        let caller = CallerCred {
+            uid: 1000,
+            gid: 1000,
+            pid: 42,
+        };
+        assert_eq!(
+            InterfaceManager::audit_line("allow", "create_uds", caller, "app-x", " id=7"),
+            "AUDIT allow op=create_uds uid=1000 pid=42 app_id=app-x id=7"
+        );
+        assert_eq!(
+            InterfaceManager::audit_line("deny", "create_shm", caller, "app-y", ": quota reached"),
+            "AUDIT deny op=create_shm uid=1000 pid=42 app_id=app-y: quota reached"
+        );
+    }
 
     fn unique_tmp() -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -889,7 +994,7 @@ mod tests {
         dir
     }
 
-    fn manager_with_uds_rule(allowed_uid: u32, runtime_dir: &PathBuf) -> Arc<InterfaceManager> {
+    fn manager_with_uds_rule(allowed_uid: u32, runtime_dir: &Path) -> Arc<InterfaceManager> {
         let json = format!(
             r#"{{
                 "rules": [{{
@@ -919,7 +1024,7 @@ mod tests {
             runtime_dir.display()
         );
         let config: GatewayConfig = serde_json::from_str(&json).expect("parse test config");
-        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)))
+        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)), None)
     }
 
     #[test]
@@ -1095,7 +1200,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    fn manager_with_shm_rule(allowed_uid: u32, runtime_dir: &PathBuf) -> Arc<InterfaceManager> {
+    fn manager_with_shm_rule(allowed_uid: u32, runtime_dir: &Path) -> Arc<InterfaceManager> {
         let json = format!(
             r#"{{
                 "rules": [{{
@@ -1125,7 +1230,7 @@ mod tests {
             runtime_dir.display()
         );
         let config: GatewayConfig = serde_json::from_str(&json).expect("parse test config");
-        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)))
+        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)), None)
     }
 
     #[test]
@@ -1243,7 +1348,7 @@ mod tests {
     /// give two distinct owner keys so the per-uid quota can actually be reached.
     fn manager_with_limits(
         allowed_uid: u32,
-        runtime_dir: &PathBuf,
+        runtime_dir: &Path,
         max_endpoints_per_uid: u32,
         create_rate_per_min: u32,
     ) -> Arc<InterfaceManager> {
@@ -1283,7 +1388,7 @@ mod tests {
             rd = runtime_dir.display()
         );
         let config: GatewayConfig = serde_json::from_str(&json).expect("parse test config");
-        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)))
+        InterfaceManager::new(&config, "test", Arc::new(AtomicBool::new(false)), None)
     }
 
     #[test]

@@ -20,6 +20,10 @@ use std::process::Command;
 
 const CHAIN_ENCRYPT: &str = "SCG_ENCRYPT";
 const CHAIN_DECRYPT: &str = "SCG_DECRYPT";
+// Deliberately compile-time constants, not config knobs (CP-10): the fwmark/table
+// are also referenced by `preflight_check` (`lookup 100`), so a knob would have to
+// thread through both. Teardown now tracks created-vs-found ownership instead, so a
+// co-resident proxy sharing these values is not disrupted.
 const TPROXY_MARK: &str = "1";
 const TPROXY_TABLE: &str = "100";
 
@@ -34,8 +38,12 @@ pub struct FirewallManager {
     owns_encrypt_chain_v6: bool,
     /// Whether we created the SCG_DECRYPT chain (mangle).
     owns_decrypt_chain: bool,
-    /// Whether we added the ip rule + ip route for TPROXY.
-    owns_routing_policy: bool,
+    /// Whether *we* added the TPROXY `ip rule fwmark` (vs. it pre-existing, e.g. a
+    /// co-resident transparent proxy). Teardown removes it only if we created it
+    /// so we don't disrupt another owner (CP-10).
+    owns_routing_rule: bool,
+    /// Whether *we* added the TPROXY `ip route` in the lookup table (CP-10).
+    owns_routing_route: bool,
 }
 
 impl FirewallManager {
@@ -55,7 +63,8 @@ impl FirewallManager {
                 owns_encrypt_chain: false,
                 owns_encrypt_chain_v6: false,
                 owns_decrypt_chain: false,
-                owns_routing_policy: false,
+                owns_routing_rule: false,
+                owns_routing_route: false,
             });
         }
 
@@ -74,7 +83,8 @@ impl FirewallManager {
             owns_encrypt_chain: false,
             owns_encrypt_chain_v6: false,
             owns_decrypt_chain: false,
-            owns_routing_policy: false,
+            owns_routing_rule: false,
+            owns_routing_route: false,
         };
 
         // ── Setup encrypt chain ─────────────────────────────────────────────
@@ -114,8 +124,13 @@ impl FirewallManager {
         if self.owns_decrypt_chain {
             Self::remove_chain("iptables", "mangle", CHAIN_DECRYPT);
         }
-        if self.owns_routing_policy {
-            Self::remove_routing_policy();
+        // Remove only the routing elements we created, so a co-resident
+        // transparent proxy sharing the fwmark rule/route is not disrupted (CP-10).
+        if self.owns_routing_rule {
+            Self::remove_routing_rule();
+        }
+        if self.owns_routing_route {
+            Self::remove_routing_route();
         }
         info!("Firewall rules torn down");
     }
@@ -183,11 +198,12 @@ impl FirewallManager {
             )?;
         }
 
-        // Add per-rule REDIRECT entries.
+        // Add per-rule REDIRECT entries. TPROXY rules are handled by
+        // `ensure_decrypt_chain`; skip them here so the `match` below is
+        // exhaustive over `InterceptMode` without a panicking fallback arm (CP-13).
         for rule in rules {
             let ic = rule.intercept.as_ref().unwrap();
-            if ic.mode != InterceptMode::IngressRedirect && ic.mode != InterceptMode::EgressRedirect
-            {
+            if ic.mode == InterceptMode::Tproxy {
                 continue;
             }
             let listen_port = Self::listen_port(rule)?;
@@ -246,7 +262,8 @@ impl FirewallManager {
                         listen_port
                     );
                 }
-                _ => unreachable!(),
+                // Skipped above; kept so the match is exhaustive without a panic.
+                InterceptMode::Tproxy => continue,
             }
         }
 
@@ -256,9 +273,11 @@ impl FirewallManager {
     // ── Decrypt chain setup (TPROXY) ────────────────────────────────────────
 
     fn ensure_decrypt_chain(&mut self, rules: &[&RuleConfig]) -> Result<(), String> {
-        // Routing policy (ip rule + ip route).
-        Self::ensure_routing_policy()?;
-        self.owns_routing_policy = true;
+        // Routing policy (ip rule + ip route). Track which elements *we* created
+        // (vs. found pre-existing) so teardown removes only ours (CP-10).
+        let (rule_added, route_added) = Self::ensure_routing_policy()?;
+        self.owns_routing_rule = rule_added;
+        self.owns_routing_route = route_added;
 
         // Create or flush the mangle chain.
         Self::create_or_flush_chain("iptables", "mangle", CHAIN_DECRYPT)?;
@@ -345,27 +364,30 @@ impl FirewallManager {
 
     // ── Routing policy ──────────────────────────────────────────────────────
 
-    fn ensure_routing_policy() -> Result<(), String> {
-        // ip rule add fwmark 1 lookup 100
+    /// Add the TPROXY `ip rule`/`ip route` only where absent, returning
+    /// `(rule_added, route_added)` so teardown removes only what we created (CP-10).
+    fn ensure_routing_policy() -> Result<(bool, bool), String> {
         let existing = Command::new("ip")
             .args(["rule", "show"])
             .output()
             .map_err(|e| format!("Failed to run 'ip rule show': {}", e))?;
-        let out = String::from_utf8_lossy(&existing.stdout);
-        if !out.contains("fwmark") || !out.contains(&format!("lookup {TPROXY_TABLE}")) {
+        let existing_routes = Command::new("ip")
+            .args(["route", "show", "table", TPROXY_TABLE])
+            .output()
+            .map_err(|e| format!("Failed to run 'ip route show': {}", e))?;
+
+        let (need_rule, need_route) = Self::routing_policy_needed(
+            &String::from_utf8_lossy(&existing.stdout),
+            &String::from_utf8_lossy(&existing_routes.stdout),
+        );
+
+        if need_rule {
             run_cmd(
                 "ip",
                 &["rule", "add", "fwmark", TPROXY_MARK, "lookup", TPROXY_TABLE],
             )?;
         }
-
-        // ip route add local default dev lo table 100
-        let existing_routes = Command::new("ip")
-            .args(["route", "show", "table", TPROXY_TABLE])
-            .output()
-            .map_err(|e| format!("Failed to run 'ip route show': {}", e))?;
-        let route_out = String::from_utf8_lossy(&existing_routes.stdout);
-        if !route_out.contains("local default") {
+        if need_route {
             run_cmd(
                 "ip",
                 &[
@@ -380,16 +402,28 @@ impl FirewallManager {
                 ],
             )?;
         }
-
-        Ok(())
+        Ok((need_rule, need_route))
     }
 
-    fn remove_routing_policy() {
+    /// Decide, from `ip rule show` / `ip route show table <T>` output, which TPROXY
+    /// routing elements need creating. Pure so it is unit-testable without
+    /// `CAP_NET_ADMIN`. `(rule_needed, route_needed)`.
+    fn routing_policy_needed(rule_show: &str, route_show: &str) -> (bool, bool) {
+        let rule_needed =
+            !rule_show.contains("fwmark") || !rule_show.contains(&format!("lookup {TPROXY_TABLE}"));
+        let route_needed = !route_show.contains("local default");
+        (rule_needed, route_needed)
+    }
+
+    fn remove_routing_rule() {
         let _ = Command::new("ip")
             .args(["rule", "del", "fwmark", TPROXY_MARK, "lookup", TPROXY_TABLE])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+    }
+
+    fn remove_routing_route() {
         let _ = Command::new("ip")
             .args([
                 "route",
@@ -911,6 +945,74 @@ mod tests {
         }));
         let cmds = plan_firewall_commands(&config);
         assert!(cmds.is_empty());
+    }
+
+    // CP-10: created-vs-found decision is pure and testable without CAP_NET_ADMIN.
+    #[test]
+    fn routing_policy_needed_detects_existing() {
+        // Both present → nothing to create.
+        let rule_show = "32765:\tfrom all fwmark 0x1 lookup 100\n";
+        let route_show = "local default dev lo scope host\n";
+        assert_eq!(
+            FirewallManager::routing_policy_needed(rule_show, route_show),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn routing_policy_needed_when_absent() {
+        // Neither present → create both.
+        assert_eq!(FirewallManager::routing_policy_needed("", ""), (true, true));
+        // Rule present, route absent → create only the route.
+        assert_eq!(
+            FirewallManager::routing_policy_needed("from all fwmark 0x1 lookup 100", ""),
+            (false, true)
+        );
+    }
+
+    // CP-13: a mixed tproxy + egress config plans commands for both modes without
+    // crossing chains (proves the exhaustive match handles every InterceptMode).
+    #[test]
+    fn mixed_modes_do_not_cross_chains() {
+        let config = cfg(serde_json::json!({
+            "rules": [
+                {
+                    "name": "tp",
+                    "direction": "decrypt",
+                    "listen_addr": "0.0.0.0:9443",
+                    "upstream_addr": "auto",
+                    "transparent": true,
+                    "intercept": { "mode": "tproxy", "match_dports": "443", "match_src": ["10.0.0.0/8"] }
+                },
+                {
+                    "name": "eg",
+                    "direction": "encrypt",
+                    "listen_addr": "127.0.0.1:8443",
+                    "upstream_addr": "127.0.0.1:80",
+                    "intercept": { "mode": "egress_redirect", "match_dst": ["10.0.0.1"], "match_dports": "80" }
+                }
+            ]
+        }));
+        let cmds = plan_firewall_commands(&config);
+        let has = |needle: &str| cmds.iter().any(|c| c.args.contains(&needle.to_string()));
+        // Both modes plan their own target.
+        assert!(has("TPROXY"), "tproxy rule missing");
+        assert!(has("REDIRECT"), "egress redirect rule missing");
+        // No cross-chain leakage: TPROXY only in mangle, REDIRECT only in nat.
+        for c in &cmds {
+            if c.args.contains(&"mangle".to_string()) {
+                assert!(
+                    !c.args.contains(&"REDIRECT".to_string()),
+                    "REDIRECT leaked into mangle: {c:?}"
+                );
+            }
+            if c.args.contains(&"nat".to_string()) {
+                assert!(
+                    !c.args.contains(&"TPROXY".to_string()),
+                    "TPROXY leaked into nat: {c:?}"
+                );
+            }
+        }
     }
 
     #[test]

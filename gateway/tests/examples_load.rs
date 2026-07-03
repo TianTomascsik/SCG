@@ -5,7 +5,7 @@
 //! drift: each one is run through the real `GatewayConfig::load`, so a renamed
 //! field or a newly-rejected combination fails CI instead of a deployment.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gateway::management::config::GatewayConfig;
 
@@ -15,7 +15,7 @@ fn manifest_dir() -> PathBuf {
 }
 
 /// Load + validate one config file, attaching the path to any failure.
-fn assert_loads(path: &PathBuf) {
+fn assert_loads(path: &Path) {
     let cfg = GatewayConfig::load(path.to_str().unwrap())
         .unwrap_or_else(|e| panic!("example config {} failed to load: {e}", path.display()));
     assert!(

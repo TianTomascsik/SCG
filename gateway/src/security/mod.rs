@@ -27,3 +27,9 @@ pub const UDP_BUF_SIZE: usize = 65536;
 
 /// Listener accept timeout (used for shutdown checks).
 pub(crate) const ACCEPT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Bounds the blocking window of any TLS/kTLS/DTLS handshake so a stalling peer
+/// cannot pin a per-rule worker or the rule thread (DoS-01). Applied via
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` on the TCP paths and `set_read_timeout` on DTLS;
+/// cleared before the relay phase (which drives non-blocking I/O).
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);

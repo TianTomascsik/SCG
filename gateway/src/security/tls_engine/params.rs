@@ -29,6 +29,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 /// Default ceiling on concurrent DTLS sessions for a DTLS encrypt relay. Bounds
 /// memory/socket/handshake-CPU growth under a source-address-spoofing flood.
@@ -112,8 +113,9 @@ pub struct TlsSecurityParams {
     pub server_name: Option<String>,
     /// PSK identity (for `subset146-psk`).
     pub psk_identity: Option<String>,
-    /// PSK key bytes, decoded from `psk_hex` (for `subset146-psk`).
-    pub psk_key: Option<Vec<u8>>,
+    /// PSK key bytes, decoded from `psk_hex` (for `subset146-psk`). Wrapped in
+    /// `Zeroizing` so the key material is wiped on drop (KC-02).
+    pub psk_key: Option<Zeroizing<Vec<u8>>>,
     /// Advanced override for the TLS ≤ 1.2 cipher list.
     pub cipher_list: Option<String>,
     /// Advanced override for the TLS 1.3 ciphersuites.
@@ -424,7 +426,7 @@ pub(crate) fn host_of(addr: &str) -> Option<String> {
 }
 
 /// Decode a hex string (optionally with `0x` prefix or whitespace) into bytes.
-fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+fn decode_hex(s: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     let cleaned: String = s
         .trim()
         .trim_start_matches("0x")
@@ -437,7 +439,8 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     if !cleaned.len().is_multiple_of(2) {
         return Err("psk_hex must have an even number of hex digits".to_string());
     }
-    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    // Exact capacity → no reallocation leaves a stale (unzeroized) copy behind.
+    let mut out = Zeroizing::new(Vec::with_capacity(cleaned.len() / 2));
     let bytes = cleaned.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -481,7 +484,7 @@ mod secret_redaction_tests {
     fn debug_redacts_psk_material() {
         let p = TlsSecurityParams {
             psk_identity: Some("super-secret-identity".to_string()),
-            psk_key: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            psk_key: Some(Zeroizing::new(vec![0xde, 0xad, 0xbe, 0xef])),
             ..TlsSecurityParams::default()
         };
         let s = format!("{p:?}");
@@ -753,8 +756,11 @@ mod tests {
 
     #[test]
     fn hex_decoder_handles_prefix_and_whitespace() {
-        assert_eq!(decode_hex("0x00ff").unwrap(), vec![0x00, 0xff]);
-        assert_eq!(decode_hex("aa bb cc").unwrap(), vec![0xaa, 0xbb, 0xcc]);
+        assert_eq!(decode_hex("0x00ff").unwrap().as_slice(), &[0x00, 0xff]);
+        assert_eq!(
+            decode_hex("aa bb cc").unwrap().as_slice(),
+            &[0xaa, 0xbb, 0xcc]
+        );
         assert!(decode_hex("abc").is_err());
     }
 }

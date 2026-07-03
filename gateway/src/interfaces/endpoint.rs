@@ -7,25 +7,24 @@
 //! so a UDS client on one gateway can interoperate with a SHM client on a peer
 //! gateway: both sides see the same length-prefixed frame stream inside TLS.
 
-use crate::management::config::{PerfKnobs, QosPolicy, TlsMode};
+use crate::management::config::{PerfKnobs, QosPolicy, TlsMode, TrafficClass};
 use crate::management::telemetry::ConnectionMetrics;
 use crate::networking::connector::connect_with_retry;
 use crate::networking::socket_manager::{
     accept_with_timeout, apply_egress_qos, bind_tcp_listener, poll_two_fds, set_nodelay,
     set_nonblocking_fd, tune_socket_buffers, write_all_nb,
 };
+use crate::processing::policy::PolicyManager;
 use crate::security::relay::relay_bidirectional_splice;
 use crate::security::tls_engine::params::TlsSecurityParams;
 use crate::security::tls_engine::{
-    build_tls_acceptor, build_tls_connector, write_all_nb_proxy, ProxyStream,
+    build_ktls_acceptor, build_ktls_connector, build_tls_acceptor, build_tls_connector,
+    set_handshake_timeouts, write_all_nb_proxy, ProxyStream,
 };
-use crate::security::RELAY_BUF_SIZE;
+use crate::security::{HANDSHAKE_TIMEOUT, RELAY_BUF_SIZE};
 
 use foreign_types_shared::ForeignTypeRef;
-use ktls_pipe::{
-    build_client_connector as ktls_client_connector, build_server_acceptor as ktls_server_acceptor,
-    enable_ktls_ssl, get_tcp_ulp, ktls_privilege_hint, KtlsSession,
-};
+use ktls_pipe::{enable_ktls_ssl, get_tcp_ulp, ktls_privilege_hint, KtlsSession};
 use log::{debug, info, warn};
 use openssl::ssl::{Ssl, SslAcceptor};
 
@@ -35,13 +34,77 @@ use scg_ipc::token::CapabilityToken;
 
 use std::collections::HashMap;
 use std::io::{self, Read};
+use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+/// Policy gate for a local endpoint's network leg (DP-08).
+///
+/// The local caller is authenticated out-of-band (uid + pid + single-use token),
+/// so there is no meaningful network *source* on the app side. The encrypt
+/// direction therefore gates the upstream **destination** (the network-meaningful
+/// attribute of that leg), and the decrypt direction gates the real network
+/// **peer** that dialed the endpoint's TLS listener — giving every local endpoint
+/// the same default-deny second gate the TCP/UDP relays carry (register OQ2).
+pub struct EndpointPolicy {
+    /// Shared, hot-reloadable policy manager (same handle as the network paths).
+    pub policy: Arc<RwLock<PolicyManager>>,
+    /// The rule's traffic class (drives the Safety fail-open behaviour).
+    pub traffic_class: TrafficClass,
+}
+
+impl EndpointPolicy {
+    /// Gate an encrypt endpoint's upstream `target` (destination-only). Fails
+    /// closed on an unparseable target, mirroring the network path (DP-07).
+    pub fn allows_destination(&self, label: &str, target: &str) -> bool {
+        let dst = match target.parse::<SocketAddr>() {
+            Ok(d) => d,
+            Err(_) => {
+                warn!(
+                    "[{label}] AUDIT deny op=local_upstream_policy target='{target}': \
+                     not an IP:port; failing closed"
+                );
+                return false;
+            }
+        };
+        let allowed = self
+            .policy
+            .read()
+            .map(|p| p.check_allowed_destination(&dst, self.traffic_class))
+            .unwrap_or(false);
+        if !allowed {
+            warn!(
+                "[{label}] AUDIT deny op=local_upstream_policy dst={dst}: \
+                 destination not permitted by policy"
+            );
+        }
+        allowed
+    }
+
+    /// Gate a decrypt endpoint's real network `peer` against the source whitelist.
+    /// The onward hop is address-less local IPC, so the endpoint's own `listen`
+    /// address stands in as the destination (documented approximation).
+    pub fn allows_peer(&self, label: &str, peer: SocketAddr, listen: &str) -> bool {
+        let dst = listen.parse::<SocketAddr>().unwrap_or(peer);
+        let allowed = self
+            .policy
+            .read()
+            .map(|p| p.check_allowed(&peer, &dst, self.traffic_class))
+            .unwrap_or(false);
+        if !allowed {
+            warn!(
+                "[{label}] AUDIT deny op=local_peer_policy peer={peer}: \
+                 source not permitted by policy"
+            );
+        }
+        allowed
+    }
+}
 
 /// Authenticate a freshly-accepted local connection on its control/data socket.
 ///
@@ -153,9 +216,11 @@ pub fn authenticate_peer(
 ///
 /// kTLS offloads the AES-GCM record layer; how the peer is authenticated (verify
 /// mode, PKI mutual cert, or PSK) is a handshake concern that completes before
-/// kTLS activates, and the kTLS context applies the same verification/PSK setup as
-/// userspace (see [`TlsSecurityParams::is_ktls_offloadable`]). So verified TLS and
-/// the Subset-146 ETCS profiles stay on the kTLS path; only `integrity-only`
+/// kTLS activates. [`connect_tls_upstream`]/[`accept_tls_upstream`] build the kTLS
+/// context through [`crate::security::tls_engine::build_ktls_connector`] /
+/// [`crate::security::tls_engine::build_ktls_acceptor`], which apply the rule's
+/// verify/CA/cert and PSK setup identically to userspace TLS (DP-01). So verified
+/// TLS and the Subset-146 ETCS profiles stay on the kTLS path; only `integrity-only`
 /// (NULL-encryption ciphers, no AES-GCM record layer) falls back to userspace
 /// `Tls`. The relay separately guards the zero-copy splice on **runtime** kTLS
 /// activation (TRA #56). If the parameters fail to parse, fall back to `Tls` so the
@@ -188,8 +253,19 @@ pub fn connect_tls_upstream(
     protocol_version: Option<&str>,
     sock_buf_size: usize,
     qos: QosPolicy,
+    policy: Option<&EndpointPolicy>,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
+    // Second gate (DP-08): a default-deny policy must permit this upstream before
+    // we dial it, mirroring the TCP/UDP relay paths.
+    if let Some(p) = policy {
+        if !p.allows_destination(label, upstream_addr) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local endpoint upstream denied by policy",
+            ));
+        }
+    }
     let upstream_tcp = connect_with_retry(
         upstream_addr,
         4,
@@ -216,6 +292,10 @@ pub fn connect_tls_upstream(
         .map_err(io::Error::other)?;
     let sni = params.sni_name(upstream_addr);
 
+    // Bound the blocking handshake window so a stalled upstream cannot wedge this
+    // endpoint thread (DoS-01); cleared once the handshake completes, below.
+    set_handshake_timeouts(&upstream_tcp, Some(HANDSHAKE_TIMEOUT))?;
+
     let hs_start = Instant::now();
     let proxy = match tls_mode {
         TlsMode::Tls => {
@@ -228,10 +308,16 @@ pub fn connect_tls_upstream(
                 "[{label}] upstream TLS handshake OK ({:.2} ms)",
                 hs_start.elapsed().as_secs_f64() * 1000.0
             );
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(ssl_stream.get_ref(), None)?;
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let connector = ktls_client_connector(params.version.as_deref())
+            // Build the kTLS connector through the tls_engine so the rule's
+            // verify mode, CA/cert and PSK callback are applied identically to
+            // userspace TLS (DP-01). The former `ktls_pipe::build_client_connector`
+            // hardcoded SslVerifyMode::NONE and silently discarded them.
+            let connector = build_ktls_connector(&params)
                 .map_err(|e| io::Error::other(format!("kTLS connector: {e}")))?;
             let mut ssl = connector
                 .configure()
@@ -261,6 +347,8 @@ pub fn connect_tls_upstream(
                     ktls_privilege_hint()
                 );
             }
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(&upstream_tcp, None)?;
             ProxyStream::Ktls {
                 session,
                 _stream: upstream_tcp,
@@ -296,6 +384,7 @@ pub fn accept_tls_upstream(
     protocol_version: Option<&str>,
     sock_buf_size: usize,
     qos: QosPolicy,
+    policy: Option<&EndpointPolicy>,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
     let listener = bind_tcp_listener(listen_addr, false, label).ok_or_else(|| {
@@ -306,22 +395,20 @@ pub fn accept_tls_upstream(
     })?;
     listener.set_nonblocking(false).ok();
 
-    // Build the server acceptor once. Userspace TLS honours the rule's
-    // cert/key/profile (self-signed fallback for the default profile); kTLS only
-    // needs the negotiated protocol version.
-    let acceptor: Option<SslAcceptor> = match tls_mode {
-        TlsMode::Tls => {
-            let params = TlsSecurityParams::from_params(provider_params, protocol_version)
-                .map_err(|e| io::Error::other(format!("TLS params: {e}")))?;
-            Some(
-                build_tls_acceptor(&params)
-                    .map_err(|e| io::Error::other(format!("TLS acceptor: {e}")))?,
-            )
-        }
-        TlsMode::Ktls => Some(
-            ktls_server_acceptor(protocol_version)
-                .map_err(|e| io::Error::other(format!("kTLS acceptor: {e}")))?,
-        ),
+    // Parse the rule's TLS security parameters once; both the userspace and the
+    // kTLS acceptor honour verify mode / CA / cert / PSK identically (DP-01).
+    let params = TlsSecurityParams::from_params(provider_params, protocol_version)
+        .map_err(|e| io::Error::other(format!("TLS params: {e}")))?;
+
+    // Build the server acceptor once (fail fast on bad config before we block on
+    // accept). Userspace TLS honours the rule's cert/key/profile (self-signed
+    // fallback for the default profile); kTLS goes through the same
+    // verify-honouring builder rather than the former no-verify bench acceptor.
+    let acceptor: SslAcceptor = match tls_mode {
+        TlsMode::Tls => build_tls_acceptor(&params)
+            .map_err(|e| io::Error::other(format!("TLS acceptor: {e}")))?,
+        TlsMode::Ktls => build_ktls_acceptor(&params)
+            .map_err(|e| io::Error::other(format!("kTLS acceptor: {e}")))?,
         TlsMode::Dtls => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -340,7 +427,17 @@ pub fn accept_tls_upstream(
             ));
         }
         match accept_with_timeout(&listener, Duration::from_millis(200)) {
-            Some(Ok(pair)) => break pair,
+            Some(Ok((stream, peer))) => {
+                // Second gate (DP-08): drop a peer the policy denies and keep
+                // listening — a denied prober must not consume this single-use
+                // endpoint or trigger the handshake.
+                if let Some(p) = policy {
+                    if !p.allows_peer(label, peer, listen_addr) {
+                        continue;
+                    }
+                }
+                break (stream, peer);
+            }
             Some(Err(e)) => return Err(e),
             None => continue,
         }
@@ -353,10 +450,13 @@ pub fn accept_tls_upstream(
     let is_v6 = peer_addr.is_ipv6();
     apply_egress_qos(fd, qos.egress_dscp(None), qos.so_priority(), is_v6);
 
+    // Bound the blocking handshake window so a peer that connects but stalls the
+    // ClientHello cannot wedge this endpoint thread (DoS-01); cleared below.
+    set_handshake_timeouts(&stream, Some(HANDSHAKE_TIMEOUT))?;
+
     let hs_start = Instant::now();
     let proxy = match tls_mode {
         TlsMode::Tls => {
-            let acceptor = acceptor.as_ref().expect("TLS acceptor built above");
             let ssl_stream = acceptor
                 .accept(stream)
                 .map_err(|e| io::Error::other(format!("TLS accept: {e}")))?;
@@ -364,10 +464,11 @@ pub fn accept_tls_upstream(
                 "[{label}] downstream TLS accept from {peer_addr} ({:.2} ms)",
                 hs_start.elapsed().as_secs_f64() * 1000.0
             );
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(ssl_stream.get_ref(), None)?;
             ProxyStream::Tls(ssl_stream)
         }
         TlsMode::Ktls => {
-            let acceptor = acceptor.as_ref().expect("kTLS acceptor built above");
             let mut ssl = Ssl::new(acceptor.context())
                 .map_err(|e| io::Error::other(format!("kTLS SSL: {e}")))?;
             ssl.set_accept_state();
@@ -393,12 +494,21 @@ pub fn accept_tls_upstream(
                     ktls_privilege_hint()
                 );
             }
+            // Handshake done — restore blocking I/O for the relay phase.
+            set_handshake_timeouts(&stream, None)?;
             ProxyStream::Ktls {
                 session,
                 _stream: stream,
             }
         }
-        TlsMode::Dtls => unreachable!("DTLS handled above"),
+        // Unreachable in practice (the acceptor build above returns for DTLS),
+        // but expressed as a fail-secure error rather than a library panic.
+        TlsMode::Dtls => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DTLS is not supported for local UDS/SHM interfaces",
+            ));
+        }
     };
     Ok(proxy)
 }
@@ -416,8 +526,19 @@ pub fn connect_plain_upstream(
     upstream_addr: &str,
     sock_buf_size: usize,
     qos: QosPolicy,
+    policy: Option<&EndpointPolicy>,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
+    // Second gate (DP-08): routing over UDS/SHM is policy-gated exactly like the
+    // TCP routing provider (register #38 parity).
+    if let Some(p) = policy {
+        if !p.allows_destination(label, upstream_addr) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local routing upstream denied by policy",
+            ));
+        }
+    }
     let upstream_tcp = connect_with_retry(
         upstream_addr,
         4,
@@ -445,6 +566,7 @@ pub fn accept_plain_upstream(
     listen_addr: &str,
     sock_buf_size: usize,
     qos: QosPolicy,
+    policy: Option<&EndpointPolicy>,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
     let listener = bind_tcp_listener(listen_addr, false, label).ok_or_else(|| {
@@ -463,7 +585,15 @@ pub fn accept_plain_upstream(
             ));
         }
         match accept_with_timeout(&listener, Duration::from_millis(200)) {
-            Some(Ok(pair)) => break pair,
+            Some(Ok((stream, peer))) => {
+                // Second gate (DP-08): drop a policy-denied peer, keep listening.
+                if let Some(p) = policy {
+                    if !p.allows_peer(label, peer, listen_addr) {
+                        continue;
+                    }
+                }
+                break (stream, peer);
+            }
             Some(Err(e)) => return Err(e),
             None => continue,
         }
@@ -695,5 +825,59 @@ mod tests {
         assert!(!should_splice_upstream(true, false)); // kTLS requested, not active
         assert!(!should_splice_upstream(false, true)); // userspace TLS
         assert!(!should_splice_upstream(false, false)); // userspace TLS, nothing active
+    }
+
+    // DP-08: EndpointPolicy gates the network leg of a local endpoint.
+    use crate::management::config::{PolicyAction, PolicyConfig, WhitelistEntry};
+
+    fn endpoint_policy(whitelist: Vec<WhitelistEntry>, class: TrafficClass) -> EndpointPolicy {
+        let cfg = PolicyConfig {
+            default_action: PolicyAction::Deny,
+            whitelist,
+            enforce_policy_on_safety: false,
+        };
+        EndpointPolicy {
+            policy: Arc::new(RwLock::new(PolicyManager::new(Some(&cfg)))),
+            traffic_class: class,
+        }
+    }
+
+    #[test]
+    fn endpoint_policy_gates_destination() {
+        let ep = endpoint_policy(
+            vec![WhitelistEntry {
+                source: "any".into(),
+                destination: "10.0.0.0/8".into(),
+            }],
+            TrafficClass::Normal,
+        );
+        assert!(ep.allows_destination("t", "10.1.2.3:443"));
+        assert!(!ep.allows_destination("t", "192.168.1.1:443"));
+        // Fail closed on an unparseable target (mirrors DP-07).
+        assert!(!ep.allows_destination("t", "backend.example.com:443"));
+    }
+
+    #[test]
+    fn endpoint_policy_gates_peer_source() {
+        let ep = endpoint_policy(
+            vec![WhitelistEntry {
+                source: "10.0.0.0/8".into(),
+                destination: "any".into(),
+            }],
+            TrafficClass::Normal,
+        );
+        let allowed: SocketAddr = "10.9.9.9:5000".parse().unwrap();
+        let denied: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+        assert!(ep.allows_peer("t", allowed, "127.0.0.1:8443"));
+        assert!(!ep.allows_peer("t", denied, "127.0.0.1:8443"));
+    }
+
+    #[test]
+    fn endpoint_policy_safety_fail_open() {
+        // Safety class with no opt-in bypasses the gate (railway availability).
+        let ep = endpoint_policy(Vec::new(), TrafficClass::Safety);
+        assert!(ep.allows_destination("t", "203.0.113.1:443"));
+        let peer: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+        assert!(ep.allows_peer("t", peer, "127.0.0.1:8443"));
     }
 }
