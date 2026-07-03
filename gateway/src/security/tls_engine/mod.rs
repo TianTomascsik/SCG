@@ -96,6 +96,15 @@ impl ProxyStream {
             ProxyStream::Tls(_) | ProxyStream::Plain(_) => false,
         }
     }
+
+    /// Whether this is the plaintext (`routing`) upstream — no crypto on the leg.
+    /// The SHM zero-copy client→gateway drain gates on this: only for a plaintext
+    /// upstream may a frame be written straight from peer-writable shared memory
+    /// (TRA #77 — a mutating client can then corrupt only its own flow, never a
+    /// TLS `SSL_write` same-buffer contract or another flow's data).
+    pub fn is_plain(&self) -> bool {
+        matches!(self, ProxyStream::Plain(_))
+    }
 }
 
 impl io::Read for ProxyStream {

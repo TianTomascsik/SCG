@@ -16,12 +16,13 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use scg_ipc::frame::{decode_header, FRAME_HEADER_LEN};
 use scg_ipc::handshake::{ShmOffer, SHM_NOTIFY_EVENTFD, SHM_NOTIFY_FUTEX, SHM_RING_SLOT};
 use scg_ipc::notify::futex_wait;
 use scg_ipc::os::{self, MapProt, Mapping};
 use scg_ipc::shm::{client_rings, RingConsumer, RingProducer, SHM_CONTROL_SIZE};
 use scg_ipc::shm_slot::{
-    client_slot_rings, slot_control_size, PushOutcome, SlotConsumer, SlotProducer,
+    client_slot_rings, slot_control_size, PushOutcome, ReservedSlot, SlotConsumer, SlotProducer,
 };
 use scg_ipc::{
     CapabilityToken, EventFd, Hello, Role, SHM_FD_CONTROL, SHM_FD_DATA_C2G, SHM_FD_DATA_G2C,
@@ -107,6 +108,52 @@ impl ClientBackend {
         match self {
             ClientBackend::Slot { consumer, .. } => Some(consumer.notify_word()),
             ClientBackend::ByteStream { .. } => None,
+        }
+    }
+
+    /// Peek the next gateway→client message's payload **in place** (slot ring
+    /// only), returning `(traffic_id, payload)` borrowed straight from the ring —
+    /// no copy into a caller buffer. Pair with [`advance_recv`](Self::advance_recv)
+    /// after processing. `None` on an empty ring or the byte-stream ring (which
+    /// has no borrowable in-place frame).
+    #[inline]
+    fn peek_payload(&self) -> Option<(u32, &[u8])> {
+        match self {
+            ClientBackend::Slot { consumer, .. } => {
+                // The on-wire frame is `[len|traffic_id][payload]`; hand back the
+                // payload slice and the decoded id, both without copying.
+                let frame = consumer.peek_frame()?;
+                let hdr: &[u8; FRAME_HEADER_LEN] =
+                    frame.get(..FRAME_HEADER_LEN)?.try_into().ok()?;
+                let (_len, traffic_id) = decode_header(hdr);
+                Some((traffic_id, &frame[FRAME_HEADER_LEN..]))
+            }
+            ClientBackend::ByteStream { .. } => None,
+        }
+    }
+
+    /// Consume the frame observed by the last [`peek_payload`](Self::peek_payload)
+    /// (slot ring only); no-op on the byte-stream ring.
+    #[inline]
+    fn advance_recv(&self) {
+        if let ClientBackend::Slot { consumer, .. } = self {
+            consumer.advance();
+        }
+    }
+
+    /// Reserve an in-place c2g slot for zero-copy production. `Ok(None)` means
+    /// the ring is full; an error means the byte-stream ring is in use, which
+    /// packs frames tightly and has no fixed-slot to lend out (callers use
+    /// [`try_push`](Self::try_push) there).
+    #[inline]
+    fn reserve(&self) -> Result<Option<ReservedSlot<'_>>> {
+        match self {
+            ClientBackend::Slot { producer, .. } => {
+                producer.reserve().map_err(|_| ScgError::FrameTooLarge)
+            }
+            ClientBackend::ByteStream { .. } => Err(ScgError::BadOffer(
+                "in-place reserve requires the slot ring (byte-stream ring in use)".to_string(),
+            )),
         }
     }
 }
@@ -299,6 +346,91 @@ impl ShmClient {
         // it drains). The client→gateway direction always uses an eventfd.
         self.c2g_evt.signal()?;
         Ok(pushed)
+    }
+
+    /// Raw in-place reserve for the C ABI: returns `(payload_ptr, capacity)` for
+    /// the next slot, or `Ok(None)` if the ring is full. The slot is *not*
+    /// published until [`commit_raw`](Self::commit_raw); because `reserve` does
+    /// not advance the write cursor and a client is single-producer, the pointer
+    /// stays valid across the two C calls.
+    pub fn reserve_raw(&self) -> Result<Option<(*mut u8, usize)>> {
+        match self.backend.reserve()? {
+            Some(mut slot) => {
+                let p = slot.payload_mut();
+                Ok(Some((p.as_mut_ptr(), p.len())))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Publish the slot previously located by [`reserve_raw`](Self::reserve_raw)
+    /// with `len` payload bytes (already written through its pointer) and wake
+    /// the gateway. Re-locates the same still-free slot, so no borrowed state is
+    /// held across the C-ABI boundary. Returns whether a frame was published.
+    pub fn commit_raw(&self, traffic_id: u32, len: usize) -> Result<bool> {
+        let published = self.commit_raw_nosignal(traffic_id, len)?;
+        if published {
+            self.flush_c2g()?;
+        }
+        Ok(published)
+    }
+
+    /// Publish the reserved slot with `len` bytes **without** waking the
+    /// gateway — for batched in-place production where a single
+    /// [`flush_c2g`](Self::flush_c2g) wakes it once for the whole batch (matching
+    /// the one-signal-per-batch amortisation of the copy-based `try_send_batch`).
+    /// Returns whether a frame was published.
+    pub fn commit_raw_nosignal(&self, traffic_id: u32, len: usize) -> Result<bool> {
+        match self.backend.reserve()? {
+            Some(slot) => {
+                let out = slot
+                    .commit(traffic_id, len)
+                    .map_err(|_| ScgError::FrameTooLarge)?;
+                Ok(matches!(out, PushOutcome::Pushed { .. }))
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Wake the gateway (one eventfd signal) after a run of
+    /// [`commit_raw_nosignal`](Self::commit_raw_nosignal).
+    pub fn flush_c2g(&self) -> Result<()> {
+        self.c2g_evt.signal()?;
+        Ok(())
+    }
+
+    /// Whether in-place reserve/commit is available (the SHM slot ring). The
+    /// byte-stream ring packs frames tightly and lends no fixed slot.
+    pub fn supports_inplace(&self) -> bool {
+        matches!(self.backend, ClientBackend::Slot { .. })
+    }
+
+    /// Whether **in-place receive** via [`peek_payload`](Self::peek_payload) is
+    /// available (the SHM slot ring). The byte-stream ring has no borrowable
+    /// in-place frame — use [`recv_into`](Self::recv_into) there.
+    pub fn supports_inplace_recv(&self) -> bool {
+        matches!(self.backend, ClientBackend::Slot { .. })
+    }
+
+    /// Wait up to `timeout` for the gateway→client ring to (maybe) have data,
+    /// **without** consuming anything — pair with [`peek_payload`](Self::peek_payload)
+    /// for a zero-copy receive. Returns `Ok(true)` if it may now have data,
+    /// `Ok(false)` on timeout.
+    pub fn wait_readable(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        self.wait_g2c(timeout)
+    }
+
+    /// Peek the next message's payload **in place** (slot ring), returning
+    /// `(traffic_id, payload)` borrowed straight from the ring — no copy. Pair
+    /// with [`advance_recv`](Self::advance_recv) after processing. `None` on an
+    /// empty ring / the byte-stream ring.
+    pub fn peek_payload(&self) -> Option<(u32, &[u8])> {
+        self.backend.peek_payload()
+    }
+
+    /// Consume the frame observed by the last [`peek_payload`](Self::peek_payload).
+    pub fn advance_recv(&self) {
+        self.backend.advance_recv();
     }
 
     /// Try to push a batch of framed messages, signalling the gateway **once**

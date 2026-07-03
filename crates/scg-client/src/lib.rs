@@ -253,6 +253,92 @@ impl ScgClient {
         }
     }
 
+    /// Reserve the next SHM send slot for **in-place** (zero-copy) production:
+    /// returns `(payload_ptr, capacity)`, or `Ok(None)` if the ring is full.
+    /// Fill up to `capacity` bytes through the pointer, then [`commit_raw`].
+    /// SHM slot ring only — errors on UDS or the byte-stream SHM ring.
+    pub fn reserve_raw(&self) -> Result<Option<(*mut u8, usize)>> {
+        match &self.inner {
+            Inner::Shm(c) => c.reserve_raw(),
+            Inner::Uds(_) => Err(ScgError::BadOffer(
+                "in-place reserve is SHM-only (UDS in use)".to_string(),
+            )),
+        }
+    }
+
+    /// Publish the slot located by [`reserve_raw`](Self::reserve_raw) with `len`
+    /// payload bytes and wake the gateway. Returns whether a frame was published.
+    pub fn commit_raw(&self, traffic_id: u32, len: usize) -> Result<bool> {
+        match &self.inner {
+            Inner::Shm(c) => c.commit_raw(traffic_id, len),
+            Inner::Uds(_) => Err(ScgError::BadOffer(
+                "in-place commit is SHM-only (UDS in use)".to_string(),
+            )),
+        }
+    }
+
+    /// Publish a reserved slot **without** waking the gateway (batched in-place
+    /// send); pair with one [`flush_c2g`](Self::flush_c2g) per batch.
+    pub fn commit_raw_nosignal(&self, traffic_id: u32, len: usize) -> Result<bool> {
+        match &self.inner {
+            Inner::Shm(c) => c.commit_raw_nosignal(traffic_id, len),
+            Inner::Uds(_) => Err(ScgError::BadOffer(
+                "in-place commit is SHM-only (UDS in use)".to_string(),
+            )),
+        }
+    }
+
+    /// Wake the gateway once after a run of
+    /// [`commit_raw_nosignal`](Self::commit_raw_nosignal). No-op for UDS.
+    pub fn flush_c2g(&self) -> Result<()> {
+        match &self.inner {
+            Inner::Shm(c) => c.flush_c2g(),
+            Inner::Uds(_) => Ok(()),
+        }
+    }
+
+    /// Whether in-place reserve/commit is available (SHM slot ring only).
+    pub fn supports_inplace(&self) -> bool {
+        match &self.inner {
+            Inner::Shm(c) => c.supports_inplace(),
+            Inner::Uds(_) => false,
+        }
+    }
+
+    /// Whether in-place (zero-copy) receive via [`peek_payload`](Self::peek_payload)
+    /// is available (SHM slot ring only).
+    pub fn supports_inplace_recv(&self) -> bool {
+        match &self.inner {
+            Inner::Shm(c) => c.supports_inplace_recv(),
+            Inner::Uds(_) => false,
+        }
+    }
+
+    /// Wait up to `timeout` for the receive ring to (maybe) have data without
+    /// consuming — pair with [`peek_payload`](Self::peek_payload). SHM only.
+    pub fn wait_readable(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        match &mut self.inner {
+            Inner::Shm(c) => c.wait_readable(timeout),
+            Inner::Uds(_) => Ok(true),
+        }
+    }
+
+    /// Peek the next message's payload in place (SHM slot ring), borrowed from
+    /// the ring — no copy. Pair with [`advance_recv`](Self::advance_recv).
+    pub fn peek_payload(&self) -> Option<(u32, &[u8])> {
+        match &self.inner {
+            Inner::Shm(c) => c.peek_payload(),
+            Inner::Uds(_) => None,
+        }
+    }
+
+    /// Consume the frame observed by the last [`peek_payload`](Self::peek_payload).
+    pub fn advance_recv(&self) {
+        if let Inner::Shm(c) = &self.inner {
+            c.advance_recv();
+        }
+    }
+
     /// Receive up to `lens.len()` messages in one call: message `i`'s payload
     /// lands at `out[i*stride..]` (truncated to `stride`) with its length in
     /// `lens[i]`. Waits up to `timeout` for the first message, then drains

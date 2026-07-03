@@ -22,10 +22,14 @@ LDFLAGS  := -L$(LIBDIR) -lscg_client -lpthread -ldl
 
 .PHONY: all clean run-c run-cpp
 
-all: c_client cpp_client
+all: c_client cpp_client zc_client
 
 c_client: c/client.c $(INCLUDE)/scg_client.h
 	$(CC) $(CFLAGS) c/client.c $(LDFLAGS) -o $@
+
+# Zero-copy SHM send: build the message directly in the ring via reserve/commit.
+zc_client: c/zero_copy.c $(INCLUDE)/scg_client.h
+	$(CC) $(CFLAGS) c/zero_copy.c $(LDFLAGS) -o $@
 
 cpp_client: cpp/client.cpp $(INCLUDE)/scg_client.hpp $(INCLUDE)/scg_client.h
 	$(CXX) $(CXXFLAGS) cpp/client.cpp $(LDFLAGS) -o $@

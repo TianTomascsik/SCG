@@ -292,6 +292,130 @@ impl SlotProducer {
         hdr.write_pos.store(pos.wrapping_add(1), Ordering::Relaxed);
         Ok(PushOutcome::Pushed { was_empty })
     }
+
+    /// Reserve the next free slot for **in-place** production: returns a
+    /// [`ReservedSlot`] whose [`payload_mut`](ReservedSlot::payload_mut) is a
+    /// writable view straight into this producer's ring segment, so the caller
+    /// can build or decrypt a payload directly into shared memory with no
+    /// staging copy (the zero-copy sibling of [`try_push`](Self::try_push)).
+    /// Publish it with [`commit`](ReservedSlot::commit); dropping a
+    /// `ReservedSlot` without committing abandons it (the slot stays free and
+    /// the next `reserve`/`try_push` reuses it, since `write_pos` never moved).
+    ///
+    /// Returns `Ok(None)` when the ring is full and `Err(ShmError::RingCorrupt)`
+    /// if the (peer-owned) `seq` word is outside its two legal states — the same
+    /// DP-11 hostile-`seq` guard as [`try_push`](Self::try_push).
+    ///
+    /// # Single-producer contract
+    /// At most one `ReservedSlot` may be live at a time: `reserve` does not
+    /// advance `write_pos`, so a second `reserve` before `commit` would hand out
+    /// the *same* slot and two `&mut` views would alias. The crate's
+    /// single-producer discipline (see [`SlotProducer::new`]'s safety contract)
+    /// already guarantees a strict reserve → fill → commit sequence, exactly as
+    /// [`peek_frame`](SlotConsumer::peek_frame)/[`advance`](SlotConsumer::advance)
+    /// require one consumer.
+    ///
+    /// # `&mut` soundness
+    /// A producer is the *only* writer of its ring's data region — the consumer
+    /// maps it read-only (`g2c` is sealed `F_SEAL_FUTURE_WRITE`; `c2g` is written
+    /// solely by the client) — so a reserved, unpublished slot is exclusively
+    /// owned by this producer until `commit`. Only the shared control page
+    /// (`seq`/positions) is peer-writable, and it is validated here (DP-11),
+    /// never dereferenced as payload (contrast TRA #71 on the read side).
+    pub fn reserve(&self) -> Result<Option<ReservedSlot<'_>>, ShmError> {
+        let hdr = self.header();
+        let pos = hdr.write_pos.load(Ordering::Relaxed);
+        let idx = (pos & self.mask) as usize;
+        let seq = self.seq_at(idx).load(Ordering::Acquire);
+        // DP-11: identical hostile-`seq` validation to `try_push` — the only
+        // states legal at this producer position are `seq == pos` (free) or
+        // `seq == pos + 1 - capacity` (occupied one lap back → genuinely full).
+        let diff = seq.wrapping_sub(pos) as i64;
+        match diff {
+            0 => {}                                                // slot free — reserve it
+            d if d == 1 - self.capacity as i64 => return Ok(None), // full
+            _ => return Err(ShmError::RingCorrupt),
+        }
+        // SAFETY: `idx < capacity` (masked) and `data` maps
+        // `capacity * segment_size` writable bytes, so this offset starts a whole
+        // in-bounds slot owned by this producer (the slot is free: `diff == 0`).
+        let seg = unsafe { self.data.add(idx * self.segment_size) };
+        Ok(Some(ReservedSlot {
+            producer: self,
+            idx,
+            pos,
+            seg,
+        }))
+    }
+}
+
+/// A slot reserved by [`SlotProducer::reserve`] for in-place production: a
+/// writable view into the producer's own ring segment, published by
+/// [`commit`](Self::commit) or abandoned on drop (no `Drop` work — an
+/// uncommitted reserve simply never advanced `write_pos`).
+///
+/// Borrows the producer, so it cannot outlive the ring; the single-producer
+/// discipline keeps at most one `ReservedSlot` live at a time (reserve → fill →
+/// commit before the next `reserve`).
+pub struct ReservedSlot<'p> {
+    producer: &'p SlotProducer,
+    idx: usize,
+    pos: u64,
+    seg: *mut u8,
+}
+
+impl ReservedSlot<'_> {
+    /// Writable payload region of the reserved slot (`max_payload()` bytes).
+    /// Fill it in place (e.g. `SSL_read` decrypts straight into it, or a client
+    /// builds a request in it), then [`commit`](Self::commit) the number of
+    /// bytes actually written.
+    #[inline]
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `seg` starts a `segment_size`-byte slot exclusively owned by
+        // this producer while reserved (the slot is free and unpublished, and the
+        // consumer maps this ring's data region read-only), so the `max_payload()`
+        // bytes after the fixed header are a valid, uniquely-borrowed writable
+        // region living as long as the borrowed producer. `FRAME_HEADER_LEN +
+        // max_payload() == segment_size`, so the slice stays inside the slot.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.seg.add(FRAME_HEADER_LEN),
+                self.producer.max_payload(),
+            )
+        }
+    }
+
+    /// Publish `len` payload bytes (already written via [`payload_mut`]) under
+    /// `traffic_id`, marking the slot READY for the consumer. `len` must be
+    /// `<= max_payload()`; otherwise `Err(FrameTooLarge)` is returned and
+    /// nothing is published. The publish step mirrors
+    /// [`SlotProducer::try_push`] exactly (Release on `seq`, then Relaxed on
+    /// `write_pos`), so only the header is written here — the payload is already
+    /// in place.
+    pub fn commit(self, traffic_id: u32, len: usize) -> Result<PushOutcome, ShmError> {
+        let p = self.producer;
+        if len > p.max_payload() {
+            return Err(ShmError::FrameTooLarge);
+        }
+        // Was the ring empty just before publishing? (consumer had caught up) —
+        // computed here, not at `reserve`, so a drain between reserve and commit
+        // is reflected, matching `try_push`.
+        let was_empty = p.header().read_pos.load(Ordering::Acquire) == self.pos;
+        let header = encode_header(len as u32, traffic_id);
+        // SAFETY: `self.seg` starts this producer's reserved (free) slot and
+        // `FRAME_HEADER_LEN <= segment_size`, so the header write stays in-slot;
+        // the source `header` is a distinct local array (no overlap).
+        unsafe {
+            std::ptr::copy_nonoverlapping(header.as_ptr(), self.seg, FRAME_HEADER_LEN);
+        }
+        // Publish: mark READY, then advance our own position.
+        p.seq_at(self.idx)
+            .store(self.pos.wrapping_add(1), Ordering::Release);
+        p.header()
+            .write_pos
+            .store(self.pos.wrapping_add(1), Ordering::Relaxed);
+        Ok(PushOutcome::Pushed { was_empty })
+    }
 }
 
 impl SlotConsumer {
@@ -814,6 +938,91 @@ mod tests {
             producer.try_push(1, b"x").unwrap(),
             PushOutcome::Pushed { .. }
         ));
+    }
+
+    // --- Zero-copy producer: reserve / commit (in-place production) ---
+
+    #[test]
+    fn reserve_commit_roundtrips_like_try_push() {
+        let (_c, _d, producer, consumer) = make(4, segment_size_for(64));
+        for i in 0..5_000u32 {
+            let len = 1 + (i as usize % 50);
+            let byte = (i & 0xff) as u8;
+            // Reserve, fill the payload straight into the ring, publish.
+            let mut slot = producer.reserve().unwrap().expect("slot free");
+            slot.payload_mut()[..len].fill(byte);
+            assert_eq!(
+                slot.commit(i, len).unwrap(),
+                PushOutcome::Pushed { was_empty: true }
+            );
+            // Consumer sees exactly the bytes written in place, same as try_push.
+            let (tid, payload) = consumer.try_pop().unwrap();
+            assert_eq!(tid, i);
+            assert_eq!(payload, vec![byte; len]);
+            assert!(consumer.try_pop().is_none());
+        }
+    }
+
+    #[test]
+    fn reserve_without_commit_abandons_slot() {
+        let (_c, _d, producer, consumer) = make(4, segment_size_for(64));
+        // Reserve then drop without committing: nothing is published and
+        // `write_pos` never moved, so the slot is reused untouched.
+        {
+            let mut slot = producer.reserve().unwrap().expect("slot free");
+            slot.payload_mut()[..3].copy_from_slice(b"xyz");
+        } // dropped, not committed
+        assert!(consumer.try_pop().is_none());
+        assert_eq!(
+            producer.try_push(9, b"abc").unwrap(),
+            PushOutcome::Pushed { was_empty: true }
+        );
+        assert_eq!(consumer.try_pop().unwrap(), (9, b"abc".to_vec()));
+    }
+
+    #[test]
+    fn commit_oversized_len_rejected_and_publishes_nothing() {
+        let (_c, _d, producer, consumer) = make(4, segment_size_for(16));
+        let max = producer.max_payload();
+        let slot = producer.reserve().unwrap().expect("slot free");
+        assert_eq!(slot.commit(1, max + 1), Err(ShmError::FrameTooLarge));
+        assert!(consumer.try_pop().is_none());
+    }
+
+    #[test]
+    fn reserve_full_ring_returns_none() {
+        let (_c, _d, producer, _consumer) = make(2, segment_size_for(16));
+        assert!(producer.reserve().unwrap().unwrap().commit(1, 4).is_ok());
+        assert!(producer.reserve().unwrap().unwrap().commit(2, 4).is_ok());
+        // Both slots occupied → reserve reports full.
+        assert!(producer.reserve().unwrap().is_none());
+    }
+
+    #[test]
+    fn reserve_corrupt_seq_yields_ring_corrupt() {
+        let (control, _d, producer, _consumer) = make(8, segment_size_for(64));
+        // Inject a `seq` in neither the free (== pos) nor full state at slot 0.
+        let seq0 = unsafe { control.ptr.add(SLOT_HEADER_SIZE) } as *const AtomicU64;
+        // SAFETY: `seq0` points at the first seq entry of the live control page.
+        unsafe { (*seq0).store(7, Ordering::Release) };
+        assert_eq!(producer.reserve().err(), Some(ShmError::RingCorrupt));
+    }
+
+    #[test]
+    fn reserve_commit_was_empty_semantics() {
+        let (_c, _d, producer, consumer) = make(8, segment_size_for(32));
+        let s1 = producer.reserve().unwrap().unwrap();
+        assert_eq!(
+            s1.commit(1, 0).unwrap(),
+            PushOutcome::Pushed { was_empty: true }
+        );
+        let s2 = producer.reserve().unwrap().unwrap();
+        assert_eq!(
+            s2.commit(2, 0).unwrap(),
+            PushOutcome::Pushed { was_empty: false }
+        );
+        consumer.try_pop().unwrap();
+        consumer.try_pop().unwrap();
     }
 
     #[test]

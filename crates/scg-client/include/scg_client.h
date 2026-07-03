@@ -56,6 +56,12 @@
 #define SCG_TIMEOUT 1
 
 /**
+ * Return code from [`scg_client_reserve`]/[`scg_client_commit`]: the send ring
+ * is full — retry after the gateway drains (not an error).
+ */
+#define SCG_FULL 2
+
+/**
  * Opaque client handle. Created by [`scg_client_connect`], destroyed by
  * [`scg_client_close`].
  */
@@ -98,6 +104,33 @@ int scg_client_send(ScgClientHandle *handle,
                     uint32_t traffic_id,
                     const uint8_t *data,
                     uintptr_t len);
+
+/**
+ * Reserve the next send slot for **zero-copy, in-place** production (SHM slot
+ * ring only). On [`SCG_OK`], `*out_ptr` points at `*out_cap` writable bytes in
+ * shared memory: build the message there, then call [`scg_client_commit`] with
+ * the byte count. Returns [`SCG_FULL`] if the ring is full (retry after
+ * draining with [`scg_client_recv`]/backoff) or [`SCG_ERR`] on error (e.g. a
+ * UDS or byte-stream endpoint, which has no in-place slot — use
+ * [`scg_client_send`]). The returned pointer is valid only until the matching
+ * [`scg_client_commit`]; do not reserve twice without committing.
+ *
+ * # Safety
+ * `handle` must be a live handle; `out_ptr`/`out_cap` must be valid, writable.
+ */
+int scg_client_reserve(ScgClientHandle *handle, uint8_t **out_ptr, uintptr_t *out_cap);
+
+/**
+ * Publish `len` bytes written into the slot from the last [`scg_client_reserve`]
+ * under `traffic_id`, and wake the gateway. `len` must not exceed the capacity
+ * that `scg_client_reserve` returned. Returns [`SCG_OK`] on success,
+ * [`SCG_FULL`] if the ring filled since the reserve, or [`SCG_ERR`] on error.
+ *
+ * # Safety
+ * `handle` must be a live handle; call exactly once per successful
+ * [`scg_client_reserve`], having written no more than `cap` bytes.
+ */
+int scg_client_commit(ScgClientHandle *handle, uint32_t traffic_id, uintptr_t len);
 
 /**
  * Receive one framed message.

@@ -124,6 +124,26 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Backoff while the gateway→client ring is full (client not draining).
 const RING_FULL_BACKOFF: Duration = Duration::from_micros(50);
 
+/// Client→gateway frame size at/above which the routing (plaintext) slot-ring
+/// relay writes straight from shared memory to the upstream instead of staging
+/// the frame into the coalesce buffer.
+///
+/// The staging copy is a *userspace* memcpy into the 4 MiB coalesce buffer, and
+/// coalescing packs many frames into one `write` — so for cache-resident frames
+/// the copy is near-free and its syscall-amortisation wins. The copy only starts
+/// to hurt once a frame busts the L2 working set (measured: at 256 KiB
+/// coalescing still wins; by 1 MiB direct-write wins and cuts gateway CPU by
+/// halving the per-message memory traffic). The threshold sits above L2 so
+/// direct-write triggers only where it is a clear win and never regresses the
+/// cache-hot common case.
+const ZC_DIRECT_THRESHOLD: usize = 512 * 1024;
+
+/// Upper bound on zero-copy direct writes performed in a single relay pass, so a
+/// fast producer cannot livelock the relay in the drain loop (it returns to
+/// `poll_relay` to service the other direction and the shutdown flag), mirroring
+/// the `RELAY_BUF_SIZE` bound `coalesce_c2g_into` applies to small frames.
+const ZC_MAX_DIRECT: usize = 64;
+
 /// Bind the control socket, serve a single authenticated client, then clean up.
 ///
 /// The endpoint is single-use: once a client presents the valid token it is
@@ -343,13 +363,25 @@ fn relay(
             break;
         }
 
-        // Latency profile: briefly busy-poll the c2g ring before blocking, so
-        // new client data is serviced without waiting for the (possibly
-        // coalesced) eventfd wakeup. Falls back to blocking when idle.
-        if spin_wait_us > 0 && seg.consumer_is_empty() {
+        // Latency profile: briefly busy-poll before blocking, so ready work is
+        // serviced without waiting for the (possibly coalesced) eventfd wakeup.
+        // Falls back to blocking when idle.
+        //
+        // The spin must watch BOTH directions. An earlier version broke only on
+        // a c2g frame (client→gateway ring), so in a request/response workload
+        // it kept spinning the whole window on the idle c2g ring while the
+        // upstream *reply* sat unserviced — making the `latency` profile add its
+        // whole spin budget (~50 µs) to RTT instead of cutting it. Break as soon
+        // as either the client ring has a request (no syscall) or the upstream
+        // has a reply pending (buffered plaintext, no syscall) or readable on its
+        // fd (a zero-timeout poll, ~0.3 µs), so a ready reply is serviced at once.
+        if spin_wait_us > 0 && seg.consumer_is_empty() && tls.ssl_pending() == 0 {
             let deadline = Instant::now() + Duration::from_micros(spin_wait_us);
             while seg.consumer_is_empty() && Instant::now() < deadline {
                 if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                if tls.ssl_pending() > 0 || fd_readable_nb(tls_fd) {
                     break;
                 }
                 std::hint::spin_loop();
@@ -372,14 +404,22 @@ fn relay(
         }
 
         // client -> gateway: drain the c2g ring unconditionally (covers any
-        // coalesced/lost eventfd signal), coalescing all available frames into
-        // one buffer and forwarding them with a single TLS write to amortise
-        // the per-record syscall/crypto cost. The slot ring appends its frames
-        // straight from shared memory (no staging copy / re-encode).
-        framed.clear();
-        seg.coalesce_c2g_into(&mut framed, &mut popbuf);
-        if !framed.is_empty() {
-            write_all_nb_proxy(tls, &framed)?;
+        // coalesced/lost eventfd signal) and forward to the upstream.
+        //
+        // On the routing (plaintext) slot-ring path, large frames are written
+        // STRAIGHT from shared memory (zero staging copy — the big-payload win;
+        // TRA #77 bounds it to plaintext so a mutating client can corrupt only
+        // its own flow). Every other path (TLS/kTLS upstream, or the byte-stream
+        // ring) coalesces into one buffer and issues a single write to amortise
+        // the per-record syscall/crypto cost.
+        if seg.is_slot_ring() && tls.is_plain() {
+            seg.drain_c2g_routing_zerocopy(tls, &mut framed)?;
+        } else {
+            framed.clear();
+            seg.coalesce_c2g_into(&mut framed, &mut popbuf);
+            if !framed.is_empty() {
+                write_all_nb_proxy(tls, &framed)?;
+            }
         }
 
         // gateway -> client: read TLS bytes, reassemble frames, push into g2c.
@@ -781,6 +821,73 @@ impl ShmSegment {
         n
     }
 
+    /// Whether this segment's rings are the fixed-slot kind (peekable in place),
+    /// as opposed to the packed byte-stream kind.
+    #[inline]
+    fn is_slot_ring(&self) -> bool {
+        matches!(self.backend, RingBackend::Slot { .. })
+    }
+
+    /// Zero-copy client→gateway drain for the ROUTING (plaintext) path on the
+    /// slot ring: a frame at or above [`ZC_DIRECT_THRESHOLD`] is written straight
+    /// from shared memory to the upstream (`write_all_nb_proxy` reads the borrowed
+    /// slot slice directly — no `framed` staging copy, the large-payload win),
+    /// while smaller frames are coalesced into `framed` so their per-record write
+    /// syscall is still amortised. Ordering is preserved: a pending coalesced
+    /// batch is flushed before any direct write. Bounded per call (≤
+    /// `RELAY_BUF_SIZE` of coalesced small frames and ≤ [`ZC_MAX_DIRECT`] direct
+    /// writes) so the relay returns to `poll_relay` — servicing the other
+    /// direction and the shutdown flag — instead of livelocking on a fast
+    /// producer, exactly as [`coalesce_c2g_into`](Self::coalesce_c2g_into) bounds
+    /// its batch.
+    ///
+    /// # Safety of writing peer-writable memory (TRA #77)
+    /// The peeked slice is backed by the client-writable c2g region. This is
+    /// sound *only* on the plaintext path (the caller gates on
+    /// [`ProxyStream::is_plain`]): the frame length is clamped to the slot's
+    /// payload capacity by the consumer's `next_ready`, so no read can go
+    /// out of bounds; and a hostile client that rewrites the slot mid-write can
+    /// corrupt only *its own* forwarded stream (`write_all_nb_proxy` may re-read
+    /// the slice on a partial write), never another flow's data or a TLS
+    /// same-buffer contract — the reason TLS/kTLS legs keep the staging copy.
+    fn drain_c2g_routing_zerocopy(
+        &self,
+        tls: &mut ProxyStream,
+        framed: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let RingBackend::Slot { consumer, .. } = &self.backend else {
+            return Ok(());
+        };
+        framed.clear();
+        let mut direct = 0usize;
+        while let Some(frame) = consumer.peek_frame() {
+            if frame.len() >= ZC_DIRECT_THRESHOLD {
+                // Flush any coalesced small frames first so on-wire order is kept.
+                if !framed.is_empty() {
+                    write_all_nb_proxy(tls, framed)?;
+                    framed.clear();
+                }
+                write_all_nb_proxy(tls, frame)?;
+                consumer.advance();
+                direct += 1;
+                if direct >= ZC_MAX_DIRECT {
+                    break;
+                }
+            } else {
+                if framed.len() + frame.len() > RELAY_BUF_SIZE {
+                    break;
+                }
+                framed.extend_from_slice(frame);
+                consumer.advance();
+            }
+        }
+        if !framed.is_empty() {
+            write_all_nb_proxy(tls, framed)?;
+            framed.clear();
+        }
+        Ok(())
+    }
+
     /// Push one frame into the gateway→client ring. Returns `Ok(Some(was_empty))`
     /// on success (whether the ring had been empty), `Ok(None)` if it is full.
     #[inline]
@@ -945,6 +1052,24 @@ fn ctl_socket_gone(ctl_fd: RawFd) -> bool {
     ret > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLIN)) != 0
 }
 
+/// Zero-timeout readability probe of a single fd (POLLIN). Used inside the
+/// latency-profile busy-poll so a ready upstream reply breaks the spin instead
+/// of waiting out the whole window while the c2g ring is idle. A negative return
+/// (including EINTR) is treated as "not readable" — conservative; the caller
+/// falls through to the blocking `poll_relay` which re-checks all fds.
+fn fd_readable_nb(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a live, fully-initialised single `pollfd`; the
+    // pointer/count pair (1) is valid for the call and `poll` only writes
+    // `revents`.
+    let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+    ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
+}
+
 #[cfg(test)]
 impl ShmSegment {
     /// Test-only: build a client-side producer over this segment's `c2g` ring and
@@ -1092,6 +1217,100 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         ShmSegment::create(&task).expect("create slot segment")
+    }
+
+    // The routing zero-copy c2g drain must forward every frame — large ones
+    // written straight from shared memory, small ones coalesced — to the
+    // upstream in push order and byte-exact. Uses a real Plain (TCP) upstream and
+    // decodes what arrives to confirm order + content are preserved.
+    #[test]
+    fn zerocopy_drain_forwards_mixed_frames_in_order() {
+        use scg_ipc::shm_slot::client_slot_rings;
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        let num_segments = 4;
+        let segment_size = 640 * 1024; // holds the >512 KiB direct-write frame
+        let big = vec![0xABu8; 600 * 1024]; // >= ZC_DIRECT_THRESHOLD → direct-written
+        let small = vec![0xCDu8; 200]; // < threshold → coalesced
+        let seg = slot_futex_segment(num_segments, segment_size);
+
+        // Fill the c2g ring as the client would (a second, writable mapping of the
+        // c2g memfd; the gateway's own c2g mapping is read-only).
+        {
+            let wr = os::mmap_shared(seg.data_c2g_fd, seg.cap_c2g, MapProt::ReadWrite)
+                .expect("writable c2g mapping");
+            // SAFETY: `seg`'s control and g2c data mappings are live and owned by
+            // `seg` for the whole scope; `wr` is a live writable mapping of
+            // `cap_c2g` bytes; the geometry matches what `ShmSegment::create` built
+            // from `num_segments`/`segment_size`.
+            let (producer, _c) = unsafe {
+                client_slot_rings(
+                    seg._control_map.as_ptr(),
+                    seg._control_map.len(),
+                    num_segments,
+                    segment_size,
+                    wr.as_ptr(),
+                    seg.cap_c2g,
+                    seg._data_g2c_map.as_ptr(),
+                    seg.cap_g2c,
+                )
+            }
+            .expect("client slot rings");
+            assert!(matches!(
+                producer.try_push(7, &big).unwrap(),
+                PushOutcome::Pushed { .. }
+            ));
+            assert!(matches!(
+                producer.try_push(9, &small).unwrap(),
+                PushOutcome::Pushed { .. }
+            ));
+        }
+
+        // Plain upstream over a loopback TCP pair; a reader thread drains it so a
+        // >512 KiB write cannot block on a full socket buffer.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let expected = big.len() + small.len() + 2 * 8; // 2 frame headers (8 B each)
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 65536];
+            while buf.len() < expected {
+                match s.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            buf
+        });
+        let up = TcpStream::connect(addr).expect("connect");
+        let mut tls = ProxyStream::Plain(up);
+        let mut framed = Vec::new();
+        seg.drain_c2g_routing_zerocopy(&mut tls, &mut framed)
+            .expect("drain");
+        drop(tls); // close so the reader's loop can finish on EOF if needed
+        let received = reader.join().expect("reader");
+
+        // Decode the received stream and assert the two frames arrived in order.
+        let mut dec = FrameDecoder::new(DEFAULT_MAX_FRAME_LEN);
+        dec.feed(&received);
+        let mut got = Vec::new();
+        while let Ok(Some((tid, payload))) = dec.next_frame_borrowed() {
+            got.push((tid, payload.to_vec()));
+        }
+        assert_eq!(got.len(), 2, "both frames must arrive");
+        assert_eq!(got[0].0, 7);
+        assert_eq!(
+            got[0].1, big,
+            "large frame forwarded byte-exact (direct write)"
+        );
+        assert_eq!(got[1].0, 9);
+        assert_eq!(
+            got[1].1, small,
+            "small frame forwarded byte-exact (coalesced)"
+        );
     }
 
     // M7: the reported geometry must reflect the ACTUAL ring the client sees.

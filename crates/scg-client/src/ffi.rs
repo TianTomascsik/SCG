@@ -43,6 +43,9 @@ pub const SCG_OK: c_int = 0;
 pub const SCG_ERR: c_int = -1;
 /// Return code from [`scg_client_recv`]: no message within the timeout.
 pub const SCG_TIMEOUT: c_int = 1;
+/// Return code from [`scg_client_reserve`]/[`scg_client_commit`]: the send ring
+/// is full — retry after the gateway drains (not an error).
+pub const SCG_FULL: c_int = 2;
 
 /// Opaque client handle. Created by [`scg_client_connect`], destroyed by
 /// [`scg_client_close`].
@@ -206,6 +209,73 @@ pub unsafe extern "C" fn scg_client_send(
 
     match h.inner.send(traffic_id, slice) {
         Ok(()) => SCG_OK,
+        Err(e) => {
+            h.set_err(&e.to_string());
+            SCG_ERR
+        }
+    }
+}
+
+/// Reserve the next send slot for **zero-copy, in-place** production (SHM slot
+/// ring only). On [`SCG_OK`], `*out_ptr` points at `*out_cap` writable bytes in
+/// shared memory: build the message there, then call [`scg_client_commit`] with
+/// the byte count. Returns [`SCG_FULL`] if the ring is full (retry after
+/// draining with [`scg_client_recv`]/backoff) or [`SCG_ERR`] on error (e.g. a
+/// UDS or byte-stream endpoint, which has no in-place slot — use
+/// [`scg_client_send`]). The returned pointer is valid only until the matching
+/// [`scg_client_commit`]; do not reserve twice without committing.
+///
+/// # Safety
+/// `handle` must be a live handle; `out_ptr`/`out_cap` must be valid, writable.
+#[no_mangle]
+pub unsafe extern "C" fn scg_client_reserve(
+    handle: *mut ScgClientHandle,
+    out_ptr: *mut *mut u8,
+    out_cap: *mut usize,
+) -> c_int {
+    let h = match handle.as_mut() {
+        Some(h) => h,
+        None => return SCG_ERR,
+    };
+    if out_ptr.is_null() || out_cap.is_null() {
+        h.set_err("out_ptr/out_cap must be non-null");
+        return SCG_ERR;
+    }
+    match h.inner.reserve_raw() {
+        Ok(Some((p, cap))) => {
+            *out_ptr = p;
+            *out_cap = cap;
+            SCG_OK
+        }
+        Ok(None) => SCG_FULL,
+        Err(e) => {
+            h.set_err(&e.to_string());
+            SCG_ERR
+        }
+    }
+}
+
+/// Publish `len` bytes written into the slot from the last [`scg_client_reserve`]
+/// under `traffic_id`, and wake the gateway. `len` must not exceed the capacity
+/// that `scg_client_reserve` returned. Returns [`SCG_OK`] on success,
+/// [`SCG_FULL`] if the ring filled since the reserve, or [`SCG_ERR`] on error.
+///
+/// # Safety
+/// `handle` must be a live handle; call exactly once per successful
+/// [`scg_client_reserve`], having written no more than `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn scg_client_commit(
+    handle: *mut ScgClientHandle,
+    traffic_id: u32,
+    len: usize,
+) -> c_int {
+    let h = match handle.as_mut() {
+        Some(h) => h,
+        None => return SCG_ERR,
+    };
+    match h.inner.commit_raw(traffic_id, len) {
+        Ok(true) => SCG_OK,
+        Ok(false) => SCG_FULL,
         Err(e) => {
             h.set_err(&e.to_string());
             SCG_ERR
