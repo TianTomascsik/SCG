@@ -3,9 +3,8 @@ members = [
     # Open Secure Communication Gateway (library + binary)
     "gateway",
 
-    # Shared infrastructure crates (consumed by the gateway and by the benches repo)
+    # kTLS session primitives shared with the gateway data plane
     "crates/ktls_pipe",
-    "crates/tls_pipe",
 
     # Local-interface IPC primitives and gRPC management protocol
     "crates/scg-ipc",
@@ -13,9 +12,6 @@ members = [
 
     # Client library (Rust core + C/C++ ABI) for the local interfaces
     "crates/scg-client",
-
-    # Benchmark logging/CSV helpers (consumed by the benches repo)
-    "crates/bench_log",
 ]
 resolver = "2"
 

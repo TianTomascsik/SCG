@@ -170,10 +170,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bench_log"
-version = "0.1.0"
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -366,7 +362,6 @@ dependencies = [
  "scg-proto",
  "serde",
  "serde_json",
- "tls_pipe",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -559,17 +554,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,7 +603,6 @@ name = "ktls_pipe"
 version = "0.1.0"
 dependencies = [
  "foreign-types-shared",
- "io-uring",
  "libc",
  "openssl",
  "openssl-sys",
@@ -1113,16 +1096,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tls_pipe"
-version = "0.1.0"
-dependencies = [
- "foreign-types-shared",
- "libc",
- "openssl",
- "openssl-sys",
 ]
 
 [[package]]
