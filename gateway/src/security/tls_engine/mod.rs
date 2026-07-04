@@ -3,6 +3,9 @@
 pub mod decrypt;
 pub mod encrypt;
 pub mod params;
+mod session_cache;
+
+pub(crate) use session_cache::{prime_resumption, resumption_key};
 
 use crate::management::cert_store::{get_or_init_cert, load_identity_pem};
 
@@ -442,7 +445,12 @@ fn apply_resumption(
                 .map_err(|e| format!("set session id context: {}", e))?;
             builder.set_session_cache_mode(SslSessionCacheMode::SERVER);
         } else {
-            builder.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+            // Client: enable the session cache AND install the new-session callback + bounded,
+            // policy-fingerprint-keyed store so a reconnect to the same upstream under the same
+            // posture can actually resume (task S2 / TRA #78–#80). Bare CLIENT cache mode alone
+            // never resumes — OpenSSL requires the app to persist the ticket and SSL_set_session
+            // it before connect, which `session_cache` wires up at the connect site.
+            session_cache::install_client_session_cache(builder);
         }
     } else {
         builder.set_options(SslOptions::NO_TICKET);

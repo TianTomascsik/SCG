@@ -19,7 +19,7 @@ use crate::security::relay::relay_bidirectional_splice;
 use crate::security::tls_engine::params::TlsSecurityParams;
 use crate::security::tls_engine::{
     build_ktls_acceptor, build_ktls_connector, build_tls_acceptor, build_tls_connector,
-    set_handshake_timeouts, write_all_nb_proxy, ProxyStream,
+    prime_resumption, resumption_key, set_handshake_timeouts, write_all_nb_proxy, ProxyStream,
 };
 use crate::security::{HANDSHAKE_TIMEOUT, RELAY_BUF_SIZE};
 
@@ -303,9 +303,23 @@ pub fn connect_tls_upstream(
         TlsMode::Tls => {
             let connector = build_tls_connector(&params)
                 .map_err(|e| io::Error::other(format!("TLS connector: {e}")))?;
-            let ssl_stream = connector
-                .connect(&sni, upstream_tcp)
-                .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
+            let ssl_stream = if params.resumption {
+                // Present a cached ticket for this exact upstream + crypto policy so the
+                // reconnect can resume (task S2 / TRA #78–#80). `configure()` carries the same
+                // SNI + hostname-verification defaults as `connect()`, so priming is transparent.
+                let key = resumption_key(&params, upstream_addr, false);
+                let mut config = connector
+                    .configure()
+                    .map_err(|e| io::Error::other(format!("TLS configure: {e}")))?;
+                prime_resumption(&mut config, key);
+                config
+                    .connect(&sni, upstream_tcp)
+                    .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?
+            } else {
+                connector
+                    .connect(&sni, upstream_tcp)
+                    .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?
+            };
             info!(
                 "[{label}] upstream TLS handshake OK ({:.2} ms)",
                 hs_start.elapsed().as_secs_f64() * 1000.0
@@ -326,6 +340,10 @@ pub fn connect_tls_upstream(
                 .map_err(|e| io::Error::other(format!("kTLS configure: {e}")))?
                 .into_ssl(&sni)
                 .map_err(|e| io::Error::other(format!("kTLS SSL: {e}")))?;
+            if params.resumption {
+                // Resume this upstream+policy if a ticket is cached (task S2 / TRA #78–#80).
+                prime_resumption(&mut ssl, resumption_key(&params, upstream_addr, true));
+            }
             ssl.set_connect_state();
             // SAFETY: enabling kTLS on the SSL object before the handshake is the
             // documented OpenSSL flow; the pointer is valid for the call.

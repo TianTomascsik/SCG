@@ -1336,6 +1336,39 @@ impl GatewayConfig {
                 }
             }
 
+            // Plaintext UDP routing: the relay forwards opaque datagrams to a fixed
+            // udp upstream (per-peer demux, bounded by max_sessions — TRA #81).
+            // Reject the combinations the fixed-upstream relay cannot honour so they
+            // fail at load, not at the first datagram.
+            if rule.effective_security_provider() == "routing" && rule.listen_proto == Proto::Udp {
+                if rule.upstream_proto != Proto::Udp {
+                    return Err(format!(
+                        "Rule '{}' (index {}): routing over udp requires upstream_proto = \"udp\"",
+                        rule.name, i
+                    ));
+                }
+                if rule.upstream_addr == "auto" {
+                    return Err(format!(
+                        "Rule '{}' (index {}): routing over udp does not support upstream_addr = \
+                         \"auto\" (no original-destination recovery); configure an explicit upstream",
+                        rule.name, i
+                    ));
+                }
+                // Session bounds, when set explicitly, must be positive: a zero cap
+                // admits nothing and a zero TTL evicts everything. Absent ⇒ the
+                // shared UDP defaults (`DEFAULT_UDP_{MAX_SESSIONS,IDLE_TTL_SECS}`).
+                for key in ["max_sessions", "idle_ttl_secs"] {
+                    if let Some(v) = rule.provider_params.get(key) {
+                        if v.as_u64().map(|n| n == 0).unwrap_or(true) {
+                            return Err(format!(
+                                "Rule '{}' (index {}): routing-udp '{}' must be a positive integer",
+                                rule.name, i, key
+                            ));
+                        }
+                    }
+                }
+            }
+
             // kTLS capability gate: kernel TLS cannot offload NULL-encryption
             // (integrity-only) cipher suites. Reject at load so the error is
             // surfaced early instead of at connection time. Other non-offloadable
@@ -1781,6 +1814,31 @@ impl GatewayConfig {
                      Use a tls/ktls provider for an encrypted local channel.",
                     rule.name, rule.listen_proto
                 ));
+            }
+        }
+
+        // Plaintext routing over the network (tcp/udp) forwards application data
+        // unencrypted on the wire (CWE-319, TRA #83). Like the verify:none
+        // advisories (M-13), this is an ERROR on a non-loopback listener unless the
+        // operator opts in via `allow_unverified_transport`, in which case it stays
+        // a warning; a loopback endpoint always stays a warning. (UDS/SHM routing
+        // has its own local-IPC advisory above; this covers the on-wire cleartext.)
+        for rule in &self.rules {
+            if rule.effective_security_provider() == "routing"
+                && matches!(rule.listen_proto, Proto::Tcp | Proto::Udp)
+            {
+                let msg = format!(
+                    "Rule '{}': routing over {} relays cleartext on the wire — application data is \
+                     unencrypted and readable/modifiable by an on-path attacker. Use a tls/ktls \
+                     provider to encrypt it, or set allow_unverified_transport: true to accept this \
+                     risk.",
+                    rule.name, rule.listen_proto
+                );
+                if listen_is_non_loopback(&rule.listen_addr) && !self.allow_unverified_transport {
+                    errors.push(msg);
+                } else {
+                    warnings.push(msg);
+                }
             }
         }
 
@@ -2778,6 +2836,122 @@ mod dscp_tests {
         let cfg = config_with_rule(serde_json::json!({ "upstream_addr": "127.0.0.1:9000" }));
         let has = |v: Vec<String>| v.iter().any(|w| w.contains("without peer verification"));
         assert!(!has(warnings_of(&cfg)) && !has(errors_of(&cfg)));
+    }
+
+    // ── Plaintext UDP routing (routing provider over a udp listener) ─────────
+
+    /// A valid plaintext `routing`+`udp` rule (loopback) merged with `extra`.
+    fn routing_udp_rule(extra: serde_json::Value) -> GatewayConfig {
+        let mut base = serde_json::json!({
+            "security_provider": "routing",
+            "listen_proto": "udp",
+            "listen_addr": "127.0.0.1:8080",
+            "upstream_addr": "127.0.0.1:9000",
+            "upstream_proto": "udp"
+        });
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        config_with_rule(base)
+    }
+
+    #[test]
+    fn validate_rejects_routing_udp_non_udp_upstream() {
+        let err = routing_udp_rule(serde_json::json!({ "upstream_proto": "tcp" }))
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.contains("routing over udp requires upstream_proto"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_routing_udp_auto_upstream() {
+        let err =
+            routing_udp_rule(serde_json::json!({ "upstream_addr": "auto", "transparent": true }))
+                .validate()
+                .unwrap_err();
+        assert!(
+            err.contains("does not support upstream_addr = \"auto\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_routing_udp_zero_session_bounds() {
+        for key in ["max_sessions", "idle_ttl_secs"] {
+            let err = routing_udp_rule(serde_json::json!({ key: 0 }))
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("must be a positive integer"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_routing_udp() {
+        // Explicit bounds, and omitted bounds (shared defaults), both validate.
+        assert!(
+            routing_udp_rule(serde_json::json!({ "max_sessions": 512, "idle_ttl_secs": 30 }))
+                .validate()
+                .is_ok()
+        );
+        assert!(routing_udp_rule(serde_json::json!({})).validate().is_ok());
+    }
+
+    // TRA #83: plaintext routing on the *wire* (tcp/udp) is a non-loopback ERROR
+    // by default, downgraded to a warning by `allow_unverified_transport`; a
+    // loopback listener stays a warning.
+    #[test]
+    fn preflight_errors_on_wire_routing_non_loopback() {
+        let cfg = routing_udp_rule(serde_json::json!({ "listen_addr": "0.0.0.0:8080" }));
+        assert!(
+            errors_of(&cfg)
+                .iter()
+                .any(|e| e.contains("cleartext on the wire")),
+            "expected a cleartext-on-wire ERROR: {:?}",
+            errors_of(&cfg)
+        );
+    }
+
+    #[test]
+    fn preflight_warns_on_wire_routing_loopback() {
+        let cfg = routing_udp_rule(serde_json::json!({}));
+        assert!(
+            warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("cleartext on the wire")),
+            "loopback routing → warning"
+        );
+        assert!(
+            !errors_of(&cfg)
+                .iter()
+                .any(|e| e.contains("cleartext on the wire")),
+            "loopback routing → not an error"
+        );
+    }
+
+    #[test]
+    fn preflight_downgrades_wire_routing_with_opt_in() {
+        let cfg = routing_udp_rule(serde_json::json!({ "listen_addr": "0.0.0.0:8080" }));
+        let cfg = GatewayConfig {
+            allow_unverified_transport: true,
+            ..cfg
+        };
+        assert!(
+            !errors_of(&cfg)
+                .iter()
+                .any(|e| e.contains("cleartext on the wire")),
+            "opt-in removes the error"
+        );
+        assert!(
+            warnings_of(&cfg)
+                .iter()
+                .any(|w| w.contains("cleartext on the wire")),
+            "opt-in keeps a warning"
+        );
     }
 
     #[test]

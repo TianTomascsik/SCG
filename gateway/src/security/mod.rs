@@ -13,6 +13,7 @@ pub mod routing_engine;
 pub mod stubs;
 pub mod tls_engine;
 pub mod udp_framing;
+pub mod udp_session;
 pub mod wireguard_engine;
 
 use std::time::Duration;

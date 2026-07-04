@@ -12,6 +12,7 @@ use crate::networking::socket_manager::{
 use crate::processing::RuleContext;
 use crate::security::relay::apply_geo_delay;
 use crate::security::tls_engine::params::{TlsSecurityParams, VerifyMode};
+use crate::security::udp_session::{session_admitted, stale_peers};
 use crate::security::{RELAY_BUF_SIZE, UDP_BUF_SIZE};
 
 use crate::management::config::Proto;
@@ -487,27 +488,8 @@ fn dtls_write_is_fatal(err: &openssl::ssl::Error) -> bool {
 //                   ENCRYPT DIRECTION: UDP -> DTLS (native UDP)
 // =============================================================================
 
-/// Whether a *new* DTLS session may be admitted given the current count and the
-/// configured maximum. Pure (testable without sockets).
-fn session_admitted(current: usize, max: usize) -> bool {
-    current < max
-}
-
-/// Peers whose last activity is at least `ttl` in the past, relative to `now`.
-/// Pure (testable without sockets); `evict_idle_sessions` applies the result.
-fn stale_peers(
-    last_activity: &[(SocketAddr, Instant)],
-    ttl: Duration,
-    now: Instant,
-) -> Vec<SocketAddr> {
-    last_activity
-        .iter()
-        .filter(|(_, last)| now.saturating_duration_since(*last) >= ttl)
-        .map(|(peer, _)| *peer)
-        .collect()
-}
-
-/// Shut down and remove every DTLS session idle for at least `ttl`.
+/// Shut down and remove every DTLS session idle for at least `ttl` (selection via
+/// the shared [`stale_peers`](crate::security::udp_session::stale_peers) helper).
 fn evict_idle_sessions(
     sessions: &mut HashMap<SocketAddr, (SslStream<DtlsUdpStream>, Instant)>,
     ttl: Duration,
@@ -1402,45 +1384,8 @@ pub(crate) fn run_dtls_decrypt_relay(ctx: &RuleContext) {
     info!("[{}] DTLS decrypt relay shutting down", ctx.rule_name);
 }
 
-#[cfg(test)]
-mod admission_tests {
-    use super::*;
-
-    #[test]
-    fn admits_below_cap_refuses_at_cap() {
-        assert!(session_admitted(0, 1024));
-        assert!(session_admitted(1023, 1024));
-        assert!(!session_admitted(1024, 1024));
-        assert!(!session_admitted(2000, 1024));
-        // A zero cap admits nothing (config validation forbids it, but the
-        // predicate must still be well-defined).
-        assert!(!session_admitted(0, 0));
-    }
-
-    #[test]
-    fn stale_peers_selects_only_expired() {
-        let now = Instant::now();
-        let ttl = Duration::from_secs(60);
-        let fresh: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let old: SocketAddr = "127.0.0.1:2".parse().unwrap();
-        let activity = vec![
-            (fresh, now - Duration::from_secs(5)),
-            (old, now - Duration::from_secs(120)),
-        ];
-        let stale = stale_peers(&activity, ttl, now);
-        assert_eq!(stale, vec![old]);
-    }
-
-    #[test]
-    fn stale_peers_boundary_is_inclusive() {
-        let now = Instant::now();
-        let ttl = Duration::from_secs(60);
-        let p: SocketAddr = "127.0.0.1:3".parse().unwrap();
-        // Exactly at the TTL boundary counts as stale (>=).
-        let activity = vec![(p, now - Duration::from_secs(60))];
-        assert_eq!(stale_peers(&activity, ttl, now), vec![p]);
-    }
-}
+// `session_admitted` / `stale_peers` admission + idle-selection unit tests live
+// with their definitions in `security::udp_session` (shared with UDP routing).
 
 #[cfg(test)]
 mod cookie_tests {
