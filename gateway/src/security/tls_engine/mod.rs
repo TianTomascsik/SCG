@@ -309,6 +309,16 @@ fn apply_cipher_policy(
             .set_cipher_list(&list)
             .map_err(|e| format!("set cipher list '{}': {}", list, e))?;
     }
+    // Pin the ECDHE key-exchange groups when overridden. Validated to a strong-group allowlist
+    // at config load (TRA #84), so this can only narrow the offered groups. OpenSSL wants a
+    // ':'-separated list; accept ',' too and normalize. Applied to both the acceptor and the
+    // connector (this helper runs on both), so it governs TB1 and TB2 handshakes alike.
+    if let Some(groups) = &params.groups {
+        let list = groups.replace(',', ":");
+        builder
+            .set_groups_list(&list)
+            .map_err(|e| format!("set groups list '{}': {}", list, e))?;
+    }
     Ok(())
 }
 

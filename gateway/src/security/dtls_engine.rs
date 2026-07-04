@@ -111,6 +111,22 @@ fn set_dtls_cipher_list(
         .map_err(|e| format!("dtls cipher list '{list}': {e}"))
 }
 
+/// Pin the ECDHE key-exchange groups on a DTLS context when overridden. Validated to a
+/// strong-group allowlist at config load (TRA #84), so it can only narrow the offered groups.
+/// Applied to both the DTLS acceptor and connector, mirroring the userspace-TLS path.
+fn set_dtls_groups(
+    builder: &mut SslContextBuilder,
+    params: &TlsSecurityParams,
+) -> Result<(), String> {
+    if let Some(groups) = &params.groups {
+        let list = groups.replace(',', ":");
+        builder
+            .set_groups_list(&list)
+            .map_err(|e| format!("dtls groups list '{list}': {e}"))?;
+    }
+    Ok(())
+}
+
 /// Load the configured CA bundle into the trust store, if any.
 fn set_dtls_ca(builder: &mut SslContextBuilder, params: &TlsSecurityParams) -> Result<(), String> {
     if let Some(ref ca) = params.ca_path {
@@ -165,6 +181,7 @@ fn build_dtls_connector(params: &TlsSecurityParams) -> Result<SslConnector, Stri
     let is_dtls10 = matches!(params.version.as_deref(), Some("dtls1.0"));
     pin_dtls_version(&mut builder, is_dtls10)?;
     set_dtls_cipher_list(&mut builder, params, is_dtls10)?;
+    set_dtls_groups(&mut builder, params)?;
 
     // Optional client identity (required when the upstream demands mutual auth).
     if let Some(ref cert_path) = params.cert_path {
@@ -299,6 +316,7 @@ fn build_dtls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String
     let is_dtls10 = matches!(params.version.as_deref(), Some("dtls1.0"));
     pin_dtls_version(&mut builder, is_dtls10)?;
     set_dtls_cipher_list(&mut builder, params, is_dtls10)?;
+    set_dtls_groups(&mut builder, params)?;
     apply_dtls_acceptor_verify(&mut builder, params)?;
 
     // Stateless DTLS cookie exchange (RFC 6347 §4.2.1): the client must echo a

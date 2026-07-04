@@ -20,6 +20,7 @@
 //! | `psk_hex` | string | PSK key as hex (for `subset146-psk`) |
 //! | `cipher_list` | string | Advanced override for TLS ≤ 1.2 cipher list |
 //! | `ciphersuites` | string | Advanced override for TLS 1.3 ciphersuites |
+//! | `groups` | string | Advanced override for the ECDHE key-exchange groups (strong-group allowlist: `X25519`, `P-256`, `P-384`, `X448`) |
 //! | `max_sessions` | integer | DTLS only: max concurrent peer sessions (admission control) |
 //! | `idle_ttl_secs` | integer | DTLS only: idle session eviction timeout (seconds) |
 //!
@@ -120,6 +121,13 @@ pub struct TlsSecurityParams {
     pub cipher_list: Option<String>,
     /// Advanced override for the TLS 1.3 ciphersuites.
     pub ciphersuites: Option<String>,
+    /// Advanced override for the ECDHE key-exchange named-group list (e.g.
+    /// `"X25519"` or `"P-256"`), applied to the handshake via OpenSSL
+    /// `set_groups_list`. Restricted to a strong-group allowlist by the
+    /// `validate` method so the field can only *narrow* the offered groups,
+    /// never downgrade below the OpenSSL modern default (TRA #84). `None` leaves
+    /// the OpenSSL default group set untouched.
+    pub groups: Option<String>,
     /// Whether TLS session resumption (TLS 1.3 tickets / TLS 1.2 session cache)
     /// is enabled for this rule. Resumption amortises the handshake cost across
     /// reconnects; leaving it `false` forces a full handshake on every
@@ -154,6 +162,7 @@ impl std::fmt::Debug for TlsSecurityParams {
             .field("psk_key", &self.psk_key.as_ref().map(|_| "[REDACTED]"))
             .field("cipher_list", &self.cipher_list)
             .field("ciphersuites", &self.ciphersuites)
+            .field("groups", &self.groups)
             .field("resumption", &self.resumption)
             .field("max_sessions", &self.max_sessions)
             .field("idle_ttl_secs", &self.idle_ttl_secs)
@@ -175,6 +184,7 @@ impl Default for TlsSecurityParams {
             psk_key: None,
             cipher_list: None,
             ciphersuites: None,
+            groups: None,
             resumption: false,
             max_sessions: DEFAULT_DTLS_MAX_SESSIONS,
             idle_ttl_secs: DEFAULT_DTLS_IDLE_TTL_SECS,
@@ -243,6 +253,7 @@ impl TlsSecurityParams {
         };
         let cipher_list = get_str("cipher_list");
         let ciphersuites = get_str("ciphersuites");
+        let groups = get_str("groups");
 
         // Session resumption defaults off (opt-in); accept a JSON bool or a
         // "true"/"false" string so it can be supplied via the generic
@@ -289,6 +300,7 @@ impl TlsSecurityParams {
             psk_key,
             cipher_list,
             ciphersuites,
+            groups,
             resumption,
             max_sessions,
             idle_ttl_secs,
@@ -332,6 +344,30 @@ impl TlsSecurityParams {
             return Err(
                 "psk_hex/psk_identity are only valid with profile = subset146-psk".to_string(),
             );
+        }
+
+        // Key-exchange group allowlist (TRA #84): a `groups` override may only RESTRICT the
+        // offered ECDHE groups to strong curves, never introduce a weak/deprecated one that
+        // would downgrade the handshake. Accept ':' or ',' separated lists; every token
+        // (case-insensitive, friendly or OpenSSL spelling) must be on the allowlist, and the
+        // list must be non-empty.
+        if let Some(groups) = &self.groups {
+            let mut any = false;
+            for token in groups
+                .split([':', ','])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                any = true;
+                if !is_allowed_group(token) {
+                    return Err(format!(
+                        "unsupported key-exchange group '{token}' (allowed: X25519, P-256, P-384, X448)"
+                    ));
+                }
+            }
+            if !any {
+                return Err("groups must list at least one key-exchange group".to_string());
+            }
         }
 
         Ok(())
@@ -423,6 +459,17 @@ pub(crate) fn host_of(addr: &str) -> Option<String> {
         Some((host, _port)) if !host.is_empty() => Some(host.to_string()),
         _ => Some(addr.to_string()),
     }
+}
+
+/// Whether a TLS/DTLS key-exchange named group is on the strong-group allowlist (TRA #84).
+/// Matches the friendly and OpenSSL spellings case-insensitively. Deliberately excludes weak or
+/// deprecated groups (small/legacy curves, finite-field DHE) so a `groups` override can only
+/// restrict to a strong curve, never downgrade the handshake.
+fn is_allowed_group(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "x25519" | "x448" | "p-256" | "prime256v1" | "secp256r1" | "p-384" | "secp384r1"
+    )
 }
 
 /// Decode a hex string (optionally with `0x` prefix or whitespace) into bytes.
@@ -589,6 +636,51 @@ mod tests {
         let p = TlsSecurityParams::from_params(&m, None).unwrap();
         assert!(!p.resumption);
         assert!(!TlsSecurityParams::default().resumption);
+    }
+
+    #[test]
+    fn groups_defaults_none() {
+        let m = params_from(&[("verify", json!("none"))]);
+        assert!(TlsSecurityParams::from_params(&m, None)
+            .unwrap()
+            .groups
+            .is_none());
+    }
+
+    #[test]
+    fn groups_accepts_allowlisted_groups() {
+        // Both handshake-sweep values and the friendly/OpenSSL spellings, ':'- or ','-separated.
+        for g in [
+            "X25519",
+            "P-256",
+            "prime256v1",
+            "x25519:p-256",
+            "P-384,X448",
+        ] {
+            let m = params_from(&[("verify", json!("none")), ("groups", json!(g))]);
+            let p = TlsSecurityParams::from_params(&m, None)
+                .unwrap_or_else(|e| panic!("groups '{g}' should be accepted: {e}"));
+            assert_eq!(p.groups.as_deref(), Some(g));
+        }
+    }
+
+    #[test]
+    fn groups_rejects_weak_or_unknown_group() {
+        // A weak/legacy curve (or any off-allowlist token) is refused at config load (TRA #84),
+        // so a `groups` override can never downgrade the handshake below the modern default.
+        for g in ["secp160r1", "ffdhe2048", "P-192", "sect163k1", "bogus"] {
+            let m = params_from(&[("verify", json!("none")), ("groups", json!(g))]);
+            assert!(
+                TlsSecurityParams::from_params(&m, None).is_err(),
+                "weak/unknown group '{g}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn groups_rejects_empty_list() {
+        let m = params_from(&[("verify", json!("none")), ("groups", json!(" : , "))]);
+        assert!(TlsSecurityParams::from_params(&m, None).is_err());
     }
 
     #[test]

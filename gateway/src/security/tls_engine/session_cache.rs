@@ -172,6 +172,7 @@ mod tests {
             psk_key: None,
             cipher_list: None,
             ciphersuites: None,
+            groups: None,
             resumption: true,
             max_sessions: 1024,
             idle_ttl_secs: 60,
