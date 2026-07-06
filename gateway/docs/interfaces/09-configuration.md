@@ -223,7 +223,7 @@ A UDS or SHM endpoint is declared as a normal rule whose `listen_proto` is
 | `listen_proto` | yes | `"uds"` or `"shm"`. |
 | `app_id` | yes | Identifies the application slot the client requests. |
 | `traffic_class` | no (default `normal`) | `"safety"` or `"normal"` — endpoints are provisioned **per app and per class**. |
-| `direction` | yes | v1 supports `"encrypt"` only; `"decrypt"` is rejected at create time (`UNIMPLEMENTED`). |
+| `direction` | yes | `"encrypt"` or `"decrypt"` — both are supported. |
 | `upstream_addr` | yes | `HOST:PORT` TLS upstream the endpoint relays to. |
 | `security_provider` | no | `"tls"` (default) or `"ktls"` for the upstream leg. |
 | `allowed_uids` | yes (non-empty) | uids permitted to open the endpoint; enforced via `SO_PEERCRED`. An empty list disables the local interface for the rule. |
@@ -256,7 +256,11 @@ resource guards added for security hardening.
 | `uds_path` | `/run/scg/management.sock` | gRPC-over-UDS control socket (`SO_PEERCRED`-authenticated). |
 | `tcp_addr` | `null` | Optional TCP bind for remote admin (e.g. `"127.0.0.1:50080"`). |
 | `runtime_dir` | `/run/scg` | Base dir for per-uid endpoint sockets (`<dir>/<uid>`, `0700`). |
-| `shm_ring_capacity` | `1048576` | Default SHM ring size per direction (bytes, page-rounded). |
+| `shm_ring_capacity` | `4194304` | Default SHM ring size per direction (bytes, page-rounded). |
+| `shm_ring_kind` | `"byte_stream"` | SHM ring flavour: `"byte_stream"` (variable-length) or `"slot"` (fixed Vyukov slots). |
+| `shm_segment_size` | `2048` | Slot ring: bytes per segment (an explicit `0` derives from the max frame). |
+| `shm_num_segments` | `512` | Slot ring: number of segments (an explicit `0` = derive; rounded to a power of two). |
+| `shm_g2c_notify` | `"eventfd"` | Gateway→client wakeup: `"eventfd"` (pollable) or `"futex"` (lowest latency, slot ring). |
 | `max_endpoints_per_uid` | `64` | Max simultaneously-live endpoints per uid (`0` = unlimited). Exceeding it returns `RESOURCE_EXHAUSTED`. |
 | `create_rate_per_min` | `120` | Per-uid token-bucket limit on create requests (`0` = unlimited). |
 
@@ -266,7 +270,9 @@ resource guards added for security hardening.
   "uds_path": "/run/scg/management.sock",
   "tcp_addr": null,
   "runtime_dir": "/run/scg",
-  "shm_ring_capacity": 1048576,
+  "shm_ring_capacity": 4194304,
+  "shm_ring_kind": "byte_stream",
+  "shm_g2c_notify": "eventfd",
   "max_endpoints_per_uid": 64,
   "create_rate_per_min": 120
 }

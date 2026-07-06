@@ -28,7 +28,7 @@ a policy engine, a config source, a management API, etc.).
 | [07](07-policy.md) | **Policy / Authorization** | Control plane | 🟡 Proposed | [processing/policy.rs](../../src/processing/policy.rs) | `policy.engine` (new) |
 | [08](08-traffic-classification.md) | **Traffic Classification** | Control plane | 🟡 Proposed | [processing/traffic_analyzer.rs](../../src/processing/traffic_analyzer.rs) | `classifier` (new) |
 | [09](09-configuration.md) | **Configuration Source** | Control plane | 🟡 Proposed | [management/config.rs](../../src/management/config.rs) + [config_manager.rs](../../src/management/config_manager.rs) | `config_source` (new) |
-| [10](10-management-api.md) | **Management / Admin API** (+ Health) | Control plane | 🟡 Proposed | [api/mod.rs](../../src/api/mod.rs) (stub) | `api` (new) |
+| [10](10-management-api.md) | **Management / Admin API** (+ Health) | Control plane | 🟡 Proposed | [api/grpc.rs](../../src/api/grpc.rs) — endpoint provisioning **built**; broader admin surface proposed | `api` |
 | [11](11-future-interfaces.md) | **Forward-looking interfaces** | Mixed | 🔵 Future | [security/stubs.rs](../../src/security/stubs.rs), [management/stubs.rs](../../src/management/stubs.rs) | — |
 
 **Status legend:** ✅ As-built (trait exists today) · 🟡 Proposed (contract for an

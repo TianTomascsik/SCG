@@ -594,9 +594,13 @@ gateway/src/
     registry.rs              -- ProviderRegistry (crypto + app protocol)
   security/
     provider.rs              -- CryptoProvider trait
-    providers/               -- Built-in: TLS, kTLS, DTLS
+    providers/               -- Built-in: TLS, kTLS, DTLS, WireGuard, routing
     tls_engine/              -- TLS/kTLS encrypt/decrypt implementation
     dtls_engine.rs           -- DTLS encrypt/decrypt implementation
+    routing_engine.rs        -- Routing (plaintext L4): TCP + multi-client UDP listeners
+    wireguard_engine.rs      -- WireGuard kernel-offload relay (+ wireguard_engine/admin.rs)
+    udp_framing.rs           -- UDP-over-TLS framing selector (UdpFraming: ale / raw)
+    udp_session.rs           -- Per-peer UDP/DTLS session admission + idle eviction
     relay.rs                 -- Bidirectional relay functions
   app_protocols/
     provider.rs              -- AppProtocolProvider + FramingSession traits

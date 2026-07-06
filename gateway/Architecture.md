@@ -40,9 +40,9 @@ The file `gateway.json` declares rules. Three fields drive provider selection:
 | `app_protocol` | `"ale"`, `"raw"`, or omitted | Selects the AppProtocolProvider (UDP-over-TLS only) |
 | `direction` | `"encrypt"` / `"decrypt"` | Determines which provider method is called |
 
-### 2. main.rs — Startup & Registration (blue box)
+### 2. lib.rs::run — Startup & Registration (blue box)
 
-`main.rs` builds a `ProviderRegistry`, registers every built-in provider, then freezes it:
+`lib.rs::run` (the composition root — *not* `main.rs`, which is a thin wrapper) builds a `ProviderRegistry`, registers every built-in provider, then freezes it:
 
 ```rust
 let mut registry = ProviderRegistry::new();
@@ -52,6 +52,7 @@ registry.register_crypto(Box::new(TlsProvider));
 registry.register_crypto(Box::new(KtlsProvider));
 registry.register_crypto(Box::new(DtlsProvider));
 registry.register_crypto(Box::new(WireguardProvider));
+registry.register_crypto(Box::new(RoutingProvider));
 
 // App protocol providers
 registry.register_app_protocol(Box::new(AleProtocolProvider));
@@ -71,7 +72,7 @@ crypto:         Vec<Box<dyn CryptoProvider>>       ← 5 built-in entries
 app_protocols:  Vec<Box<dyn AppProtocolProvider>>   ← 2 built-in entries
 ```
 
-Lookup is by name: `registry.find_crypto("tls")` iterates the `Vec` and returns the first entry whose `name()` matches. The Vec is tiny (3-5 entries) so linear scan is fine.
+Lookup is by name: `registry.find_crypto("tls")` iterates the `Vec` and returns the first entry whose `name()` matches. The Vec is tiny (5 crypto / 2 app-protocol) so linear scan is fine.
 
 #### 3a. CryptoProvider implementations (green boxes)
 
@@ -109,8 +110,8 @@ pub trait CryptoProvider: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn supported_modes(&self) -> Vec<ProviderMode>;
-    fn run_encrypt(&self, ctx: RuleContext) -> Result<()>;  // blocks until shutdown
-    fn run_decrypt(&self, ctx: RuleContext) -> Result<()>;  // blocks until shutdown
+    fn run_encrypt(&self, ctx: &RuleContext) -> Result<(), String>;  // blocks until shutdown
+    fn run_decrypt(&self, ctx: &RuleContext) -> Result<(), String>;  // blocks until shutdown
 }
 ```
 
@@ -159,7 +160,7 @@ This is the **central switchboard**. For each rule in the config, `start_single_
 
 **Step 2 — find_crypto():** Looks up `registry.find_crypto(ctx.security_provider)` to get a `&dyn CryptoProvider`.
 
-**Step 3 — Dispatch:** Calls `provider.run_encrypt(ctx)` or `provider.run_decrypt(ctx)` based on the rule's `direction`. This call **blocks until shutdown** — the thread is owned by the provider from this point on.
+**Step 3 — Dispatch:** Calls `provider.run_encrypt(&ctx)` or `provider.run_decrypt(&ctx)` based on the rule's `direction`. This call **blocks until shutdown** — the thread is owned by the provider from this point on.
 
 ### 6. Security Engines (blue boxes, bottom)
 

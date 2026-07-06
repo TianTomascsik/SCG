@@ -1,7 +1,7 @@
 //! Crypto provider trait for extensible security engines.
 //!
 //! Each crypto provider implements one method of encrypting/decrypting traffic.
-//! Built-in providers: TLS, kTLS, DTLS.
+//! Built-in providers: TLS, kTLS, DTLS, WireGuard, routing.
 //! New providers can be added by implementing `CryptoProvider` and registering
 //! them in the `ProviderRegistry`.
 
@@ -24,7 +24,8 @@ pub struct ProviderMode {
 /// # Adding a new provider
 ///
 /// 1. Create a struct implementing this trait
-/// 2. Register it in `main.rs` via `registry.register_crypto(Box::new(MyProvider))`
+/// 2. Register it in `lib.rs::run` via `registry.register_crypto(Box::new(MyProvider))`
+///    (or inject it out-of-tree via `gateway::run(extra_crypto, extra_app)`)
 /// 3. Use the provider's `name()` as the `"security_provider"` value in config
 pub trait CryptoProvider: Send + Sync {
     /// Unique string identifier used in config (e.g., "tls", "ktls", "dtls").

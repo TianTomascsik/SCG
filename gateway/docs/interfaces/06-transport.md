@@ -141,6 +141,15 @@ impl TransportFactory for TcpTransport {
 
 ## Selection
 
+> **Note — proposed vs as-built.** The `TransportFactory` seam and a `transport`
+> selector key below are *proposed*. As-built there is **no `transport` key**:
+> all four transports are chosen by **`listen_proto`** (`"tcp"|"udp"|"uds"|"shm"`),
+> and — critically — **UDS/SHM are not statically bound at a fixed path**. They are
+> **dynamically provisioned per app / traffic class** through the management API
+> (see [10 — Management API](10-management-api.md) and
+> [09 — Configuration](09-configuration.md)); a `uds`/`shm` rule uses
+> `"listen_addr": "local"`, not a socket path.
+
 ```json
 { "transport": "uds", "listen_addr": "/run/scg/in.sock", "upstream_addr": "/run/scg/out.sock" }
 ```

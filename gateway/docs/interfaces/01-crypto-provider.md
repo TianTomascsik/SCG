@@ -110,7 +110,7 @@ forward plaintext on the protected side when protection cannot be established.
 | `KtlsProvider` | `"ktls"` | [providers/ktls_provider.rs](../../src/security/providers/ktls_provider.rs) | Kernel TLS offload; shares the TLS engine. Non-offloadable profiles fall back to userspace `tls`; integrity-only is rejected at config-load. |
 | `DtlsProvider` | `"dtls"` | [providers/dtls_provider.rs](../../src/security/providers/dtls_provider.rs) | Datagram TLS; UDP only. DTLS 1.0 (CBC) + DTLS 1.2 (AEAD), verify/CA/identity parity with `tls`. |
 | `WireguardProvider` | `"wireguard"` | [providers/wireguard_provider.rs](../../src/security/providers/wireguard_provider.rs) | Kernel WireGuard offload; UDP only. Provisions a `wg` interface ([wireguard_engine/](../../src/security/wireguard_engine.rs)) and relays plaintext through the kernel tunnel. Needs `CAP_NET_ADMIN`, the `wireguard` module, and `wg`; keys via `provider_params`. Interface-lifecycle provider — see also [06-transport.md](06-transport.md). |
-| `RoutingProvider` | `"routing"` | [providers/routing_provider.rs](../../src/security/providers/routing_provider.rs) | Plaintext L4 passthrough (no crypto): forward + classify/policy only. TCP encrypt + decrypt. |
+| `RoutingProvider` | `"routing"` | [providers/routing_provider.rs](../../src/security/providers/routing_provider.rs) | Plaintext L4 passthrough (no crypto): forward + classify/policy only. TCP **and** multi-client UDP (`run_udp_routing_listener` + `security/udp_session.rs`), encrypt + decrypt. |
 
 Shared engines: [tls_engine/](../../src/security/tls_engine/),
 [dtls_engine.rs](../../src/security/dtls_engine.rs).
@@ -180,7 +180,7 @@ impl CryptoProvider for MyProvider {
 
 ## Registration & selection
 
-Registered once in [main.rs](../../src/main.rs) on the
+Registered once in [lib.rs::run](../../src/lib.rs) (the composition root, not `main.rs`) on the
 [`ProviderRegistry`](../../src/processing/registry.rs):
 
 ```rust

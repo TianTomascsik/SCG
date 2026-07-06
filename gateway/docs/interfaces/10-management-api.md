@@ -1,7 +1,9 @@
 # 10 — Management & Admin API Interface
 
 > **Status:** 🟡 Proposed · **Traits:** `ManagementApi`, `AdminApi`,
-> `HealthCheck` · **Abstracts:** [api/mod.rs](../../src/api/mod.rs) (TODO stub) ·
+> `HealthCheck` · **Abstracts:** [api/mod.rs](../../src/api/mod.rs) — the
+> broader admin/status trait surface is proposed, but the **endpoint-provisioning
+> API is implemented** in [api/grpc.rs](../../src/api/grpc.rs) (see *Implemented* below) ·
 > **Stub:** [traits/management_api.rs](traits/management_api.rs)
 
 ## Purpose
@@ -135,9 +137,14 @@ impl ManagementApi for CoreManagement {
 
 ## Selection
 
-```json
-{ "api": { "bind": "127.0.0.1:50051", "protocol": "grpc",
-           "admin": { "enabled": true, "auth": "mtls" } } }
+```jsonc
+// Real keys. (The proposed `bind`/`protocol`/`admin`/`mtls` form is NOT shipped —
+//  there is no mTLS and no separate admin service; see "Implemented" below.)
+{ "api": { "uds_path": "/run/scg/management.sock",  // gRPC-over-UDS (SO_PEERCRED); default
+           "tcp_addr": null,                          // optional TCP — UNAUTHENTICATED (health only)
+           "runtime_dir": "/run/scg",
+           "max_endpoints_per_uid": 64,
+           "create_rate_per_min": 120 } }
 ```
 
 ## Conformance checklist
@@ -193,7 +200,9 @@ reuse it. Tokens never appear in logs (Debug masks them as `***`).
 | Unknown `app_id`/class/direction | `NOT_FOUND` |
 | uid/pid not authorized | `PERMISSION_DENIED` |
 | Per-uid quota or rate limit exceeded | `RESOURCE_EXHAUSTED` |
-| `decrypt` direction (v1) | `UNIMPLEMENTED` |
+
+Both `encrypt` and `decrypt` directions are supported (a decrypt endpoint creates
+just like an encrypt endpoint).
 
 Every denial emits one greppable audit line:
 `AUDIT deny op=… uid=… pid=… app_id=…: reason`. Resource guards are configured

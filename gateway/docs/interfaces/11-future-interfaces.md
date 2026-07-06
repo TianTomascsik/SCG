@@ -103,6 +103,31 @@ pub trait SecretStore: Send + Sync {
 }
 ```
 
+## G. Traffic Mirror — new `ObserverTap` (reuse UDS/SHM endpoints, interface 06)
+
+An **observer tap** that mirrors selected, already-decrypted **(plaintext)** flows to a
+read-only endpoint for recording / monitoring (IDS/NDR span-port, pcap, audit-of-payload),
+plus a reverse **test-injection** variant. It **reuses** the existing UDS/SHM local-interface
+machinery ([`interfaces/uds.rs`](../../src/interfaces/uds.rs) /
+[`shm.rs`](../../src/interfaces/shm.rs)) rather than adding a new data-plane subsystem: the
+relay feeds a **copy** of frames for a config-selected set of `traffic_id`s / rules to a
+read-only observer endpoint, carrying the same authenticated-endpoint discipline
+(`SO_PEERCRED` + single-use capability token). Status: **planned — no code today.**
+
+```rust
+pub trait ObserverTap: Send + Sync {
+    /// Should this flow be mirrored? (config-selected traffic_id / rule filter)
+    fn selects(&self, traffic_id: u32) -> bool;
+    /// Deliver a copy of a plaintext frame to the observer endpoint.
+    fn mirror(&self, traffic_id: u32, frame: &[u8]) -> Result<(), TapError>;
+}
+```
+
+> **⚠ Security.** A mirror exposes **plaintext** on the trusted side — a real trust-boundary
+> addition. It must be gated to explicitly-configured flows, reuse `SO_PEERCRED` + capability
+> token, and **pass a TRA before implementation**. See the Application Interfaces README
+> (`Architecture/Application Interfaces & Workers/README.md`, §10).
+
 ## Summary: new vs. reused
 
 | Future module | Interface strategy |
@@ -113,6 +138,7 @@ pub trait SecretStore: Send + Sync {
 | IAM | **New** `AuthProvider` (gates Admin API, 10) |
 | Crypto Policy / Algorithm Manager | **New** `CryptoPolicy` |
 | Network Namespace / Firewall Manager | **New** `NetworkManager` |
+| Traffic Mirror (observer tap) | **New** `ObserverTap` (reuses UDS/SHM endpoints, 06) |
 
 ## Conformance (when implemented)
 
