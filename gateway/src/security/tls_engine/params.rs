@@ -336,6 +336,17 @@ impl TlsSecurityParams {
                 if self.verify != VerifyMode::Mutual => {
                     return Err("subset146-pki profile requires verify = mutual".to_string());
                 }
+            TlsProfile::IntegrityOnly if self.is_tls13() => {
+                // TLS 1.3 removed every non-AEAD cipher suite; there is no NULL / integrity-only
+                // cipher suite it can negotiate (the draft TLS_SHA256_SHA256 / TLS_SHA384_SHA384
+                // codepoints are not implemented by OpenSSL), so an integrity-only 1.3 handshake
+                // negotiates zero ciphersuites and fails at handshake time. Reject at config load
+                // like the analogous subset146-psk + TLS 1.3 case above (TRA #85).
+                return Err(
+                    "integrity-only requires TLS 1.2 (TLS 1.3 has no NULL/integrity-only cipher suite)"
+                        .to_string(),
+                );
+            }
             _ => {}
         }
 
@@ -426,8 +437,13 @@ impl TlsSecurityParams {
             ),
             TlsProfile::Subset146Psk => (Some("DHE-PSK-AES256-GCM-SHA384:@SECLEVEL=0"), None),
             TlsProfile::IntegrityOnly => (
+                // The eNULL suites below are real OpenSSL TLS ≤1.2 ciphers. There is deliberately
+                // NO TLS 1.3 ciphersuite here: TLS 1.3 has no integrity-only / NULL cipher suite
+                // (the draft TLS_SHA256_SHA256 / TLS_SHA384_SHA384 codepoints are not implemented),
+                // and integrity-only + TLS 1.3 is rejected by `validate()` (TRA #85). Presetting
+                // fabricated 1.3 codepoints here was dead, unresolvable crypto config.
                 Some("ECDHE-ECDSA-NULL-SHA:ECDHE-RSA-NULL-SHA:NULL-SHA256:NULL-SHA:@SECLEVEL=0"),
-                Some("TLS_SHA384_SHA384:TLS_SHA256_SHA256"),
+                None,
             ),
         };
 
@@ -753,6 +769,30 @@ mod tests {
         let p = TlsSecurityParams::from_params(&m, Some("tls1.2")).unwrap();
         assert_eq!(p.profile, TlsProfile::IntegrityOnly);
         assert!(!p.is_ktls_offloadable());
+    }
+
+    #[test]
+    fn integrity_only_rejects_tls13() {
+        // TLS 1.3 has no NULL/integrity-only cipher suite, so integrity-only + TLS 1.3
+        // can never complete a handshake — it must be rejected at config load, not left
+        // to fail opaquely at handshake time (TRA #85).
+        let m = params_from(&[("profile", json!("integrity-only"))]);
+        assert!(TlsSecurityParams::from_params(&m, Some("tls1.3")).is_err());
+    }
+
+    #[test]
+    fn integrity_only_tls12_has_no_tls13_ciphersuites() {
+        // integrity-only is TLS 1.2 only: the eNULL cipher_list is real, but the TLS 1.3
+        // ciphersuite slot must be empty (previously it presetted fabricated draft codepoints
+        // TLS_SHA256_SHA256/TLS_SHA384_SHA384 that OpenSSL cannot resolve — TRA #85).
+        let m = params_from(&[("profile", json!("integrity-only"))]);
+        let p = TlsSecurityParams::from_params(&m, Some("tls1.2")).unwrap();
+        let (list, suites) = p.cipher_policy();
+        assert!(list.unwrap().contains("NULL-SHA"));
+        assert!(
+            suites.is_none(),
+            "integrity-only must yield no TLS 1.3 ciphersuites"
+        );
     }
 
     #[test]
