@@ -9,6 +9,8 @@ pub mod dtls_engine;
 pub mod provider;
 pub mod providers;
 pub mod relay;
+#[cfg(feature = "io_uring")]
+pub mod relay_uring;
 pub mod routing_engine;
 pub mod stubs;
 pub mod tls_engine;

@@ -6,6 +6,12 @@ description = "Transparent TLS/kTLS encryption proxy gateway (POC)"
 
 [features]
 default = []
+# Experimental, opt-in io_uring relay backend for the zero-copy splice data path
+# (evaluation PoC). Off by default; when compiled in it is still gated at run time by
+# the SCG_RELAY_IO_URING env var and falls back to the splice path if the ring
+# cannot be created, so a feature-on build with the switch off is byte-identical
+# to the default splice relay.
+io_uring = ["dep:io-uring"]
 
 [[bin]]
 name = "gateway"
@@ -22,6 +28,9 @@ serde = { version = "1", features = ["derive"] }
 ktls_pipe = { path = "../crates/ktls_pipe" }
 log = "0.4"
 env_logger = "0.11"
+# Optional: io_uring submission/completion backend for the splice relay (WP5 PoC).
+# Only linked when the `io_uring` feature is enabled.
+io-uring = { version = "0.7", optional = true }
 # Zeroize WireGuard key material (private keys / PSKs) on drop — the only crypto
 # the WireGuard provider holds in userspace, since the cipher work is offloaded
 # to the kernel `wireguard` module. Apache-2.0/MIT.

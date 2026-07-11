@@ -544,8 +544,236 @@ fn splice_one_direction(
 /// - Separate WouldBlock from EOF to avoid unnecessary recv(MSG_PEEK)
 /// - 16 MiB pipe buffers for fewer splice calls per data volume
 // Internal relay entry point; a param struct is a larger refactor than warranted here.
+//
+// Dispatcher: when the `io_uring` feature is compiled in and its runtime switch is
+// set, and the connection uses none of the knobs the io_uring backend does not
+// implement (adaptive BDP tuning, geo-delay simulation), try the io_uring relay and
+// fall back to the poll+splice implementation on any ring-setup failure. With the
+// feature off this is a direct call to the splice implementation, so the default
+// build is byte-identical.
 #[allow(clippy::too_many_arguments)]
 pub fn relay_bidirectional_splice(
+    tls_fd: RawFd,
+    upstream_fd: RawFd,
+    conn_metrics: &mut ConnectionMetrics,
+    shutdown: &AtomicBool,
+    delay_ms: u64,
+    pipe_size: usize,
+    busy_poll_us: u32,
+    bdp_adaptive: bool,
+    bdp_queue_budget_us: u64,
+) -> io::Result<()> {
+    // Backend study: select the fd<->fd relay backend at run time. All of
+    // this is behind the `io_uring` feature, so the default build is a direct call
+    // to the splice path below (byte-identical). geo-delay simulation is only
+    // implemented by the splice path, so a non-zero delay always uses it.
+    #[cfg(feature = "io_uring")]
+    if delay_ms == 0 {
+        match relay_backend_selection() {
+            RelayBackendSel::ReadWrite => {
+                return relay_bidirectional_readwrite(
+                    tls_fd,
+                    upstream_fd,
+                    conn_metrics,
+                    shutdown,
+                    busy_poll_us,
+                    pipe_size,
+                );
+            }
+            RelayBackendSel::IoUringSplice if !bdp_adaptive => {
+                match crate::security::relay_uring::relay_bidirectional_splice_uring(
+                    tls_fd,
+                    upstream_fd,
+                    conn_metrics,
+                    shutdown,
+                    delay_ms,
+                    pipe_size,
+                    busy_poll_us,
+                    bdp_adaptive,
+                    bdp_queue_budget_us,
+                ) {
+                    Ok(()) => return Ok(()),
+                    // The io_uring backends only return Err before any bytes move
+                    // (ring/pipe/buffer setup), so falling back here cannot re-relay
+                    // a mid-stream connection.
+                    Err(e) => debug!("io_uring splice unavailable ({e}); using splice backend"),
+                }
+            }
+            RelayBackendSel::IoUringRecvSend => {
+                match crate::security::relay_uring::relay_bidirectional_recvsend_uring(
+                    tls_fd,
+                    upstream_fd,
+                    conn_metrics,
+                    shutdown,
+                    pipe_size,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => debug!("io_uring recv/send unavailable ({e}); using splice backend"),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    relay_bidirectional_splice_pollsplice(
+        tls_fd,
+        upstream_fd,
+        conn_metrics,
+        shutdown,
+        delay_ms,
+        pipe_size,
+        busy_poll_us,
+        bdp_adaptive,
+        bdp_queue_budget_us,
+    )
+}
+
+/// Runtime relay-backend selection for the fd<->fd path (relay-backend study). Read per
+/// connection from `SCG_RELAY_BACKEND`, with `SCG_RELAY_IO_URING=1` kept as an
+/// alias for `iouring_splice`. Only compiled under the `io_uring` feature.
+#[cfg(feature = "io_uring")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayBackendSel {
+    Splice,
+    ReadWrite,
+    IoUringSplice,
+    IoUringRecvSend,
+}
+
+#[cfg(feature = "io_uring")]
+fn relay_backend_selection() -> RelayBackendSel {
+    match std::env::var("SCG_RELAY_BACKEND").ok().as_deref() {
+        Some("readwrite") => RelayBackendSel::ReadWrite,
+        Some("iouring_splice") => RelayBackendSel::IoUringSplice,
+        Some("iouring_rw") | Some("iouring_recvsend") => RelayBackendSel::IoUringRecvSend,
+        Some("splice") => RelayBackendSel::Splice,
+        _ => {
+            if matches!(
+                std::env::var("SCG_RELAY_IO_URING").ok().as_deref(),
+                Some("1") | Some("true") | Some("yes")
+            ) {
+                RelayBackendSel::IoUringSplice
+            } else {
+                RelayBackendSel::Splice
+            }
+        }
+    }
+}
+
+/// Best-effort `shutdown(fd, SHUT_WR)` for relay teardown.
+#[cfg(feature = "io_uring")]
+fn shutdown_write_fd(fd: RawFd) {
+    // SAFETY: `fd` is a valid open socket owned by the caller; `shutdown` takes the
+    // fd and `SHUT_WR` and touches no memory. Result ignored (best-effort teardown).
+    unsafe {
+        libc::shutdown(fd, libc::SHUT_WR);
+    }
+}
+
+/// Copy-based poll(2) + read/write fd<->fd relay (the baseline for the io_uring
+/// recv/send comparison). Unlike the splice path it makes two userspace copies per
+/// message, but it is the fair syscall-I/O counterpart to io_uring recv/send.
+#[cfg(feature = "io_uring")]
+fn relay_bidirectional_readwrite(
+    a_fd: RawFd,
+    b_fd: RawFd,
+    conn_metrics: &mut ConnectionMetrics,
+    shutdown: &AtomicBool,
+    busy_poll_us: u32,
+    buf_size: usize,
+) -> io::Result<()> {
+    set_nonblocking_fd(a_fd);
+    set_nonblocking_fd(b_fd);
+    set_quickack(a_fd);
+    set_quickack(b_fd);
+    let cap = buf_size.clamp(64 * 1024, 4 * 1024 * 1024);
+    let mut buf = vec![0u8; cap];
+
+    // Drain one direction until WouldBlock/EOF. Returns Ok(true) to keep relaying,
+    // Ok(false) to tear down (EOF or unrecoverable error).
+    fn drain(src: RawFd, dst: RawFd, buf: &mut [u8], m: &mut ConnectionMetrics) -> bool {
+        loop {
+            // SAFETY: `buf` is a valid mutable slice; `read` writes at most `buf.len()`
+            // bytes into it and returns the count (or <0, checked below).
+            let n = unsafe { libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::WouldBlock => return true,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return false,
+                }
+            }
+            if n == 0 {
+                return false; // EOF
+            }
+            let got = n as usize;
+            let mut off = 0usize;
+            while off < got {
+                // SAFETY: `buf[off..got]` is within the initialised region just read;
+                // `write` reads at most `got - off` bytes from that valid pointer.
+                let w = unsafe {
+                    libc::write(dst, buf[off..].as_ptr() as *const libc::c_void, got - off)
+                };
+                if w < 0 {
+                    let e = io::Error::last_os_error();
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            let mut pfd = libc::pollfd {
+                                fd: dst,
+                                events: libc::POLLOUT,
+                                revents: 0,
+                            };
+                            // SAFETY: `&mut pfd` is a single live pollfd and the count
+                            // `1` matches it; `poll` touches only `pfd`. Result ignored.
+                            unsafe {
+                                libc::poll(&mut pfd, 1, 100);
+                            }
+                            continue;
+                        }
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return false,
+                    }
+                }
+                if w == 0 {
+                    return false;
+                }
+                off += w as usize;
+            }
+            m.record_read(got);
+            m.record_relay(got);
+        }
+    }
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let (a_ready, b_ready) = poll_two_fds_with_spin(a_fd, b_fd, 0, busy_poll_us, 100)?;
+        if !a_ready && !b_ready {
+            continue;
+        }
+        if a_ready && !drain(a_fd, b_fd, &mut buf, conn_metrics) {
+            shutdown_write_fd(b_fd);
+            shutdown_write_fd(a_fd);
+            return Ok(());
+        }
+        if b_ready && !drain(b_fd, a_fd, &mut buf, conn_metrics) {
+            shutdown_write_fd(a_fd);
+            shutdown_write_fd(b_fd);
+            return Ok(());
+        }
+    }
+
+    shutdown_write_fd(a_fd);
+    shutdown_write_fd(b_fd);
+    Ok(())
+}
+
+/// The poll(2)+splice(2) zero-copy relay (the default backend). See the dispatcher
+/// [`relay_bidirectional_splice`] above.
+#[allow(clippy::too_many_arguments)]
+fn relay_bidirectional_splice_pollsplice(
     tls_fd: RawFd,
     upstream_fd: RawFd,
     conn_metrics: &mut ConnectionMetrics,
