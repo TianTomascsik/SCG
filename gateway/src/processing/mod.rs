@@ -281,11 +281,22 @@ pub fn start_single_rule(
         )
         .map(|p| p.is_ktls_offloadable())
         .unwrap_or(false);
+    let kernel_ktls = ktls_pipe::kernel_supports_ktls();
+    // Surface the kernel-side fallback once per rule: without the `tls` ULP the
+    // connections silently run on userspace TLS, and the preflight warning only
+    // appears at --validate/startup preflight, not in the rule's own log.
+    if configured_provider == "ktls" && !kernel_ktls {
+        warn!(
+            "[{}] rule requests kTLS but the kernel TLS ULP is unavailable \
+             (try: modprobe tls); the rule runs on userspace TLS",
+            rule_name
+        );
+    }
     let security_provider = crate::management::config::resolve_crypto_provider(
         &configured_provider,
         offloadable,
         config.prefer_ktls,
-        ktls_pipe::kernel_supports_ktls(),
+        kernel_ktls,
     )
     .to_string();
     if security_provider != configured_provider {
@@ -296,8 +307,9 @@ pub fn start_single_rule(
             );
         } else {
             warn!(
-                "[{}] kTLS cannot offload this rule's crypto parameters; \
-                 falling back to userspace TLS",
+                "[{}] rule requests kTLS but its crypto parameters are not \
+                 offloadable (kTLS offloads only the AES-GCM record-layer \
+                 profiles); falling back to userspace TLS",
                 rule_name
             );
         }

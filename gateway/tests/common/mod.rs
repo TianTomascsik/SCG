@@ -15,7 +15,7 @@ pub mod qos;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,10 @@ use gateway::security::providers::wireguard_provider::WireguardProvider;
 pub struct EchoServer {
     /// `127.0.0.1:<port>` address the gateway should use as `upstream_addr`.
     pub addr: String,
+    /// Completed TLS accepts whose session was resumed (`SSL_session_reused`).
+    pub resumed_accepts: Arc<AtomicUsize>,
+    /// Completed TLS accepts that ran a full handshake.
+    pub full_accepts: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -79,7 +83,11 @@ impl EchoServer {
             .expect("echo set_nonblocking");
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let resumed_accepts = Arc::new(AtomicUsize::new(0));
+        let full_accepts = Arc::new(AtomicUsize::new(0));
         let sd = shutdown.clone();
+        let resumed_ctr = resumed_accepts.clone();
+        let full_ctr = full_accepts.clone();
         let handle = std::thread::spawn(move || {
             let acceptor = build_tls_acceptor(&params).expect("build tls acceptor");
             while !sd.load(Ordering::Relaxed) {
@@ -87,6 +95,8 @@ impl EchoServer {
                     Ok((stream, _peer)) => {
                         let acc = acceptor.clone();
                         let conn_sd = sd.clone();
+                        let resumed_ctr = resumed_ctr.clone();
+                        let full_ctr = full_ctr.clone();
                         std::thread::spawn(move || {
                             // Accepted sockets must be blocking for the handshake.
                             let _ = stream.set_nonblocking(false);
@@ -94,6 +104,13 @@ impl EchoServer {
                                 Ok(s) => s,
                                 Err(_) => return,
                             };
+                            // Record whether this accept resumed a cached session
+                            // (drives the tls_resumption.rs assertions).
+                            if tls.ssl().session_reused() {
+                                resumed_ctr.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                full_ctr.fetch_add(1, Ordering::SeqCst);
+                            }
                             let mut buf = [0u8; 16 * 1024];
                             loop {
                                 if conn_sd.load(Ordering::Relaxed) {
@@ -122,6 +139,8 @@ impl EchoServer {
 
         EchoServer {
             addr,
+            resumed_accepts,
+            full_accepts,
             shutdown,
             handle: Some(handle),
         }

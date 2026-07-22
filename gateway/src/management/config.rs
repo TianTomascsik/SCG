@@ -1709,7 +1709,10 @@ impl GatewayConfig {
                     warnings.push(
                         "TPROXY routing policy not found (ip rule fwmark 1 lookup 100). \
                          Incoming decrypt via TPROXY will not work without it. \
-                         Run setup_gateway.sh or: ip rule add fwmark 1 lookup 100"
+                         Add an `intercept` block to the rule so the gateway configures \
+                         policy routing itself at startup, or run manually: \
+                         ip rule add fwmark 1 lookup 100 && \
+                         ip route add local default dev lo table 100"
                             .to_string(),
                     );
                 }
@@ -2037,8 +2040,12 @@ impl GatewayConfig {
             Ok(status) if !status.success() => {
                 warnings.push(format!(
                     "iptables chain '{}' not found in {} table. \
-                     Traffic interception will not work. Run setup_gateway.sh to configure.",
-                    chain, table
+                     Traffic interception will not work without it. \
+                     Add an `intercept` block to the rule so the gateway installs its \
+                     netfilter rules itself at startup, or create the chain manually \
+                     (iptables -t {} -N {}, a PREROUTING jump, and per-rule \
+                     REDIRECT/TPROXY entries).",
+                    chain, table, table, chain
                 ));
             }
             Err(_) => {

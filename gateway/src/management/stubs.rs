@@ -23,7 +23,7 @@
 // - iptables/nftables rule management (SCG_ENCRYPT, SCG_DECRYPT chains)
 // - TPROXY routing policy setup (ip rule fwmark 1 lookup 100)
 // - Network namespace creation for isolation
-// - Automated setup_gateway.sh equivalent
+// - Automated host setup (netfilter chains + policy routing)
 
 // TODO: Certificate Revocation & OCSP
 // - CRL download and caching

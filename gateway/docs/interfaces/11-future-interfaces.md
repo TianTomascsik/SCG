@@ -61,9 +61,10 @@ This complements [interface 05](05-cert-key-management.md): keys/certs decide
 
 ## D. Network Namespace & Firewall Manager — new `NetworkManager`
 
-Automates what the `setup_gateway.sh` scripts do today: iptables/nftables chains
-(`SCG_ENCRYPT`, `SCG_DECRYPT`), TPROXY routing (`ip rule fwmark 1 lookup 100`),
-and network-namespace isolation. Consumed at startup and by the
+Generalizes today's host setup — done by the `FirewallManager` for `intercept`
+rules, or manually by the operator: iptables/nftables chains (`SCG_ENCRYPT`,
+`SCG_DECRYPT`), TPROXY routing (`ip rule fwmark 1 lookup 100`), and
+network-namespace isolation. Consumed at startup and by the
 [transport](06-transport.md) layer for transparent mode.
 
 ```rust
