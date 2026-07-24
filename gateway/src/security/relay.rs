@@ -668,3 +668,32 @@ pub fn relay_bidirectional_splice(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::apply_geo_delay;
+    use std::time::Instant;
+
+    #[test]
+    fn geo_delay_zero_is_a_noop() {
+        // Development-mode geo delay of 0 must not sleep (fast path).
+        let start = Instant::now();
+        apply_geo_delay(0);
+        assert!(
+            start.elapsed().as_millis() < 5,
+            "apply_geo_delay(0) should return immediately"
+        );
+    }
+
+    #[test]
+    fn geo_delay_sleeps_at_least_requested() {
+        // A configured delay must add at least that much latency per telegram.
+        let delay_ms = 20;
+        let start = Instant::now();
+        apply_geo_delay(delay_ms);
+        assert!(
+            start.elapsed().as_millis() >= delay_ms as u128,
+            "apply_geo_delay({delay_ms}) slept less than requested"
+        );
+    }
+}
