@@ -11,6 +11,10 @@
 //! Runs unprivileged: the boot configs use loopback + self-signed TLS and carry
 //! no `intercept` block, so no firewall/CAP_NET_ADMIN setup is triggered.
 
+// Several helpers and imports are used only by the `dev`-gated flat-config tests
+// below; in a default (production-feature) build they are intentionally unused.
+#![allow(dead_code, unused_imports)]
+
 mod common;
 
 use std::io::Write;
@@ -20,6 +24,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::temp_dir;
+
+use openssl::base64;
+use openssl::hash::{hash, MessageDigest};
+use openssl::pkey::PKey;
+use openssl::sign::Signer;
 
 /// Path to the built `gateway` binary (Cargo sets this for integration tests).
 fn gateway_bin() -> &'static str {
@@ -143,6 +152,7 @@ fn no_args_prints_usage_and_exits_zero() {
     );
 }
 
+#[cfg(feature = "dev")]
 #[test]
 fn validate_good_config_succeeds() {
     // A simple, unprivileged config (no transparent/intercept rules, so preflight
@@ -179,6 +189,7 @@ fn validate_good_config_succeeds() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[cfg(feature = "dev")]
 #[test]
 fn validate_honours_log_level_flags() {
     // Drives the log-level resolution arms in `run()`: an explicit level and an
@@ -213,6 +224,7 @@ fn validate_honours_log_level_flags() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[cfg(feature = "dev")]
 #[test]
 fn validate_missing_config_fails() {
     let out = Command::new(gateway_bin())
@@ -243,8 +255,149 @@ fn missing_config_flag_errors() {
     );
 }
 
+// In a production (non-`dev`) build the unsigned single-file `--config` loader is
+// compiled out: the binary must refuse it and point the operator at the signed
+// `--config-dir` path (SCG-TRA #87).
+#[cfg(not(feature = "dev"))]
+#[test]
+fn config_flag_rejected_without_dev_feature() {
+    let tmp = temp_dir("cli-prod-refuse");
+    let cfg_path = tmp.join("gw.json");
+    std::fs::write(
+        &cfg_path,
+        r#"{ "rules": [{
+            "name": "x", "direction": "encrypt",
+            "listen_addr": "127.0.0.1:65000", "listen_proto": "tcp",
+            "upstream_addr": "127.0.0.1:9", "upstream_proto": "tcp",
+            "security_provider": "routing", "traffic_class": "normal"
+        }] }"#,
+    )
+    .unwrap();
+
+    let out = Command::new(gateway_bin())
+        .args(["--validate", "--config", cfg_path.to_str().unwrap()])
+        .output()
+        .expect("spawn production gateway with --config");
+
+    assert!(
+        !out.status.success(),
+        "a production build must reject --config (unsigned flat config)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--config-dir"),
+        "refusal should direct the operator to the signed --config-dir; got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ── Signed layered config (`--config-dir`): the production config source ──────
+
+/// Lowercase-hex SHA-256, matching the gateway's `integrity::sha256_hex`.
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = hash(MessageDigest::sha256(), data).expect("sha256");
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest.iter() {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Write a detached base64 Ed25519 signature (`<path>.sig`) over the file's
+/// exact bytes, exactly as `tools/validate_config.py sign` and the gateway's
+/// `integrity` module expect.
+fn write_sig(path: &Path, key: &PKey<openssl::pkey::Private>) {
+    let data = std::fs::read(path).expect("read for signing");
+    let mut signer = Signer::new_without_digest(key).expect("ed25519 signer");
+    let sig = signer.sign_oneshot_to_vec(&data).expect("sign");
+    let b64 = base64::encode_block(&sig);
+    let mut sig_path = path.as_os_str().to_os_string();
+    sig_path.push(".sig");
+    std::fs::write(sig_path, b64).expect("write .sig");
+}
+
+/// A production gateway build accepts only the signed, layered `--config-dir`
+/// configuration (SCG-TRA #87). Build a minimal, self-consistent signed config
+/// directory at test time (schema + hash-pinned defaults + user + detached
+/// Ed25519 signatures) and assert the real binary loads, verifies, maps, and
+/// validates it — the positive counterpart to the flat-config refusal test, and
+/// the end-to-end proof that the production config path works in *both* the
+/// default and `dev` builds.
+#[test]
+fn signed_config_dir_validates() {
+    let tmp = temp_dir("cli-signed-dir");
+    let dir = tmp.join("config");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The schema is opaque to the Rust loader — only its pinned hash is checked.
+    let schema = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
+    let schema_path = dir.join("scg.lite.schema.json");
+    std::fs::write(&schema_path, schema).unwrap();
+    let schema_hash = sha256_hex(schema.as_bytes());
+
+    let defaults = serde_json::json!({
+        "schema_version": "1.0",
+        "defaults": {
+            "connection": { "enabled": true, "transparent": false },
+            "protection": { "default_mode": "full" }
+        },
+        "runtime": {
+            "config_manager": { "schema_sha256": schema_hash },
+            "config_signing": { "algorithm": "ed25519", "signature_suffix": ".sig" }
+        },
+        "crypto": {
+            "profiles": [ { "profile_id": "routing_only", "protocol": "NONE" } ]
+        }
+    });
+
+    // One loopback routing connection: no TLS posture errors, no DNS, so
+    // `--validate` passes (routing-over-tcp is a warning, not an error).
+    let port = free_port();
+    let user = serde_json::json!({
+        "apps": [ { "app_id": "app", "default_traffic_class": "normal" } ],
+        "connections": [ {
+            "connection_id": "c-routing",
+            "app_id": "app",
+            "protection": { "mode": "routing_only", "profile_ref": "routing_only", "role": "none" },
+            "transport": { "protocol": "tcp" },
+            "ingress": { "endpoint": { "ip": "127.0.0.1", "port": port, "protocol": "tcp" } },
+            "paths": [ { "path_id": "p", "egress": { "endpoint": { "host": "127.0.0.1", "port": 9, "protocol": "tcp" } } } ]
+        } ]
+    });
+
+    let defaults_path = dir.join("scg.defaults.json");
+    let user_path = dir.join("scg.user.json");
+    std::fs::write(&defaults_path, serde_json::to_vec_pretty(&defaults).unwrap()).unwrap();
+    std::fs::write(&user_path, serde_json::to_vec_pretty(&user).unwrap()).unwrap();
+
+    // Sign defaults + user with a freshly generated Ed25519 key; the public key
+    // is passed explicitly as the trust anchor (avoids the co-located-anchor
+    // posture advisory).
+    let key = PKey::generate_ed25519().expect("gen ed25519");
+    let pubkey_path = tmp.join("config-signing.pub.pem");
+    std::fs::write(&pubkey_path, key.public_key_to_pem().unwrap()).unwrap();
+    write_sig(&defaults_path, &key);
+    write_sig(&user_path, &key);
+
+    let out = Command::new(gateway_bin())
+        .args(["--validate", "--config-dir", dir.to_str().unwrap()])
+        .args(["--config-pubkey", pubkey_path.to_str().unwrap()])
+        .output()
+        .expect("spawn gateway --validate --config-dir");
+
+    assert!(
+        out.status.success(),
+        "a signed --config-dir must validate and exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 // ── Full boot + graceful shutdown ────────────────────────────────────────────
 
+#[cfg(feature = "dev")]
 #[test]
 fn boot_then_sigterm_shuts_down_cleanly() {
     let tmp = temp_dir("cli-boot");
@@ -274,6 +427,7 @@ fn boot_then_sigterm_shuts_down_cleanly() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[cfg(feature = "dev")]
 #[test]
 fn boot_then_sighup_reloads_then_sigterm() {
     let tmp = temp_dir("cli-reload");

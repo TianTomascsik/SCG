@@ -48,6 +48,63 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+/// Resolve the classic single-file `--config <FILE>` configuration.
+///
+/// This unsigned flat config carries no integrity or authenticity guarantee, so
+/// it is a **development-only** convenience compiled in only with the `dev`
+/// Cargo feature (SCG-TRA #87). The signed, layered `--config-dir` path is
+/// always available and is the only source a production build accepts.
+///
+/// Returns the same tuple shape as the lite-config branch:
+/// `(config, warnings, watch_path, lite_source)`.
+#[cfg(feature = "dev")]
+fn resolve_flat_config(
+    args: &[String],
+    registry: &ProviderRegistry,
+) -> (GatewayConfig, Vec<String>, String, Option<LiteSource>) {
+    let config_path = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!("Error: --config PATH or --config-dir DIR is required");
+            print_usage(&args[0], registry);
+            std::process::exit(1);
+        });
+    match GatewayConfig::load(&config_path) {
+        Ok(c) => (c, Vec::new(), config_path, None),
+        Err(e) => {
+            eprintln!("Configuration error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Production builds refuse the unsigned single-file config: only the signed,
+/// layered `--config-dir` configuration is accepted (SCG-TRA #87). This variant
+/// is compiled when the `dev` feature is **off**; it never returns, so the
+/// caller's tuple binding is satisfied by the diverging `exit`.
+#[cfg(not(feature = "dev"))]
+fn resolve_flat_config(
+    args: &[String],
+    registry: &ProviderRegistry,
+) -> (GatewayConfig, Vec<String>, String, Option<LiteSource>) {
+    if args.iter().any(|a| a == "--config") {
+        eprintln!(
+            "Error: the single-file --config <FILE> (unsigned flat config) is a dev-only build feature."
+        );
+        eprintln!(
+            "Production builds require a signed, layered configuration: --config-dir <DIR> [--config-pubkey <KEY>]."
+        );
+        eprintln!("Rebuild the gateway with `--features dev` to enable --config.");
+    } else {
+        eprintln!("Error: --config-dir <DIR> is required (signed, layered configuration).");
+    }
+    print_usage(&args[0], registry);
+    std::process::exit(1);
+}
+
 /// Run the gateway runtime.
 ///
 /// The built-in TLS/kTLS/DTLS/WireGuard/routing crypto providers and ALE/Raw
@@ -127,23 +184,7 @@ pub fn run(
             }
         }
     } else {
-        let config_path = args
-            .iter()
-            .position(|a| a == "--config")
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-            .unwrap_or_else(|| {
-                eprintln!("Error: --config PATH or --config-dir DIR is required");
-                print_usage(&args[0], &registry);
-                std::process::exit(1);
-            });
-        match GatewayConfig::load(&config_path) {
-            Ok(c) => (c, Vec::new(), config_path, None),
-            Err(e) => {
-                eprintln!("Configuration error: {}", e);
-                std::process::exit(1);
-            }
-        }
+        resolve_flat_config(&args, &registry)
     };
 
     // Parse --log-level CLI flag (overrides config log_level)
@@ -603,15 +644,25 @@ fn write_stderr(msg: &[u8]) {
 }
 
 fn print_usage(prog: &str, registry: &ProviderRegistry) {
-    eprintln!(
-        "Usage: {} (--config PATH | --config-dir DIR) [OPTIONS]",
-        prog
-    );
+    // The classic single-file `--config` loader is a `dev`-only build feature
+    // (SCG-TRA #87); the usage line and option help reflect the current build.
+    #[cfg(feature = "dev")]
+    {
+        eprintln!(
+            "Usage: {} (--config PATH | --config-dir DIR) [OPTIONS]",
+            prog
+        );
+    }
+    #[cfg(not(feature = "dev"))]
+    {
+        eprintln!("Usage: {} --config-dir DIR [OPTIONS]", prog);
+    }
     eprintln!();
     eprintln!("  Transparent encryption proxy gateway with extensible provider architecture");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --config PATH        Path to a classic single-file JSON config");
+    #[cfg(feature = "dev")]
+    eprintln!("  --config PATH        Path to a classic single-file JSON config (dev builds only)");
     eprintln!("  --config-dir DIR     Path to a layered 'lite' config dir (signed");
     eprintln!("                       scg.defaults.json + scg.user.json + schema)");
     eprintln!("  --config-pubkey PATH Ed25519 signing public key (trust anchor) for");

@@ -38,26 +38,38 @@ application.
 ## Quick Start
 
 ```bash
-# Build
+# Build (production: accepts only the signed --config-dir configuration)
 cargo build --release --bin gateway
 
-# Run with config
+# Build for development (also accepts the unsigned single-file --config)
+cargo build --release --bin gateway --features dev
+
+# Run with a signed, layered configuration directory (production)
+sudo ./target/release/gateway --config-dir /etc/scg/config
+
+# Run with a single-file config (requires a --features dev build)
 sudo ./target/release/gateway --config gateway/gateway.example.json
 
-# Run with overrides
-sudo ./target/release/gateway \
-    --config gateway.json \
-    --watch
+# Enable hot-reload polling
+sudo ./target/release/gateway --config-dir /etc/scg/config --watch
 
-# Validate config without starting
-sudo ./target/release/gateway --config gateway.json --validate
+# Validate a configuration without starting
+sudo ./target/release/gateway --config-dir /etc/scg/config --validate
 ```
+
+> **Config integrity.** The unsigned single-file `--config <FILE>` loader is a
+> development-only build feature (`--features dev`). A default (production) build
+> accepts only the signed, layered `--config-dir` (Ed25519-signed
+> `scg.defaults.json` + `scg.user.json` with a pinned schema hash, verified
+> fail-closed). See SCG-TRA finding #87.
 
 ### CLI Options
 
 | Flag | Description |
 |---|---|
-| `--config PATH` | Path to JSON configuration file **(required)** |
+| `--config-dir DIR` | Signed, layered config directory **(required in production builds)** |
+| `--config-pubkey PATH` | Ed25519 trust anchor for `--config-dir` (defaults to `DIR/trust/config-signing.pub.pem`) |
+| `--config PATH` | Single-file JSON config (**`--features dev` builds only**) |
 | `--validate` | Validate config and check environment, then exit |
 | `--log-level LVL` | Set log level: error, warn, info, debug, trace (default: info) |
 | `--watch` | Enable config file polling every 2 seconds |
@@ -355,7 +367,7 @@ Configure via CLI flag or JSON config:
 
 ```bash
 # CLI flag (overrides config file)
-gateway --config gateway.json --log-level debug
+gateway --config-dir /etc/scg/config --log-level debug
 
 # JSON config
 { "log_level": "debug" }
@@ -364,7 +376,7 @@ gateway --config gateway.json --log-level debug
 The `RUST_LOG` environment variable is also supported for fine-grained per-module control:
 
 ```bash
-RUST_LOG=gateway::security=trace gateway --config gateway.json
+RUST_LOG=gateway::security=trace gateway --config-dir /etc/scg/config
 ```
 
 ### Data minimization & retention
@@ -546,7 +558,7 @@ sudo systemctl reload SecureCommunicationGateway
 With `--watch`, the config file is polled every 2 seconds:
 
 ```bash
-gateway --config gateway.json --watch
+gateway --config-dir /etc/scg/config --watch
 ```
 
 ### What happens on reload
@@ -564,7 +576,7 @@ Rules are identified by `name`. To modify a rule, change its name (which removes
 Use `--validate` to verify both the config file and the runtime environment:
 
 ```bash
-gateway --config gateway.json --validate
+gateway --config-dir /etc/scg/config --validate
 ```
 
 | Check | Type | Description |
