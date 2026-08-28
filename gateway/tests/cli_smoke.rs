@@ -368,7 +368,11 @@ fn signed_config_dir_validates() {
 
     let defaults_path = dir.join("scg.defaults.json");
     let user_path = dir.join("scg.user.json");
-    std::fs::write(&defaults_path, serde_json::to_vec_pretty(&defaults).unwrap()).unwrap();
+    std::fs::write(
+        &defaults_path,
+        serde_json::to_vec_pretty(&defaults).unwrap(),
+    )
+    .unwrap();
     std::fs::write(&user_path, serde_json::to_vec_pretty(&user).unwrap()).unwrap();
 
     // Sign defaults + user with a freshly generated Ed25519 key; the public key

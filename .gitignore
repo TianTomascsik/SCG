@@ -9,3 +9,17 @@
 
 # Logs
 *.log
+
+# Compiled example clients (built via crates/scg-client/examples/Makefile)
+crates/scg-client/examples/c_client
+crates/scg-client/examples/cpp_client
+crates/scg-client/examples/zc_client
+
+# Editor / local
+*.bak
+*.orig
+*~
+.idea/
+.vscode/
+.env
+.env.*

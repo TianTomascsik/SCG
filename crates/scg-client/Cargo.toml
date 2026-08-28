@@ -1,9 +1,12 @@
 [package]
 name = "scg-client"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Client library (Rust core + C/C++ ABI) for the SCG local interfaces (UDS and shared memory)."
+publish = false
 
 [lib]
 name = "scg_client"

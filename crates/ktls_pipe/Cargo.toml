@@ -1,7 +1,12 @@
 [package]
 name = "ktls_pipe"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Kernel TLS (kTLS) session primitives shared with the SCG gateway data plane."
+publish = false
 
 [dependencies]
 openssl = "0.10"

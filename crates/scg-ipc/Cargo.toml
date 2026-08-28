@@ -1,9 +1,12 @@
 [package]
 name = "scg-ipc"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Shared IPC primitives for the Secure Communication Gateway and its client libraries: framed packets, sealed shared-memory rings, capability tokens, and Linux IPC syscall helpers."
-license = "Apache-2.0"
+publish = false
 
 [dependencies]
 libc = "0.2"

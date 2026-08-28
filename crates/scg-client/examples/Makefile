@@ -47,4 +47,4 @@ run-cpp: cpp_client
 	LD_LIBRARY_PATH=$(LIBDIR) ./cpp_client $(APP) $(TRANSPORT) $(CLASS) "$(MGMT)" "$(MESSAGE)"
 
 clean:
-	rm -f c_client cpp_client
+	rm -f c_client cpp_client zc_client

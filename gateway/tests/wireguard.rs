@@ -29,13 +29,14 @@ use common::{free_port, run_rules, temp_dir};
 use gateway::management::config::GatewayConfig;
 use gateway::security::wireguard_engine::wireguard_available;
 
-// Two real X25519 keypairs (derived with OpenSSL). Benchmark/test material only
-// — not secret. Gateway A's private pairs with Gateway B's public, and vice
-// versa, exactly as a gateway-to-gateway WireGuard tunnel is keyed.
-const A_PRIV: &str = "YIU06CCTQAWakOr4BzFQm12PHbSrbLS6AoHXwYRzf2s=";
-const A_PUB: &str = "9ZbRNWy7qc+1SSM04oB0lsbRwi6JxBypHIJ+pDYuOyI=";
-const B_PRIV: &str = "KIfGAY5onof5FlOhwqH83HbK00vFrhq/Za5thhxOYVQ=";
-const B_PUB: &str = "E8wSpx1wNz0iDPMOswelLLwGrXSaWkZN+zhuve7QUEo=";
+// Two real X25519 keypairs (generated with `wg genkey`). Benchmark/test
+// material only — not secret, never used outside these tests and the example
+// config. Gateway A's private pairs with Gateway B's public, and vice versa,
+// exactly as a gateway-to-gateway WireGuard tunnel is keyed.
+const A_PRIV: &str = "EEGrkSn/ZIEJT8npG+00ddEqUrzY3l9SoFBVdiC233o=";
+const A_PUB: &str = "m0neOhJb0nrbT+zyFGclSlUBk+U68tw0vbm9kogJZH8=";
+const B_PRIV: &str = "SFi8zIkkReUDpupIlhGhHgPPCaa55SiPmEfjn+JY3ms=";
+const B_PUB: &str = "PTwJxvoRo9l8AZcKkDqhhKw2+adSRlZbxSs9qE2YOio=";
 
 /// Send one datagram to a gateway rule and read the echo, retrying briefly
 /// (plain UDP has no retransmission and the listener may still be binding).
