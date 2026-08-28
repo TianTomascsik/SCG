@@ -21,7 +21,7 @@ name = "gateway"
 path = "src/main.rs"
 
 [dependencies]
-ale_pipe = { path = "../../ale-frame", package = "ale-frame" }
+ale_pipe = { git = "https://github.com/TianTomascsik/ale-frame.git", tag = "v0.2.0", package = "ale-frame" }
 openssl = "0.10"
 openssl-sys = "0.9"
 libc = "0.2"

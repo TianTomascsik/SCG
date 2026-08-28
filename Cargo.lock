@@ -14,6 +14,7 @@ dependencies = [
 [[package]]
 name = "ale-frame"
 version = "0.2.0"
+source = "git+https://github.com/TianTomascsik/ale-frame.git?tag=v0.2.0#23073f5d2c74fd74a1bb8cb6eef867492b03eb15"
 
 [[package]]
 name = "anstream"
