@@ -63,7 +63,7 @@ pub struct UdsEndpointTask {
     pub owner_uid: u32,
     /// Single-use capability token; consumed on the first valid HELLO.
     pub token: Arc<Mutex<Option<CapabilityToken>>>,
-    /// Shared policy manager for the second gate on the network leg (DP-08).
+    /// Shared policy manager for the second gate on the network leg.
     /// `None` disables the gate (used by tests / policy-less deployments).
     pub policy: Option<Arc<RwLock<PolicyManager>>>,
     /// Per-endpoint shutdown flag (set by the manager on close/shutdown).
@@ -187,7 +187,7 @@ fn authenticate(stream: &UnixStream, task: &UdsEndpointTask) -> Result<PeerCred,
 /// Establish the TLS upstream (dial for encrypt, accept for decrypt) and run the
 /// bidirectional relay for one client.
 fn serve(task: &UdsEndpointTask, stream: UnixStream) {
-    // Second gate (DP-08): a shared, hot-reloadable policy handle, applied on the
+    // Second gate : a shared, hot-reloadable policy handle, applied on the
     // network leg (destination for encrypt, network peer for decrypt).
     let endpoint_policy = task.policy.as_ref().map(|p| EndpointPolicy {
         policy: p.clone(),

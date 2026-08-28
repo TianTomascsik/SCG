@@ -16,8 +16,8 @@ without changing the gateway core, and so access can be gated by authentication.
 
 ## Why an interface is needed
 
-[api/mod.rs](../../src/api/mod.rs) is currently a set of TODO comments describing
-a planned gRPC API and gRPC Admin API. Defining the interface now (a) pins down
+Beyond the implemented endpoint-provisioning surface, a fuller runtime API and
+an Admin API are planned. Defining the interface now (a) pins down
 the contract the core must satisfy, (b) lets the management surface be exposed
 over different transports, and (c) separates **read/operate** (`ManagementApi`)
 from **privileged admin** (`AdminApi`) so the latter can require authentication.
@@ -110,17 +110,17 @@ pub enum AdminError { Unauthorized, InvalidConfig(String), Unavailable(String), 
   rule threads. `Send + Sync`.
 - **Shutdown:** the binding stops with the gateway.
 
-## Mapping from the planned stub
+## Mapping from the planned surface
 
-| [api/mod.rs](../../src/api/mod.rs) TODO | Interface |
+| Planned capability | Interface |
 |------|-----------|
-| "Runtime status queries (active rules, connection counts, throughput)" | `ManagementApi::status` / `list_rules` / `metrics_snapshot` |
-| "Rule management (add/remove/modify without config file)" | `AdminApi::apply_config` |
-| "Health check endpoint for orchestration" | `HealthCheck` |
-| "Certificate management (upload, rotate, revoke)" | `AdminApi::rotate_keys` (+ cert provider) |
-| "Security policy updates" | `AdminApi::reload_policy` |
-| "Audit log retrieval" | `AdminApi::fetch_audit` |
-| "Integration with IAM for authenticated access" | authN/authZ at the binding layer |
+| Runtime status queries (active rules, connection counts, throughput) | `ManagementApi::status` / `list_rules` / `metrics_snapshot` |
+| Rule management (add/remove/modify without config file) | `AdminApi::apply_config` |
+| Health check endpoint for orchestration | `HealthCheck` |
+| Certificate management (upload, rotate, revoke) | `AdminApi::rotate_keys` (+ cert provider) |
+| Security policy updates | `AdminApi::reload_policy` |
+| Audit log retrieval | `AdminApi::fetch_audit` |
+| Integration with IAM for authenticated access | authN/authZ at the binding layer |
 
 ## Example implementor (skeleton)
 

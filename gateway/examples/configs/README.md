@@ -1,9 +1,9 @@
 # Example configurations & capability matrix
 
 Runnable, per-capability gateway configurations. Each file is a complete
-`GatewayConfig` (a `rules` array) and is validated in CI by
-[`tests/examples_load.rs`](../../tests/examples_load.rs), so a renamed field or a
-newly-rejected combination fails the build.
+`GatewayConfig` (a `rules` array) and is validated by
+[`tests/examples_load.rs`](../../tests/examples_load.rs) (part of `cargo test`),
+so a renamed field or a newly-rejected combination fails the test suite.
 
 > The certificate/key paths (`/etc/scg/pki/…`) are placeholders for
 > documentation. Configs **parse and validate** without the files present; the

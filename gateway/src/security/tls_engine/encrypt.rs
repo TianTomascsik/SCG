@@ -63,7 +63,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         None => return,
     };
     listener.set_nonblocking(false).ok();
-    // Listener port, for original-destination recovery (M10).
+    // Listener port, for original-destination recovery.
     let listen_port = listener.local_addr().ok().map(|a| a.port());
 
     // Resolve typed security parameters once; shared by all connections.
@@ -104,7 +104,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         // upstream, recover the original destination (REDIRECT/DNAT *or* true
         // TPROXY) and fail closed if it cannot be recovered — the old
         // SO_ORIGINAL_DST-only path silently misrouted TPROXY flows to the
-        // configured upstream (M10). A transparent rule with an explicit
+        // configured upstream. A transparent rule with an explicit
         // upstream is a fixed-forward interceptor and forwards there.
         let target = if ctx.transparent && ctx.upstream_addr == "auto" {
             match tproxy::recover_transparent_dst(client_stream.as_raw_fd(), listen_port) {
@@ -128,7 +128,7 @@ pub(crate) fn run_tcp_encrypt_listener(ctx: &RuleContext) {
         };
 
         // Traffic classification + policy check (fail closed on an unparseable
-        // upstream target — DP-07).
+        // upstream target).
         if !ctx.classify_and_check_policy_target(&peer_addr, &target) {
             continue; // Drop connection — policy denied or target unresolvable
         }
@@ -262,7 +262,7 @@ pub(crate) fn handle_tcp_encrypt(
                 .ok_or_else(|| io::Error::other("TLS connector was not initialised"))?;
             let ssl_stream = if params.resumption {
                 // Present a cached ticket for this exact upstream + crypto policy so the
-                // reconnect can resume (task S2 / TRA #78–#80), mirroring the interface
+                // reconnect can resume (TRA #78–#80), mirroring the interface
                 // endpoint connector. `configure()` keeps the same SNI/verification
                 // defaults as `connect()`, so priming is transparent.
                 let key = resumption_key(params, upstream_addr, false);
@@ -296,7 +296,7 @@ pub(crate) fn handle_tcp_encrypt(
                 .into_ssl(&sni)
                 .map_err(|e| io::Error::other(format!("kTLS SSL: {}", e)))?;
             if params.resumption {
-                // Resume this upstream+policy if a ticket is cached (task S2 / TRA #78–#80).
+                // Resume this upstream+policy if a ticket is cached (TRA #78–#80).
                 prime_resumption(&mut ssl, resumption_key(params, upstream_addr, true));
             }
             ssl.set_connect_state();

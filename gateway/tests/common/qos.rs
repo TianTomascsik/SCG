@@ -1,4 +1,4 @@
-//! Test-only QoS plumbing for the WP7 DSCP integration tests.
+//! Test-only QoS plumbing for the DSCP integration tests.
 //!
 //! Provides loopback echo backends that record the DiffServ (DSCP) value of the
 //! traffic they receive, so a test can assert what the gateway marked on its

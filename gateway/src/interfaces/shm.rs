@@ -110,7 +110,7 @@ pub struct ShmEndpointTask {
     pub owner_uid: u32,
     /// Single-use capability token; consumed on the first valid HELLO.
     pub token: Arc<Mutex<Option<CapabilityToken>>>,
-    /// Shared policy manager for the second gate on the network leg (DP-08).
+    /// Shared policy manager for the second gate on the network leg.
     /// `None` disables the gate (used by tests / policy-less deployments).
     pub policy: Option<Arc<RwLock<PolicyManager>>>,
     /// Per-endpoint shutdown flag (set by the manager on close/shutdown).
@@ -292,7 +292,7 @@ fn serve(task: &ShmEndpointTask, mut control: UnixStream) {
         task.label
     );
 
-    // Second gate (DP-08): shared, hot-reloadable policy on the network leg.
+    // Second gate : shared, hot-reloadable policy on the network leg.
     let endpoint_policy = task.policy.as_ref().map(|p| EndpointPolicy {
         policy: p.clone(),
         traffic_class: task.qos.traffic_class,
@@ -489,7 +489,7 @@ fn relay(
 /// is legitimately full. A [`ShmError::RingCorrupt`] from the producer — the peer
 /// moved the control-page `read_idx`/`seq` outside its valid window — surfaces as
 /// an error so the caller tears the endpoint down, rather than spinning forever on
-/// a false Full (DP-11).
+/// a false Full.
 fn push_g2c(
     seg: &ShmSegment,
     traffic_id: u32,

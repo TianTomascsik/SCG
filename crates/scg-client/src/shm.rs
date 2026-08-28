@@ -338,7 +338,7 @@ impl ShmClient {
     /// Try to push one framed message without waiting for ring capacity.
     ///
     /// Returns `Ok(false)` when the ring is full. Callers that own a shutdown
-    /// signal (such as SESHAT's sender loop) should use this form so they can
+    /// signal (a high-rate batching sender, for instance) should use this form so they can
     /// observe cancellation instead of blocking forever after a peer exits.
     pub fn try_send(&mut self, traffic_id: u32, data: &[u8]) -> Result<bool> {
         let pushed = self.backend.try_push(traffic_id, data)?;

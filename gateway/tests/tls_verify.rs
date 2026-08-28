@@ -1,6 +1,6 @@
-//! WP2 — TLS verification modes and HTTPS (L4) termination.
+//! TLS verification modes and HTTPS (L4) termination.
 //!
-//! Exercises the verify/identity wiring added in WP1 end-to-end against a real
+//! Exercises the verify/identity wiring end-to-end against a real
 //! CA-issued certificate chain (see [`common::pki::TestPki`]):
 //!
 //! * `server_verify_round_trip` — gateway verifies a trusted upstream.

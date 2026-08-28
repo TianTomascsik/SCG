@@ -11,12 +11,11 @@
 
 Abstract the **byte-moving layer** so the same security engine can run over
 different transports — TCP, UDP, Unix domain sockets (UDS), or shared memory
-(SHM) — selected by configuration. The repository already contains transport
-benchmarks for exactly these
-([bench_tcp](../../../benches/bench_tcp/), [bench_udp](../../../benches/bench_udp/),
-[bench_uds](../../../benches/bench_uds/), [bench_shm](../../../benches/bench_shm/)),
-which is strong evidence that transport interchangeability is an intended axis of
-extension. This interface makes that axis a first-class, swappable boundary.
+(SHM) — selected by configuration. The gateway already ships all four as
+concrete data paths (`networking/`, `security/dtls_engine.rs`, and the local
+interfaces in `src/interfaces/{uds,shm}.rs`), so transport interchangeability
+is an intended axis of extension. This interface makes that axis a
+first-class, swappable boundary.
 
 ## Why an interface is needed
 
@@ -190,7 +189,6 @@ specifics:
   the client over the control socket via `SCM_RIGHTS`.
 - **Wakeup** defaults to **eventfd** so the single-threaded relay can multiplex
   the upstream fd and the ring notification through one `poll`/`epoll`. The
-  trade-off (eventfd vs. strict/hybrid futex vs. busy-poll) is quantified by the
-  `wakeup_bench` micro-benchmark in
-  [SCG-Interface-benchmarks/bench_shm](../../../SCG-Interface-benchmarks/bench_shm);
-  busy-poll/hybrid remain available as a dedicated-core low-latency knob.
+  trade-off (eventfd vs. strict/hybrid futex vs. busy-poll) was quantified by a
+  wakeup micro-benchmark; busy-poll/hybrid remain available as a dedicated-core
+  low-latency knob.

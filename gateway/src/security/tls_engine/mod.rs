@@ -20,7 +20,7 @@ use params::{TlsProfile, TlsSecurityParams, VerifyMode};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ─── ProxyStream ─────────────────────────────────────────────────────────────
 
@@ -312,7 +312,8 @@ fn apply_cipher_policy(
     // Pin the ECDHE key-exchange groups when overridden. Validated to a strong-group allowlist
     // at config load (TRA #84), so this can only narrow the offered groups. OpenSSL wants a
     // ':'-separated list; accept ',' too and normalize. Applied to both the acceptor and the
-    // connector (this helper runs on both), so it governs TB1 and TB2 handshakes alike.
+    // connector (this helper runs on both), so it governs downstream and upstream
+    // handshakes alike.
     if let Some(groups) = &params.groups {
         let list = groups.replace(',', ":");
         builder
@@ -457,7 +458,7 @@ fn apply_resumption(
         } else {
             // Client: enable the session cache AND install the new-session callback + bounded,
             // policy-fingerprint-keyed store so a reconnect to the same upstream under the same
-            // posture can actually resume (task S2 / TRA #78–#80). Bare CLIENT cache mode alone
+            // posture can actually resume (TRA #78–#80). Bare CLIENT cache mode alone
             // never resumes — OpenSSL requires the app to persist the ticket and SSL_set_session
             // it before connect, which `session_cache` wires up at the connect site.
             session_cache::install_client_session_cache(builder);
@@ -535,62 +536,6 @@ pub fn write_all_nb_proxy(stream: &mut ProxyStream, data: &[u8]) -> io::Result<(
     Ok(())
 }
 
-/// Write all bytes to a ProxyStream with a wall-clock time limit.
-/// Gives up if no progress is made within `timeout_ms` milliseconds.
-#[allow(dead_code)]
-pub fn write_nb_proxy_timed(
-    stream: &mut ProxyStream,
-    data: &[u8],
-    timeout_ms: u64,
-) -> io::Result<()> {
-    let timeout = Duration::from_millis(timeout_ms);
-    let mut pos = 0;
-    let mut last_progress = Instant::now();
-    while pos < data.len() {
-        let n = match stream {
-            ProxyStream::Tls(s) => match s.write(&data[pos..]) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if last_progress.elapsed() > timeout {
-                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                    }
-                    poll_proxy_write_ready(stream, 100)?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            },
-            ProxyStream::Ktls { session, .. } => match session.write(&data[pos..]) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if last_progress.elapsed() > timeout {
-                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                    }
-                    poll_proxy_write_ready(stream, 100)?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            },
-            ProxyStream::Plain(s) => match s.write(&data[pos..]) {
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if last_progress.elapsed() > timeout {
-                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                    }
-                    poll_proxy_write_ready(stream, 100)?;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            },
-        };
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
-        }
-        pos += n;
-        last_progress = Instant::now();
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -613,7 +558,7 @@ mod tests {
             .collect()
     }
 
-    // DP-01: the kTLS connector used by the UDS/SHM local-interface path must
+    // The kTLS connector used by the UDS/SHM local-interface path must
     // apply the rule's verify mode, exactly like the userspace connector — the
     // former bench builder hardcoded SslVerifyMode::NONE.
     #[test]
@@ -633,7 +578,7 @@ mod tests {
         assert_eq!(ck.context().verify_mode(), cu.context().verify_mode());
     }
 
-    // DP-01/KC-05: a `verify=mutual` kTLS acceptor must demand a client cert
+    // A `verify=mutual` kTLS acceptor must demand a client cert
     // (PEER | FAIL_IF_NO_PEER_CERT), not accept any client.
     #[test]
     fn ktls_acceptor_mutual_requires_client_cert() {

@@ -88,7 +88,7 @@ impl PolicyManager {
 
     /// Destination-only policy check for a flow whose source is authenticated
     /// out-of-band — the UDS/SHM local endpoints, where the caller is identified
-    /// by uid + pid + single-use token rather than a network source (DP-08). An
+    /// by uid + pid + single-use token rather than a network source. An
     /// entry matches on its `destination` pattern alone; `Safety` fail-open and
     /// `default_action` semantics are identical to [`check_allowed`](Self::check_allowed).
     pub fn check_allowed_destination(&self, dst: &SocketAddr, traffic_class: TrafficClass) -> bool {
@@ -222,7 +222,7 @@ mod tests {
         ));
     }
 
-    // DP-08: destination-only check matches on the destination pattern alone
+    // Destination-only check matches on the destination pattern alone
     // (the local endpoint's caller is authenticated out-of-band).
     #[test]
     fn destination_only_matches_dst_pattern() {
@@ -240,7 +240,7 @@ mod tests {
         assert!(!pm.check_allowed_destination(&addr("192.168.1.1:443"), TrafficClass::Normal));
     }
 
-    // DP-08: destination-only check preserves the Safety fail-open default and the
+    // Destination-only check preserves the Safety fail-open default and the
     // empty-whitelist default_action.
     #[test]
     fn destination_only_safety_and_default_action() {
@@ -255,7 +255,7 @@ mod tests {
         assert!(pm.check_allowed_destination(&addr("10.0.0.1:1"), TrafficClass::Normal));
     }
 
-    // DP-09: a dual-stack listener presents IPv4 peers as `::ffff:a.b.c.d`; the
+    // A dual-stack listener presents IPv4 peers as `::ffff:a.b.c.d`; the
     // source whitelist (written in native v4) must still match after canonicalization.
     #[test]
     fn mapped_v4_source_passes_v4_whitelist() {

@@ -1,4 +1,4 @@
-//! Client-side (gateway→upstream) TLS session cache for resumption (task S2).
+//! Client-side (gateway→upstream) TLS session cache for resumption.
 //!
 //! The gateway previously never resumed to an upstream: `apply_resumption` set only
 //! `SslSessionCacheMode::CLIENT` and every per-endpoint `SslConnector` connected once and
@@ -7,7 +7,7 @@
 //! handshake — driven by the rule's `resumption` toggle (default `false`, so behaviour is
 //! unchanged unless opted in).
 //!
-//! Design controls (TRA register #78–#80, TB2):
+//! Design controls (TRA register #78–#80; governs the gateway→upstream trust boundary):
 //!   * **#78 cross-peer / cross-policy reuse** — sessions are keyed by a *full* upstream
 //!     identity + crypto-policy fingerprint ([`resumption_key`]): a cached ticket is only
 //!     ever presented on a byte-identical reconnect to the same peer under the same posture.

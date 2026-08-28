@@ -15,7 +15,6 @@ pub struct ProviderRegistry {
     app_protocols: Vec<Box<dyn AppProtocolProvider>>,
 }
 
-#[allow(dead_code)]
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::new()

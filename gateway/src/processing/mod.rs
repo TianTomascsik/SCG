@@ -112,7 +112,7 @@ impl RuleContext {
     /// never call this per datagram (DNS-per-packet would be a self-inflicted
     /// DoS). A hostname that cannot be resolved returns `None` so the caller can
     /// fail closed. This restores functionality for legitimate DNS-name
-    /// upstreams that the strict `IP:port`-only policy gate (DP-07, #54) would
+    /// upstreams that the strict `IP:port`-only policy gate  would
     /// otherwise drop entirely (TRA #73).
     pub fn resolve_upstream_target(&self, target: &str) -> Option<std::net::SocketAddr> {
         use std::net::ToSocketAddrs;
@@ -130,7 +130,7 @@ impl RuleContext {
 
     /// Classify + policy-gate a flow whose destination is still a `target` string
     /// (e.g. the configured `upstream_addr`). Fails **closed** when the target is
-    /// not a parseable `IP:port` (DP-07): the flow is dropped and an `AUDIT deny`
+    /// not a parseable `IP:port`: the flow is dropped and an `AUDIT deny`
     /// line is emitted, rather than silently skipping the default-deny/source
     /// whitelist gate. Callers must treat `false` as "drop this connection".
     ///
@@ -509,7 +509,7 @@ mod tests {
         }
     }
 
-    // DP-07: an upstream target that is not a parseable IP:port must fail closed
+    // An upstream target that is not a parseable IP:port must fail closed
     // (drop), not silently skip the policy gate. With no policy manager the
     // delegate path would *allow*, so a `false` here proves the fail-closed branch.
     #[test]
@@ -544,7 +544,7 @@ mod tests {
             ctx.resolve_upstream_target("127.0.0.1:9000"),
             Some("127.0.0.1:9000".parse().unwrap())
         );
-        // The reserved .invalid TLD never resolves → fail closed.
+        // The reserved.invalid TLD never resolves → fail closed.
         assert!(ctx
             .resolve_upstream_target("nonexistent.invalid:443")
             .is_none());

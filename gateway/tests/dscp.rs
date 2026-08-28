@@ -1,4 +1,4 @@
-//! WP7 — End-to-end DSCP tagging / preservation + safety-priority tests.
+//! End-to-end DSCP tagging / preservation + safety-priority tests.
 //!
 //! The gateway marks the DiffServ (DSCP) field on its **upstream** egress
 //! socket. These tests put a DSCP-recording echo backend ([`DscpUdpSink`] /
@@ -234,8 +234,8 @@ fn dtls_decrypt_preserves_inbound_ipv6() {
 // assert the data path stays intact while the safety-class egress QoS is
 // applied on the splice upstream, and assert the DS field *only when* the
 // platform actually surfaces it (e.g. a real NIC). The egress TOS value itself
-// is proven at the syscall layer by the WP1 `set_dscp`/`apply_egress_qos`
-// getsockopt round-trips and by the WP2 `QosPolicy::egress_dscp` unit tests.
+// is proven at the syscall layer by the `set_dscp`/`apply_egress_qos`
+// getsockopt round-trip tests and by the `QosPolicy::egress_dscp` unit tests.
 
 fn routing_tag_case(tag: &str, listen_host: &str, sink_bind: &str) {
     let tmp = temp_dir(tag);

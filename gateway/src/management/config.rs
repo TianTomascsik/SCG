@@ -77,7 +77,7 @@ pub struct GatewayConfig {
     pub conn_pool_size: Option<usize>,
 
     /// Downgrade the unverified-transport preflight **errors** back to warnings
-    /// (M-13): `verify: none` to a non-loopback upstream, or a non-mutual decrypt
+    /// `verify: none` to a non-loopback upstream, or a non-mutual decrypt
     /// listener on a non-loopback bind. Default `false` (fail-secure) — an
     /// operator who deliberately runs an unverified posture on a routable endpoint
     /// must opt in, so `--validate` fails the config until they do.
@@ -1114,7 +1114,7 @@ impl AddressPattern {
     /// Check if a socket address matches this pattern.
     pub fn matches(&self, addr: &SocketAddr) -> bool {
         // Canonicalize the peer IP so an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
-        // as seen on a dual-stack `[::]` listener) matches IPv4 patterns (DP-09).
+        // as seen on a dual-stack `[::]` listener) matches IPv4 patterns.
         // Exact/IpOnly pattern IPs are canonicalized too, so a pattern *written* in
         // mapped form still matches. Cidr networks are matched literally — a v6
         // prefix over a mapped network does not translate to a v4 prefix.
@@ -1822,7 +1822,7 @@ impl GatewayConfig {
 
         // Plaintext routing over the network (tcp/udp) forwards application data
         // unencrypted on the wire (CWE-319, TRA #83). Like the verify:none
-        // advisories (M-13), this is an ERROR on a non-loopback listener unless the
+        // advisories, this is an ERROR on a non-loopback listener unless the
         // operator opts in via `allow_unverified_transport`, in which case it stays
         // a warning; a loopback endpoint always stays a warning. (UDS/SHM routing
         // has its own local-IPC advisory above; this covers the on-wire cleartext.)
@@ -1861,7 +1861,7 @@ impl GatewayConfig {
         // ── TLS/DTLS verification-posture advisories ─────────────────────────
         // `verify: none` stays legal for back-compat, but unverified upstreams
         // (MITM, CWE-295) and decrypt listeners that do not authenticate clients
-        // (CWE-306) are ERRORS on a non-loopback endpoint (M-13) unless the
+        // (CWE-306) are ERRORS on a non-loopback endpoint unless the
         // operator opts in via `allow_unverified_transport`, in which case they
         // stay warnings. A loopback/local endpoint always stays a warning. The
         // per-rule KEY-file permission advisory (KC-01) is emitted here too, where
@@ -2328,7 +2328,7 @@ fn upstream_is_loopback(upstream_addr: &str) -> bool {
 }
 
 /// Whether a decrypt rule's `listen_addr` is a routable (non-loopback) bind, used
-/// to decide whether an unauthenticated-decrypt posture is an error (M-13). A
+/// to decide whether an unauthenticated-decrypt posture is an error. A
 /// local UDS/SHM listener (unparseable as `SocketAddr`) is treated as loopback —
 /// its callers are already kernel-authenticated, so it never escalates.
 fn listen_is_non_loopback(listen_addr: &str) -> bool {
@@ -2429,28 +2429,6 @@ fn is_wide_untrusted_source(source: &str) -> bool {
     }
 }
 
-/// Decode a hex string to bytes, returning an error on odd length or non-hex
-/// characters instead of panicking.
-///
-/// NOTE: the security path (PSK decoding) uses the `decode_hex` in
-/// `security::tls_engine::params`; this function currently has no callers and is
-/// a candidate for removal (see DRY cleanup) — it is kept and hardened for now so
-/// it is not a panicking landmine for any out-of-tree consumer.
-pub fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length {}", hex.len()));
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            let pair = hex
-                .get(i..i + 2)
-                .ok_or_else(|| "hex slice out of bounds".to_string())?;
-            u8::from_str_radix(pair, 16).map_err(|e| format!("invalid hex byte '{pair}': {e}"))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod address_pattern_tests {
     use super::*;
@@ -2459,7 +2437,7 @@ mod address_pattern_tests {
         s.parse().unwrap()
     }
 
-    // DP-09: an IPv4-mapped IPv6 peer (dual-stack `[::]` listener) matches an
+    // An IPv4-mapped IPv6 peer (dual-stack `[::]` listener) matches an
     // IPv4 CIDR / IP-only / exact whitelist entry after canonicalization.
     #[test]
     fn mapped_v4_peer_matches_v4_patterns() {
@@ -2800,7 +2778,7 @@ mod dscp_tests {
         cfg.preflight_check().1
     }
 
-    // M-13: verify:none to a non-loopback upstream is now a preflight ERROR
+    // Verify:none to a non-loopback upstream is a preflight ERROR
     // (fails --validate) rather than a warning.
     #[test]
     fn preflight_errors_on_unverified_remote_encrypt() {
@@ -2813,7 +2791,7 @@ mod dscp_tests {
         );
     }
 
-    // M-13: the opt-in downgrades that error back to a warning.
+    // The opt-in downgrades that error back to a warning.
     #[test]
     fn preflight_downgrades_unverified_encrypt_with_opt_in() {
         let cfg = config_with_rule(serde_json::json!({
@@ -2982,7 +2960,7 @@ mod dscp_tests {
         );
     }
 
-    // M-13: non-mutual decrypt on a NON-loopback listen is an error.
+    // Non-mutual decrypt on a NON-loopback listen is an error.
     #[test]
     fn preflight_errors_on_nonloopback_unauthenticated_decrypt() {
         let cfg = config_with_rule(serde_json::json!({

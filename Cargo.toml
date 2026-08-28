@@ -34,9 +34,9 @@ strip = "symbols"
 # Profiling profile: identical codegen to `release` (opt-level 3, fat LTO,
 # 1 codegen-unit, panic=abort are all inherited) but keeps DWARF + symbols so
 # perf/flamegraphs resolve gateway frames instead of bare hex addresses.
-# `collect_perf_data.sh` builds the gateway with this profile (plus
-# `-C force-frame-pointers=yes`) for the flamegraph stage only; steady-state
-# performance is within measurement noise of `release`.
+# Build with `--profile profiling` (optionally with
+# `RUSTFLAGS=-Cforce-frame-pointers=yes`) when collecting perf data;
+# steady-state performance is within measurement noise of `release`.
 [profile.profiling]
 inherits = "release"
 debug = 1

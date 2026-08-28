@@ -1,4 +1,4 @@
-//! WP3 — Subset-146 TLS PKI profile (`profile = subset146-pki`).
+//! Subset-146 TLS PKI profile (`profile = subset146-pki`).
 //!
 //! The profile preset (mandatory mutual X.509 auth, ECDHE/ECDSA-GCM cipher
 //! policy, TLS 1.2 + 1.3) is implemented in `TlsSecurityParams`. These tests

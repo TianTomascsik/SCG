@@ -2,8 +2,8 @@
 //!
 //! This is an **additive** alternative to the variable-length byte-stream ring
 //! in [`crate::shm`]. It trades the byte-stream's tight packing for fixed-size
-//! slots and a per-slot sequence number, which buys three things the WP0
-//! benchmark cares about:
+//! slots and a per-slot sequence number, which buys three things a
+//! throughput-focused transport cares about:
 //!
 //! * **Cache-line separation.** The producer's `write_pos` and the consumer's
 //!   `read_pos` live on *separate* 64-byte cache lines (the byte-stream ring
@@ -35,7 +35,7 @@
 //! producer's payload region. Because the peer owns `seq`, the producer validates
 //! it against its valid window on every push (free or one-lap-back full) and
 //! returns [`ShmError::RingCorrupt`] otherwise, rather than trusting a hostile
-//! value that would wedge it on a false Full (DP-11).
+//! value that would wedge it on a false Full.
 //!
 //! The structure is single-producer / single-consumer today; the `seq`
 //! protocol is the standard MPMC one, so it can be relaxed to MPSC later
@@ -258,7 +258,7 @@ impl SlotProducer {
         let seq = self.seq_at(idx).load(Ordering::Acquire);
         // The consumer (a possibly-hostile peer) owns `seq` on the shared control
         // page, so validate it against the only two states legal at this producer
-        // position (DP-11): `seq == pos` (slot free) or `seq == pos + 1 - capacity`
+        // position: `seq == pos` (slot free) or `seq == pos + 1 - capacity`
         // (occupied one lap back → genuinely full). Any other value means the peer
         // corrupted the ring; report it so the endpoint tears down instead of
         // spinning on a perpetual (false) Full.
@@ -304,7 +304,7 @@ impl SlotProducer {
     ///
     /// Returns `Ok(None)` when the ring is full and `Err(ShmError::RingCorrupt)`
     /// if the (peer-owned) `seq` word is outside its two legal states — the same
-    /// DP-11 hostile-`seq` guard as [`try_push`](Self::try_push).
+    /// hostile-`seq` guard as [`try_push`](Self::try_push).
     ///
     /// # Single-producer contract
     /// At most one `ReservedSlot` may be live at a time: `reserve` does not
@@ -320,14 +320,14 @@ impl SlotProducer {
     /// maps it read-only (`g2c` is sealed `F_SEAL_FUTURE_WRITE`; `c2g` is written
     /// solely by the client) — so a reserved, unpublished slot is exclusively
     /// owned by this producer until `commit`. Only the shared control page
-    /// (`seq`/positions) is peer-writable, and it is validated here (DP-11),
+    /// (`seq`/positions) is peer-writable, and it is validated here,
     /// never dereferenced as payload (contrast TRA #71 on the read side).
     pub fn reserve(&self) -> Result<Option<ReservedSlot<'_>>, ShmError> {
         let hdr = self.header();
         let pos = hdr.write_pos.load(Ordering::Relaxed);
         let idx = (pos & self.mask) as usize;
         let seq = self.seq_at(idx).load(Ordering::Acquire);
-        // DP-11: identical hostile-`seq` validation to `try_push` — the only
+        // Identical hostile-`seq` validation to `try_push` — the only
         // states legal at this producer position are `seq == pos` (free) or
         // `seq == pos + 1 - capacity` (occupied one lap back → genuinely full).
         let diff = seq.wrapping_sub(pos) as i64;
@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(producer.try_push(3, &[3u8; 16]).unwrap(), PushOutcome::Full);
     }
 
-    // DP-11: a hostile consumer that writes a `seq` outside the {free, full}
+    // A hostile consumer that writes a `seq` outside the {free, full}
     // window must yield RingCorrupt (so the endpoint tears down) rather than a
     // false Full (which would wedge the producer forever).
     #[test]

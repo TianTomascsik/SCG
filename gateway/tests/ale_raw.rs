@@ -1,4 +1,4 @@
-//! WP8 — UDP-over-TLS application framing (`app_protocol = ale | raw`).
+//! UDP-over-TLS application framing (`app_protocol = ale | raw`).
 //!
 //! UDP traffic tunnelled through TLS is framed at the application layer so the
 //! TLS byte stream can be split back into datagrams on the far side. Two

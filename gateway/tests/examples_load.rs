@@ -1,4 +1,4 @@
-//! WP9 — every shipped example config must parse and validate.
+//! Every shipped example config must parse and validate.
 //!
 //! Guards the documented example configurations (the per-capability files in
 //! `examples/configs/` plus the top-level `gateway.example.json`) against schema

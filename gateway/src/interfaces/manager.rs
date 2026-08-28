@@ -209,14 +209,14 @@ pub struct InterfaceManager {
     rate: Mutex<RateLimiter>,
     /// Shared, hot-reloadable policy manager threaded into every endpoint task so
     /// the local-IPC relay carries the same default-deny second gate as the
-    /// network paths (DP-08). `None` disables the gate.
+    /// network paths. `None` disables the gate.
     policy: Option<Arc<RwLock<PolicyManager>>>,
 }
 
 impl InterfaceManager {
     /// Build the manager from the gateway config, deriving UDS/SHM templates
     /// from rules whose `listen_proto` is `uds` or `shm`. `policy` is the shared
-    /// policy manager applied to each endpoint's network leg (DP-08).
+    /// policy manager applied to each endpoint's network leg.
     pub fn new(
         config: &GatewayConfig,
         version: impl Into<String>,

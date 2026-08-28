@@ -115,7 +115,7 @@ pub struct TlsSecurityParams {
     /// PSK identity (for `subset146-psk`).
     pub psk_identity: Option<String>,
     /// PSK key bytes, decoded from `psk_hex` (for `subset146-psk`). Wrapped in
-    /// `Zeroizing` so the key material is wiped on drop (KC-02).
+    /// `Zeroizing` so the key material is wiped on drop.
     pub psk_key: Option<Zeroizing<Vec<u8>>>,
     /// Advanced override for the TLS ≤ 1.2 cipher list.
     pub cipher_list: Option<String>,
@@ -526,8 +526,9 @@ fn hex_val(b: u8) -> Result<u8, String> {
 
 /// Best-effort probe: does the linked OpenSSL expose NULL-encryption ciphers?
 ///
-/// Distribution builds frequently disable `eNULL`. WP5's integrity-only test
-/// uses this to skip gracefully instead of failing on an unsupported platform.
+/// Distribution builds frequently disable `eNULL`. The integrity-only test
+/// (`gateway/tests/integrity_only.rs`) uses this to skip gracefully instead
+/// of failing on an unsupported platform.
 pub fn openssl_supports_null_cipher() -> bool {
     use openssl::ssl::{SslContext, SslMethod};
     let mut builder = match SslContext::builder(SslMethod::tls()) {

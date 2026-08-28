@@ -1,6 +1,6 @@
-//! WP7 — DTLS engine hardening (`security_provider = dtls`).
+//! DTLS engine hardening (`security_provider = dtls`).
 //!
-//! WP1 wired DTLS as a UDP-native crypto provider; WP7 brings its security
+//! DTLS is a UDP-native crypto provider; these tests bring its security
 //! parameters to parity with the userspace TLS engine: peer **verify** modes,
 //! CA pinning, file-based identities, SNI, and per-version cipher policy
 //! (DTLS 1.0 CBC, DTLS 1.2 AEAD).

@@ -11,7 +11,7 @@ Group=scg
 
 # Gateway binary and config — override via drop-in or environment file
 EnvironmentFile=-/etc/scg/environment
-ExecStart=/opt/scg/gateway --config ${CONFIG:-/etc/scg/gateway.json} --watch
+ExecStart=/opt/scg/gateway --config-dir ${CONFIG_DIR:-/etc/scg/config} --watch
 
 # Capabilities required for TPROXY/kTLS/raw sockets and Safety-class nice priority
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE

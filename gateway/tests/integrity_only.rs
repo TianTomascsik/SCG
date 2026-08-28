@@ -1,7 +1,7 @@
-//! WP5 — TLS integrity-only / NULL-cipher profile (`profile = integrity-only`).
+//! TLS integrity-only / NULL-cipher profile (`profile = integrity-only`).
 //!
 //! Authenticated-but-not-encrypted TLS using Subset-146 NULL-cipher suites
-//! (`TLS_ECDHE_ECDSA_WITH_NULL_SHA` et al.), wired in WP1. Tests:
+//! (`TLS_ECDHE_ECDSA_WITH_NULL_SHA` et al.). Tests:
 //!
 //!   * `integrity_only_round_trip_negotiates_enull` — a raw TLS client that
 //!     offers NULL ciphers terminates on a decrypt rule, the negotiated cipher

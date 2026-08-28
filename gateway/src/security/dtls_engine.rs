@@ -224,7 +224,7 @@ thread_local! {
 
 /// Process-lifetime secret keying the DTLS HelloVerifyRequest cookie HMAC.
 ///
-/// Fails **closed** if the CSPRNG is unavailable (KC-03): the sticky `None` makes
+/// Fails **closed** if the CSPRNG is unavailable: the sticky `None` makes
 /// every cookie compute/verify error out rather than falling back to an all-zero
 /// (predictable) key. The DTLS rule refuses to start (see `build_dtls_acceptor`).
 fn dtls_cookie_secret() -> Result<&'static [u8; 32], openssl::error::ErrorStack> {
@@ -330,7 +330,7 @@ fn build_dtls_acceptor(params: &TlsSecurityParams) -> Result<SslAcceptor, String
     // invoked (the cookie protection would be silently inert).
     builder.set_options(SslOptions::COOKIE_EXCHANGE);
     // Eagerly key the cookie secret so a DTLS rule fails to start on RNG failure
-    // (KC-03), rather than accepting handshakes with a predictable/zero cookie.
+    //, rather than accepting handshakes with a predictable/zero cookie.
     dtls_cookie_secret()
         .map_err(|e| format!("DTLS cookie secret unavailable (RNG failure): {e}"))?;
     builder.set_cookie_generate_cb(dtls_cookie_generate);
@@ -632,7 +632,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
             last_evict = now;
         }
 
-        // Build dynamic pollfd array: [plain_socket, ...dtls_upstream_fds]
+        // Build dynamic pollfd array: [plain_socket,...dtls_upstream_fds]
         pollfds.clear();
         pollfds.push(libc::pollfd {
             fd: plain_fd,
@@ -693,7 +693,7 @@ pub(crate) fn run_dtls_encrypt_relay(ctx: &RuleContext) {
                         }
 
                         // Policy check per datagram against the pre-resolved
-                        // upstream address (DP-07, fail closed).
+                        // upstream address (fail closed).
                         if !ctx.classify_and_check_policy(&peer_addr, &target_addr) {
                             continue; // Drop datagram — policy denied
                         }
@@ -1432,7 +1432,7 @@ mod cookie_tests {
         assert_ne!(a, b, "a different peer must yield a different cookie");
     }
 
-    // KC-03: on a functioning host the secret is available and stable (same
+    // On a functioning host the secret is available and stable (same
     // pointer/bytes across calls). RNG failure is uninjectable without wrapping
     // OpenSSL, so the fail-closed path is documented rather than unit-tested; the
     // accessor now returns a `Result`, so a failure propagates instead of minting

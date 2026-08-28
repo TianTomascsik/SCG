@@ -52,7 +52,8 @@ use std::sync::{Arc, Mutex, RwLock};
 ///
 /// This unsigned flat config carries no integrity or authenticity guarantee, so
 /// it is a **development-only** convenience compiled in only with the `dev`
-/// Cargo feature (SCG-TRA #87). The signed, layered `--config-dir` path is
+/// Cargo feature (unsigned configs are a config-tampering vector, so production
+/// builds refuse them). The signed, layered `--config-dir` path is
 /// always available and is the only source a production build accepts.
 ///
 /// Returns the same tuple shape as the lite-config branch:
@@ -82,7 +83,7 @@ fn resolve_flat_config(
 }
 
 /// Production builds refuse the unsigned single-file config: only the signed,
-/// layered `--config-dir` configuration is accepted (SCG-TRA #87). This variant
+/// layered `--config-dir` configuration is accepted. This variant
 /// is compiled when the `dev` feature is **off**; it never returns, so the
 /// caller's tuple binding is satisfied by the diverging `exit`.
 #[cfg(not(feature = "dev"))]
@@ -149,8 +150,8 @@ pub fn run(
 
     // ── Resolve the configuration source ─────────────────────────────────────
     // Two mutually-exclusive modes:
-    //   --config PATH     ... classic single-file gateway config
-    //   --config-dir DIR  ... layered "lite" config (signed defaults + user)
+    //   --config PATH    ... classic single-file gateway config
+    //   --config-dir DIR ... layered "lite" config (signed defaults + user)
     //
     // In lite mode the directory is loaded through the layered pipeline, which
     // verifies the detached Ed25519 signatures and the pinned schema hash
@@ -645,7 +646,7 @@ fn write_stderr(msg: &[u8]) {
 
 fn print_usage(prog: &str, registry: &ProviderRegistry) {
     // The classic single-file `--config` loader is a `dev`-only build feature
-    // (SCG-TRA #87); the usage line and option help reflect the current build.
+    // (see the `dev` feature); the usage line and option help reflect the current build.
     #[cfg(feature = "dev")]
     {
         eprintln!(

@@ -90,7 +90,7 @@ pub(crate) fn run_tcp_routing_listener(ctx: &RuleContext) {
         };
 
         // Traffic classification + policy check (fail closed on an unparseable
-        // target — DP-07).
+        // target).
         if !ctx.classify_and_check_policy_target(&peer_addr, &target) {
             continue; // Drop connection — policy denied or target unresolvable
         }
@@ -253,7 +253,7 @@ pub(crate) fn run_udp_routing_listener(ctx: &RuleContext) {
             last_evict = now;
         }
 
-        // Dynamic pollfd array: [listen_socket, ...per-peer upstream fds].
+        // Dynamic pollfd array: [listen_socket,...per-peer upstream fds].
         pollfds.clear();
         pollfds.push(libc::pollfd {
             fd: listen_fd,
@@ -529,7 +529,7 @@ fn is_auto_upstream(upstream: &str) -> bool {
 
 // The original-destination recovery logic (SO_ORIGINAL_DST → getsockname →
 // fail-closed) now lives in `interfaces::tproxy::recover_transparent_dst`,
-// shared with the TLS encrypt/decrypt paths (M10). Its pure decision core is
+// shared with the TLS encrypt/decrypt paths. Its pure decision core is
 // unit-tested there.
 
 #[cfg(test)]

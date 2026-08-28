@@ -29,7 +29,7 @@ a policy engine, a config source, a management API, etc.).
 | [08](08-traffic-classification.md) | **Traffic Classification** | Control plane | 🟡 Proposed | [processing/traffic_analyzer.rs](../../src/processing/traffic_analyzer.rs) | `classifier` (new) |
 | [09](09-configuration.md) | **Configuration Source** | Control plane | 🟡 Proposed | [management/config.rs](../../src/management/config.rs) + [config_manager.rs](../../src/management/config_manager.rs) | `config_source` (new) |
 | [10](10-management-api.md) | **Management / Admin API** (+ Health) | Control plane | 🟡 Proposed | [api/grpc.rs](../../src/api/grpc.rs) — endpoint provisioning **built**; broader admin surface proposed | `api` |
-| [11](11-future-interfaces.md) | **Forward-looking interfaces** | Mixed | 🔵 Future | [security/stubs.rs](../../src/security/stubs.rs), [management/stubs.rs](../../src/management/stubs.rs) | — |
+| [11](11-future-interfaces.md) | **Forward-looking interfaces** | Mixed | 🔵 Future | — | — |
 
 **Status legend:** ✅ As-built (trait exists today) · 🟡 Proposed (contract for an
 existing concrete implementation) · 🔵 Future (planned module, no implementation yet).
@@ -110,13 +110,14 @@ provider, a transport factory), the recommended path is to add an
 
 ## Composition root & dependency injection
 
-Today the gateway wires modules together in [`main.rs`](../../src/main.rs): it
+Today the gateway wires modules together in [`lib.rs::run`](../../src/lib.rs)
+(`main.rs` is a thin wrapper): it
 builds a [`ProviderRegistry`](../../src/processing/registry.rs), registers the
 built-in crypto and protocol providers, freezes it with `into_arc()`, and passes
 the `Arc<ProviderRegistry>` to the rule runner.
 
 ```text
-gateway.json ──load & validate──▶ main.rs ──register──▶ ProviderRegistry
+gateway.json ──load & validate──▶ lib.rs::run ──register──▶ ProviderRegistry
                                                               │ into_arc() (freeze)
                                                               ▼
                                                    Arc<ProviderRegistry>  ──▶ each rule thread
@@ -124,7 +125,7 @@ gateway.json ──load & validate──▶ main.rs ──register──▶ Prov
 
 To make **all** module categories swappable (not just crypto/protocol), the
 specs propose generalizing this into a single **composition root** assembled in
-`main.rs` and carried alongside the registry:
+`lib.rs::run` and carried alongside the registry:
 
 ```rust
 // PROPOSED — see individual specs for each trait.
@@ -203,7 +204,7 @@ The generic recipe (each spec has interface-specific steps):
    (e.g. a new crypto engine under `src/security/providers/`).
 2. **Honour the contract** in the spec: thread-safety bounds, lifecycle, error
    behaviour, and the conformance checklist.
-3. **Register / inject** it at the composition root in `main.rs` (add a
+3. **Register / inject** it at the composition root in `lib.rs::run` (add a
    `register_*` call, or set the corresponding `GatewayServices` field).
 4. **Select it** via the config selector named in the catalog table (e.g.
    `"security_provider": "my-engine"`).

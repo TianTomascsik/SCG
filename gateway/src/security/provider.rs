@@ -10,7 +10,6 @@ use crate::processing::RuleContext;
 
 /// A supported (direction, listen_proto) combination for a crypto provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ProviderMode {
     pub direction: Direction,
     pub listen_proto: Proto,
@@ -35,6 +34,9 @@ pub trait CryptoProvider: Send + Sync {
     fn description(&self) -> &str;
 
     /// Which (direction, listen_proto) combinations this provider supports.
+    ///
+    /// Advisory metadata: the dispatcher does not consult it yet; per-provider
+    /// validation still rejects unsupported combinations at config load.
     fn supported_modes(&self) -> Vec<ProviderMode>;
 
     /// Run the encrypt direction for this provider. Blocks until shutdown.

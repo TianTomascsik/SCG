@@ -12,8 +12,8 @@ publish = false
 default = []
 # `dev` enables the classic unsigned single-file `--config <FILE>` loader.
 # Production builds omit it: only the signed, layered `--config-dir` config
-# (Ed25519 signatures + pinned schema hash, fail-closed) is accepted. See
-# SCG-TRA finding #87.
+# (Ed25519 signatures + pinned schema hash, fail-closed) is accepted, because
+# unsigned configs are a config-tampering vector.
 dev = []
 
 [[bin]]

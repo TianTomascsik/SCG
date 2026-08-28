@@ -432,7 +432,7 @@ impl FirewallManager {
                     TPROXY_TABLE,
                 ],
             ) {
-                // Roll back the rule we just added before returning (M19): the
+                // Roll back the rule we just added before returning: the
                 // caller sets `owns_routing_rule` from our return value, so on
                 // this early Err it would otherwise never learn to remove the
                 // freshly-added fwmark rule — a leak past the aborted startup.

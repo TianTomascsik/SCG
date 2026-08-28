@@ -1,7 +1,7 @@
 {
   "sock_buf_size": 16777216,
   "log_level": "info",
-  "_comment_allow_unverified_transport": "This demo config includes rules with verify:none to non-loopback upstreams and a non-mutual decrypt listener. Those are a preflight ERROR (fail --validate) by default (M-13); this opt-in downgrades them to warnings so the illustrative config still validates. Do NOT set this in production unless you accept unverified transport.",
+  "_comment_allow_unverified_transport": "This demo config includes rules with verify:none to non-loopback upstreams and a non-mutual decrypt listener. Those are a preflight ERROR (fail --validate) by default; this opt-in downgrades them to warnings so the illustrative config still validates. Do NOT set this in production unless you accept unverified transport.",
   "allow_unverified_transport": true,
   "rules": [
     {

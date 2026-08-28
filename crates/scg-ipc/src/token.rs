@@ -68,7 +68,7 @@ impl Drop for CapabilityToken {
     }
 }
 
-/// Best-effort volatile wipe of a token buffer (KC-02).
+/// Best-effort volatile wipe of a token buffer.
 ///
 /// `scg-ipc` is deliberately libc-only, so this hand-rolls what the `zeroize`
 /// crate would do rather than taking a dependency: a `write_volatile` the
@@ -115,7 +115,7 @@ mod tests {
         assert!(!token.ct_eq(&bytes));
     }
 
-    // KC-02: the wipe helper clears the buffer (drop uses the same routine).
+    // The wipe helper clears the buffer (drop uses the same routine).
     #[test]
     fn zeroize_token_bytes_clears_buffer() {
         let mut bytes = [0xA5u8; TOKEN_LEN];
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(bytes, [0u8; TOKEN_LEN]);
     }
 
-    // KC-02: the token never prints its material (guards against accidental log leaks).
+    // The token never prints its material (guards against accidental log leaks).
     #[test]
     fn debug_masks_token_material() {
         let s = format!("{:?}", CapabilityToken::from_bytes([0xAB; TOKEN_LEN]));

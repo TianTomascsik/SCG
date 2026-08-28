@@ -1,6 +1,8 @@
 # Gateway Provider Architecture
 
 > Companion document for `provider_architecture.drawio` — read both together.
+> The diagram is a [draw.io](https://www.drawio.com/) source file; open it at
+> <https://app.diagrams.net> or with the draw.io desktop app.
 
 ---
 
@@ -11,7 +13,7 @@ The gateway uses a **provider architecture** to decouple *what* security is appl
 This makes it possible to add new security schemes (or new application-level framings) without touching the dispatch logic or any other provider.
 
 ```
-gateway.json ──load & validate──▶ main.rs ──register──▶ ProviderRegistry
+gateway.json ──load & validate──▶ lib.rs::run ──register──▶ ProviderRegistry
                                                              │
                                                into_arc() (freeze)
                                                              │
@@ -250,7 +252,7 @@ Minimal overhead for generic UDP tunneling:
 
 1. Create `gateway/src/security/providers/my_provider.rs` implementing `CryptoProvider`
 2. Add `pub mod my_provider;` to `gateway/src/security/providers/mod.rs`
-3. Register in `main.rs`: `registry.register_crypto(Box::new(MyProvider))`
+3. Register at the composition root (`lib.rs::run`, or pass it via `gateway::run(extra_crypto, extra_app)` from your own binary): `registry.register_crypto(Box::new(MyProvider))`
 
 Then use `"security_provider": "my_name"` in config.
 
@@ -259,7 +261,7 @@ Then use `"security_provider": "my_name"` in config.
 1. Create `gateway/src/app_protocols/my_protocol.rs` implementing `AppProtocolProvider`
 2. Implement `FramingSession` for the per-connection session struct
 3. Add `pub mod my_protocol;` to `gateway/src/app_protocols/mod.rs`
-4. Register in `main.rs`: `registry.register_app_protocol(Box::new(MyProtocol))`
+4. Register at the composition root (`lib.rs::run`, or via `gateway::run(extra_crypto, extra_app)`): `registry.register_app_protocol(Box::new(MyProtocol))`
 
 Then use `"app_protocol": "my_name"` in config.
 
@@ -324,8 +326,8 @@ app ──gRPC/UDS──▶ ManagementApi.CreateUdsEndpoint(app_id, class, direc
   The gateway-to-client ring is **sealed** (`F_SEAL_WRITE`) so the client maps it
   read-only and cannot tamper with it. Wakeups default to **eventfd** because the
   single-threaded relay must multiplex the upstream fd and the ring notification
-  through one `poll`/`epoll`; see the [SHM wakeup benchmark](../../SCG-Interface-benchmarks/bench_shm)
-  (`wakeup_bench`) for the data behind that choice (busy-poll / hybrid-futex remain
+  through one `poll`/`epoll`; a wakeup micro-benchmark (eventfd vs. strict/hybrid
+  futex vs. busy-poll) informed that default (busy-poll / hybrid-futex remain
   available as a dedicated-core low-latency knob).
 
 ### Security layers

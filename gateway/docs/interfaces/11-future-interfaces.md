@@ -1,17 +1,16 @@
 # 11 — Forward-Looking Interfaces
 
-> **Status:** 🔵 Future · **Source:** [security/stubs.rs](../../src/security/stubs.rs),
-> [management/stubs.rs](../../src/management/stubs.rs), [api/mod.rs](../../src/api/mod.rs) ·
+> **Status:** 🔵 Future ·
 > **Stub:** [traits/future.rs](traits/future.rs)
 
-These modules are **planned but unimplemented** (TODO stubs in the codebase).
+These modules are **planned but unimplemented**; this document is their design record.
 They are documented here so that when they are built they slot into the existing
 interface boundaries instead of inventing new ad-hoc seams. Wherever possible a
 future module **reuses an existing interface** rather than defining a new one.
 
 ## A. New security engines — reuse `CryptoProvider` (interface 01)
 
-The stubs in [security/stubs.rs](../../src/security/stubs.rs) describe additional
+This section describes additional
 encryption schemes. None of these need a *new* interface — each is a new
 [`CryptoProvider`](01-crypto-provider.md) implementation registered by name.
 
@@ -126,8 +125,7 @@ pub trait ObserverTap: Send + Sync {
 
 > **⚠ Security.** A mirror exposes **plaintext** on the trusted side — a real trust-boundary
 > addition. It must be gated to explicitly-configured flows, reuse `SO_PEERCRED` + capability
-> token, and **pass a TRA before implementation**. See the Application Interfaces README
-> (`Architecture/Application Interfaces & Workers/README.md`, §10).
+> token, and **pass a TRA before implementation**.
 
 ## Summary: new vs. reused
 

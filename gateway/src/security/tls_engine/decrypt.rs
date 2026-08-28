@@ -45,7 +45,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
     };
     listener.set_nonblocking(false).ok();
     // Listener port, used to tell a genuine TPROXY redirect from a direct
-    // connection during original-destination recovery (M10).
+    // connection during original-destination recovery.
     let listen_port = listener.local_addr().ok().map(|a| a.port());
 
     info!(
@@ -97,7 +97,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         //
         // `recover_transparent_dst` handles both REDIRECT/DNAT (SO_ORIGINAL_DST)
         // and true TPROXY (getsockname), where the old SO_ORIGINAL_DST-only path
-        // dropped EVERY connection (M10). It fails closed when the destination
+        // dropped EVERY connection. It fails closed when the destination
         // cannot be recovered.
         let resolved_upstream = if ctx.upstream_addr == "auto" && ctx.transparent {
             match tproxy::recover_transparent_dst(fd, listen_port) {
@@ -121,7 +121,7 @@ pub(crate) fn run_tcp_decrypt_listener(ctx: &RuleContext) {
         };
 
         // Traffic classification + policy check (fail closed on an unparseable
-        // upstream target — DP-07).
+        // upstream target).
         if !ctx.classify_and_check_policy_target(&peer_addr, &resolved_upstream) {
             continue; // Drop connection — policy denied or target unresolvable
         }

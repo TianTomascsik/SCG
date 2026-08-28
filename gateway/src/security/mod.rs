@@ -5,12 +5,10 @@
 
 pub mod conn_pool;
 pub mod dtls_engine;
-#[allow(dead_code)]
 pub mod provider;
 pub mod providers;
 pub mod relay;
 pub mod routing_engine;
-pub mod stubs;
 pub mod tls_engine;
 pub mod udp_framing;
 pub mod udp_session;

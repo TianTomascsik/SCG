@@ -89,7 +89,7 @@ pub fn load_identity_pem(
         .map_err(|e| format!("failed to read cert_path '{}': {}", cert_path.display(), e))?;
     // The PEM private key is secret material: wrap it in `Zeroizing` so the
     // heap buffer is wiped when this function returns, on both the success and
-    // error paths, instead of lingering in freed memory (L1, KC-02). OpenSSL
+    // error paths, instead of lingering in freed memory. OpenSSL
     // keeps its own parsed copy; this only protects the transient PEM bytes.
     let key_pem = zeroize::Zeroizing::new(
         std::fs::read(key_path)

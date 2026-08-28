@@ -1,4 +1,4 @@
-//! Test-only DTLS (UDP) plumbing for the WP7 DTLS tests.
+//! Test-only DTLS (UDP) plumbing for the DTLS tests.
 //!
 //! The gateway's own `DtlsUdpStream` / DTLS builders are private, so the
 //! integration tests build their own OpenSSL DTLS peers:

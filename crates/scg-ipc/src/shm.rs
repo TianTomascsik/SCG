@@ -20,8 +20,8 @@
 //!   words — mapped read/write by both sides, but every value the gateway reads
 //!   from it is validated (never trusted) on **both** the consume side (frame
 //!   length clamped to the slot) and the produce side (the peer-written
-//!   `read_idx`/`seq` is bounded to its valid window, else [`ShmError::RingCorrupt`]
-//!   — DP-11);
+//!   `read_idx`/`seq` is bounded to its valid window, else
+//!   [`ShmError::RingCorrupt`]);
 //! * two **data** memfds holding only the ring bytes.
 //!
 //! The data memfd the gateway *produces* into (`g2c`) is sealed with
@@ -99,7 +99,7 @@ pub enum ShmError {
     FrameTooLarge,
     /// The peer-writable ring control state (slot `seq` / `read_idx`) is outside
     /// its valid window — a corrupt or hostile peer. The producer tears the ring
-    /// down instead of stalling forever (DP-11).
+    /// down instead of stalling forever.
     RingCorrupt,
 }
 
@@ -232,7 +232,7 @@ impl RingProducer {
         // control page. A legal `used` is in `[0, cap]`; anything larger means the
         // peer moved `read_idx` outside its window, which would otherwise underflow
         // `cap - used` (silent wrap) or wedge the producer on a perpetual Full.
-        // Report it so the endpoint tears down instead of stalling (DP-11).
+        // Report it so the endpoint tears down instead of stalling.
         let read = ix.read_idx.load(Ordering::Acquire);
         let used = write.wrapping_sub(read) as usize;
         if used > self.cap {
@@ -586,7 +586,7 @@ mod tests {
         assert!(consumer.try_pop().is_none());
     }
 
-    // DP-11: a hostile consumer that moves `read_idx` outside `[write - cap, write]`
+    // A hostile consumer that moves `read_idx` outside `[write - cap, write]`
     // must yield RingCorrupt (endpoint teardown) instead of underflowing `cap - used`
     // or wedging the producer on a false Full.
     #[test]

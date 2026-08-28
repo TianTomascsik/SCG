@@ -10,7 +10,7 @@
 //!   word. Lower latency for a pure SHM hop, but not pollable, so it is only
 //!   suitable where a thread waits solely on the ring.
 //!
-//! The final default is selected by the WP0 benchmark; both are kept so the
+//! The default was selected by benchmarking both variants; both are kept so the
 //! gateway and clients can negotiate whichever a deployment prefers.
 
 use std::io;

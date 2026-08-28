@@ -1,6 +1,6 @@
-//! WP4 — Subset-146 TLS PSK profile (`profile = subset146-psk`).
+//! Subset-146 TLS PSK profile (`profile = subset146-psk`).
 //!
-//! TLS-PSK (DHE-PSK-AES256-GCM-SHA384, TLS 1.2) wired in WP1 via OpenSSL PSK
+//! TLS-PSK (DHE-PSK-AES256-GCM-SHA384, TLS 1.2) wired via OpenSSL PSK
 //! callbacks. These tests prove it end-to-end with no certificates involved:
 //!
 //!   * `subset146_psk_round_trip`            — matching identity + key handshake.

@@ -76,13 +76,13 @@ impl SharedConfig {
         let last = *self.last_modified.read().unwrap_or_else(|e| e.into_inner());
         // `!=`, not `>`: restoring a known-good backup (cp -p, rsync -a,
         // git checkout) gives the file an *older* mtime than the loaded one,
-        // and that replacement must still trigger a reload (M15).
+        // and that replacement must still trigger a reload.
         current_mtime != last
     }
 
     /// Reload config from disk. Returns the diff, or an error string.
     pub fn reload(&self) -> Result<ConfigDiff, String> {
-        // Capture the watched file's mtime BEFORE reading it (M15): a write
+        // Capture the watched file's mtime BEFORE reading it: a write
         // landing mid-load then leaves the stored value differing from the
         // file's real mtime, so the next poll re-triggers and converges on the
         // latest content. Stamping after the read would adopt the new mtime
@@ -297,7 +297,7 @@ mod tests {
         }
     }
 
-    // M15(b): restoring a backup whose mtime is OLDER than the loaded config
+    // Restoring a backup whose mtime is OLDER than the loaded config
     // (cp -p, rsync -a, git checkout) must still be detected as a change —
     // the comparison is `!=`, not `>`.
     #[test]
@@ -326,7 +326,7 @@ mod tests {
         assert!(!shared.has_changed(), "reload must clear the change flag");
     }
 
-    // M15(a): the stored mtime is captured before the read, so a normal
+    // The stored mtime is captured before the read, so a normal
     // edit → reload cycle stamps the edited file's mtime and re-arms cleanly.
     #[test]
     fn reload_adopts_edited_file_mtime() {

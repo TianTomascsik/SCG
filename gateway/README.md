@@ -32,6 +32,8 @@ application.
 | **ALE framing** | ALEPKT framing per Subset-098/037 for UDP-over-TLS (EuroRadio) |
 | **Raw framing** | Simple length-prefix framing for UDP-over-TLS without ALE overhead |
 | **TPROXY** | Transparent proxy via `IP_TRANSPARENT` + `SO_ORIGINAL_DST` |
+| **Local interfaces (UDS/SHM)** | Unix-socket and sealed shared-memory rings for co-located applications, provisioned over the management API |
+| **gRPC management API** | Endpoint provisioning + runtime control over a Unix-domain gRPC socket |
 | **Hot-reload** | SIGHUP or file watch -- add/remove rules without restart |
 | **Provider architecture** | Add custom security or protocol providers by implementing a trait |
 
@@ -61,7 +63,7 @@ sudo ./target/release/gateway --config-dir /etc/scg/config --validate
 > development-only build feature (`--features dev`). A default (production) build
 > accepts only the signed, layered `--config-dir` (Ed25519-signed
 > `scg.defaults.json` + `scg.user.json` with a pinned schema hash, verified
-> fail-closed). See SCG-TRA finding #87.
+> fail-closed), because unsigned configs are a config-tampering vector.
 
 ### CLI Options
 
@@ -383,7 +385,7 @@ RUST_LOG=gateway::security=trace gateway --config-dir /etc/scg/config
 
 The gateway sits on a signaling chokepoint, so its logs are themselves a
 privacy/linkability surface (a train-movement metadata source). Operate them
-accordingly (KC-07):
+accordingly:
 
 - **ETCS identifiers** (`calling`/`called` ETCS-IDs) are emitted **only at
   `debug`** and must stay debug-only; do not raise the ALE provider to `debug` in
@@ -457,8 +459,8 @@ fn main() {
 ## Systemd Deployment
 
 > A ready-to-use unit file ships as `gateway/SecureCommunicationGateway.service`.
-> For full deployment tooling (native, container, devcontainer) see the
-> `deploy-methods` repository.
+> For container deployment tooling see
+> [SCG-deploy-methods](https://github.com/TianTomascsik/SCG-deploy-methods).
 
 ### Installation
 
@@ -470,10 +472,14 @@ cargo build --release --bin gateway
 sudo mkdir -p /opt/scg
 sudo cp target/release/gateway /opt/scg/
 
-# Install config
-sudo mkdir -p /etc/scg
-sudo cp gateway/gateway.example.json /etc/scg/gateway.json
-# Edit /etc/scg/gateway.json for your environment
+# Install the signed, layered configuration directory (production builds
+# accept only --config-dir; see "Config integrity" above). Populate it with
+# scg.defaults.json + scg.user.json + scg.lite.schema.json, their detached
+# Ed25519 .sig files, and trust/config-signing.pub.pem, then adjust
+# scg.user.json for your environment and re-sign it.
+sudo mkdir -p /etc/scg/config/trust
+# (the SCG-deploy-methods repository ships a worked signed-config example
+#  and an openssl-based resign.sh)
 
 # Install systemd service
 sudo cp gateway/SecureCommunicationGateway.service /etc/systemd/system/
@@ -608,6 +614,7 @@ gateway/src/
     provider.rs              -- CryptoProvider trait
     providers/               -- Built-in: TLS, kTLS, DTLS, WireGuard, routing
     tls_engine/              -- TLS/kTLS encrypt/decrypt implementation
+    conn_pool.rs             -- Upstream connection pooling
     dtls_engine.rs           -- DTLS encrypt/decrypt implementation
     routing_engine.rs        -- Routing (plaintext L4): TCP + multi-client UDP listeners
     wireguard_engine.rs      -- WireGuard kernel-offload relay (+ wireguard_engine/admin.rs)
@@ -621,10 +628,18 @@ gateway/src/
   management/
     config.rs                -- JSON config parsing, validation
     config_manager.rs        -- Hot-reload via SIGHUP / file watch
+    lite_config/             -- Signed, layered --config-dir loader (Ed25519 + pinned schema hash)
     cert_store.rs            -- Self-signed certificate generation
     telemetry.rs             -- Metrics and CSV logging
+  api/
+    grpc.rs                  -- gRPC management server (endpoint provisioning, runtime control)
+  interfaces/
+    manager.rs               -- Local-interface lifecycle + policy plumbing
+    endpoint.rs              -- Per-endpoint network leg (TLS/kTLS upstream, policy gates)
+    uds.rs                   -- Unix-domain-socket endpoints
+    shm.rs                   -- Sealed shared-memory ring endpoints
+    tproxy.rs                -- TPROXY original-destination recovery
   networking/                -- Socket management, connect with retry
-  interfaces/                -- TPROXY support
 ```
 
 ### Thread Model
@@ -648,13 +663,28 @@ cargo build --bin gateway
 cargo build --release --bin gateway
 ```
 
+## Testing
+
+```bash
+# Unit + integration tests (includes example-config validation)
+cargo test
+
+# Cross-language smoke test of the local interfaces: drives the Rust, C, and
+# C++ example clients over UDS and SHM against a real gateway (unprivileged;
+# skips gracefully when a toolchain is missing)
+../scripts/run_local_clients.sh
+```
+
 ## Dependencies
 
 | Crate | Purpose |
 |---|---|
 | `openssl` | TLS and DTLS via OpenSSL |
 | `ktls_pipe` | Kernel TLS session management (workspace member) |
-| `tls_pipe` | Userspace TLS helpers (workspace member) |
-| `ale_pipe` | ALE/ALEPKT framing (workspace member) |
+| `ale-frame` (imported as `ale_pipe`) | ALE/ALEPKT framing — external git dependency, pinned to a release tag |
+| `scg-ipc` | Local-interface IPC primitives: framed packets, SHM rings, capability tokens (workspace member) |
+| `scg-proto` | gRPC/protobuf definitions for the management API (workspace member) |
+| `tonic` + `prost` + `tokio` | gRPC management server (async, on a dedicated thread off the data path) |
 | `serde` + `serde_json` | JSON config deserialization |
+| `zeroize` | Wiping key material on drop |
 | `libc` | Low-level system calls (TPROXY, signals, poll) |

@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// Policy gate for a local endpoint's network leg (DP-08).
+/// Policy gate for a local endpoint's network leg.
 ///
 /// The local caller is authenticated out-of-band (uid + pid + single-use token),
 /// so there is no meaningful network *source* on the app side. The encrypt
@@ -60,7 +60,7 @@ pub struct EndpointPolicy {
 
 impl EndpointPolicy {
     /// Gate an encrypt endpoint's upstream `target` (destination-only). Fails
-    /// closed on an unparseable target, mirroring the network path (DP-07).
+    /// closed on an unparseable target, mirroring the network path.
     pub fn allows_destination(&self, label: &str, target: &str) -> bool {
         let dst = match target.parse::<SocketAddr>() {
             Ok(d) => d,
@@ -221,7 +221,7 @@ pub fn authenticate_peer(
 /// kTLS activates. [`connect_tls_upstream`]/[`accept_tls_upstream`] build the kTLS
 /// context through [`crate::security::tls_engine::build_ktls_connector`] /
 /// [`crate::security::tls_engine::build_ktls_acceptor`], which apply the rule's
-/// verify/CA/cert and PSK setup identically to userspace TLS (DP-01). So verified
+/// verify/CA/cert and PSK setup identically to userspace TLS. So verified
 /// TLS and the Subset-146 ETCS profiles stay on the kTLS path; only `integrity-only`
 /// (NULL-encryption ciphers, no AES-GCM record layer) falls back to userspace
 /// `Tls`. The relay separately guards the zero-copy splice on **runtime** kTLS
@@ -258,7 +258,7 @@ pub fn connect_tls_upstream(
     policy: Option<&EndpointPolicy>,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
-    // Second gate (DP-08): a default-deny policy must permit this upstream before
+    // Second gate: a default-deny policy must permit this upstream before
     // we dial it, mirroring the TCP/UDP relay paths.
     if let Some(p) = policy {
         if !p.allows_destination(label, upstream_addr) {
@@ -305,7 +305,7 @@ pub fn connect_tls_upstream(
                 .map_err(|e| io::Error::other(format!("TLS connector: {e}")))?;
             let ssl_stream = if params.resumption {
                 // Present a cached ticket for this exact upstream + crypto policy so the
-                // reconnect can resume (task S2 / TRA #78–#80). `configure()` carries the same
+                // reconnect can resume (TRA #78–#80). `configure()` carries the same
                 // SNI + hostname-verification defaults as `connect()`, so priming is transparent.
                 let key = resumption_key(&params, upstream_addr, false);
                 let mut config = connector
@@ -331,7 +331,7 @@ pub fn connect_tls_upstream(
         TlsMode::Ktls => {
             // Build the kTLS connector through the tls_engine so the rule's
             // verify mode, CA/cert and PSK callback are applied identically to
-            // userspace TLS (DP-01). The former `ktls_pipe::build_client_connector`
+            // userspace TLS. The former `ktls_pipe::build_client_connector`
             // hardcoded SslVerifyMode::NONE and silently discarded them.
             let connector = build_ktls_connector(&params)
                 .map_err(|e| io::Error::other(format!("kTLS connector: {e}")))?;
@@ -341,7 +341,7 @@ pub fn connect_tls_upstream(
                 .into_ssl(&sni)
                 .map_err(|e| io::Error::other(format!("kTLS SSL: {e}")))?;
             if params.resumption {
-                // Resume this upstream+policy if a ticket is cached (task S2 / TRA #78–#80).
+                // Resume this upstream+policy if a ticket is cached (TRA #78–#80).
                 prime_resumption(&mut ssl, resumption_key(&params, upstream_addr, true));
             }
             ssl.set_connect_state();
@@ -416,7 +416,7 @@ pub fn accept_tls_upstream(
     listener.set_nonblocking(false).ok();
 
     // Parse the rule's TLS security parameters once; both the userspace and the
-    // kTLS acceptor honour verify mode / CA / cert / PSK identically (DP-01).
+    // kTLS acceptor honour verify mode / CA / cert / PSK identically.
     let params = TlsSecurityParams::from_params(provider_params, protocol_version)
         .map_err(|e| io::Error::other(format!("TLS params: {e}")))?;
 
@@ -448,7 +448,7 @@ pub fn accept_tls_upstream(
         }
         match accept_with_timeout(&listener, Duration::from_millis(200)) {
             Some(Ok((stream, peer))) => {
-                // Second gate (DP-08): drop a peer the policy denies and keep
+                // Second gate: drop a peer the policy denies and keep
                 // listening — a denied prober must not consume this single-use
                 // endpoint or trigger the handshake.
                 if let Some(p) = policy {
@@ -549,7 +549,7 @@ pub fn connect_plain_upstream(
     policy: Option<&EndpointPolicy>,
     shutdown: &AtomicBool,
 ) -> io::Result<ProxyStream> {
-    // Second gate (DP-08): routing over UDS/SHM is policy-gated exactly like the
+    // Second gate: routing over UDS/SHM is policy-gated exactly like the
     // TCP routing provider (register #38 parity).
     if let Some(p) = policy {
         if !p.allows_destination(label, upstream_addr) {
@@ -606,7 +606,7 @@ pub fn accept_plain_upstream(
         }
         match accept_with_timeout(&listener, Duration::from_millis(200)) {
             Some(Ok((stream, peer))) => {
-                // Second gate (DP-08): drop a policy-denied peer, keep listening.
+                // Second gate: drop a policy-denied peer, keep listening.
                 if let Some(p) = policy {
                     if !p.allows_peer(label, peer, listen_addr) {
                         continue;
@@ -936,7 +936,7 @@ mod tests {
         assert!(!should_splice_upstream(false, false)); // userspace TLS, nothing active
     }
 
-    // DP-08: EndpointPolicy gates the network leg of a local endpoint.
+    // EndpointPolicy gates the network leg of a local endpoint.
     use crate::management::config::{PolicyAction, PolicyConfig, WhitelistEntry};
 
     fn endpoint_policy(whitelist: Vec<WhitelistEntry>, class: TrafficClass) -> EndpointPolicy {
@@ -962,7 +962,7 @@ mod tests {
         );
         assert!(ep.allows_destination("t", "10.1.2.3:443"));
         assert!(!ep.allows_destination("t", "192.168.1.1:443"));
-        // Fail closed on an unparseable target (mirrors DP-07).
+        // Fail closed on an unparseable target.
         assert!(!ep.allows_destination("t", "backend.example.com:443"));
     }
 

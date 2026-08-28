@@ -13,7 +13,7 @@
 //!   and operator hint.
 //!
 //! The gateway builds its verify/cert/CA-honouring kTLS connectors and
-//! acceptors in `security::tls_engine` (see TRA DP-01); this crate deliberately
+//! acceptors in `security::tls_engine`; this crate deliberately
 //! contains no certificate or crypto-policy logic. The historical `KtlsPipe`
 //! benchmark harness (io_uring / vmsplice / splice lanes and the `SCG_BENCH_*`
 //! environment knobs) was removed in 2026-07 as orphaned code — recover it from

@@ -120,7 +120,7 @@ pub fn get_original_dst(fd: RawFd) -> io::Result<SocketAddr> {
 /// TCP connection from the accepted socket `fd`, or `None` when it cannot be
 /// determined — in which case the caller MUST fail closed (drop the
 /// connection) rather than forward to a default and bypass the destination
-/// policy (M10 / TRA #59).
+/// policy (TRA #59).
 ///
 /// Recovery order:
 /// * `SO_ORIGINAL_DST` first — the conntrack pre-translation destination for
@@ -365,7 +365,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    // M10: original-destination recovery decision core.
+    // Original-destination recovery decision core.
     #[test]
     fn redirect_uses_so_original_dst() {
         // REDIRECT/DNAT: SO_ORIGINAL_DST wins regardless of the local address.

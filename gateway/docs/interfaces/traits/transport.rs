@@ -3,7 +3,7 @@
 //! Status: PROPOSED. Abstracts TCP/UDP/UDS/SHM behind a factory so the same
 //! security engine can run over different transports. Generalizes the free
 //! functions in `networking/connector.rs`, `networking/socket_manager.rs`, and
-//! the TPROXY helpers in `interfaces/tproxy.rs`. (See benches/bench_{tcp,udp,uds,shm}.)
+//! the TPROXY helpers in `interfaces/tproxy.rs`.
 
 use std::io;
 use std::os::unix::io::RawFd;

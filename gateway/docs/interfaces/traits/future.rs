@@ -1,7 +1,7 @@
 //! Forward-looking interfaces — REFERENCE STUB (not compiled).
 //!
-//! Status: FUTURE. Contracts for planned modules (TODO stubs in
-//! `security/stubs.rs`, `management/stubs.rs`, `api/mod.rs`). Where possible a
+//! Status: FUTURE. Contracts for planned modules (see
+//! `11-future-interfaces.md`). Where possible a
 //! future module REUSES an existing interface (e.g. IPSec/WireGuard/GDOI are new
 //! `CryptoProvider`s, OCSP extends `CertificateProvider`, HSM implements the
 //! interface-05 providers). Only genuinely new seams are defined below.

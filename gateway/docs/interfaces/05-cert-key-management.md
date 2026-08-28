@@ -3,8 +3,9 @@
 > **Status:** 🟡 Proposed · **Traits:** `CertificateProvider`,
 > `PreSharedKeyStore`, `KeyMaterialProvider` ·
 > **Abstracts:** [management/cert_store.rs](../../src/management/cert_store.rs)
-> (`get_or_init_cert`), keyed-MAC key injection, and the PSK TODO in
-> [management/stubs.rs](../../src/management/stubs.rs) ·
+> (`get_or_init_cert`), keyed-MAC key injection, and a future dedicated PSK
+> registry.
+>
 > **Stub:** [traits/cert_key.rs](traits/cert_key.rs)
 
 ## Purpose
@@ -34,7 +35,7 @@ Today:
   engines call it directly (a hidden global dependency).
 - A **keyed-MAC provider's key** would be parsed from config and pushed into a
   bespoke, per-provider field on `RuleContext`.
-- **PSK is unimplemented** (a TODO in [management/stubs.rs](../../src/management/stubs.rs)).
+- **A dedicated PSK registry is unimplemented** (see [11-future-interfaces.md](11-future-interfaces.md)); PSK material itself is configured per rule today.
 
 There is no rotation, no peer verification policy, no separation between "how a
 cert is obtained" and "how it is used." An interface removes the global, unifies
@@ -60,8 +61,8 @@ flattened `provider_params` + `protocol_version`, and the builders consume it:
   [`build_tls_acceptor` / `build_tls_connector`](../../src/security/tls_engine/mod.rs)
   and [`build_dtls_acceptor` / `build_dtls_connector`](../../src/security/dtls_engine.rs).
 - **PSK** — `profile = subset146-psk` wires the OpenSSL PSK server/client
-  callbacks from `psk_identity` + `psk_hex` (DHE-PSK, TLS 1.2). This is the
-  concrete fill-in for the former PSK TODO.
+  callbacks from `psk_identity` + `psk_hex` (DHE-PSK, TLS 1.2) — the
+  concrete per-rule PSK mechanism shipped today.
 - **Cipher policy** — selected per `profile` (`subset146-pki`, `integrity-only`,
   …) with optional `cipher_list`/`ciphersuites` overrides.
 
@@ -72,7 +73,7 @@ on a missing/invalid file — without the rotation/epoch semantics the traits ad
 See the per-profile runnable configs in
 [examples/configs/](../../examples/configs/).
 
-## Authenticated upstream identity (TB2)
+## Authenticated upstream identity (gateway→upstream trust boundary)
 
 When the gateway connects to an upstream (the encrypt/connector leg), the
 **identity that is cryptographically authenticated is the SNI / verification
@@ -203,7 +204,7 @@ to no protection.
 | `get_or_init_cert()` (self-signed RSA-2048, `OnceLock`) | A `SelfSignedCertProvider: CertificateProvider` (default impl preserving current behaviour). |
 | `build_tls_acceptor()` / `build_dtls_acceptor()` calling the global | Pass `&dyn CertificateProvider` into the builders. |
 | A per-provider key field on `RuleContext` | `KeyMaterialProvider::key(KeyId("mac:<rule>"))`. |
-| PSK TODO | `PreSharedKeyStore` impl (file/static table, later HSM). |
+| Per-rule PSK config fields | `PreSharedKeyStore` impl (file/static table, later HSM). |
 
 ## Example implementor (skeleton)
 
