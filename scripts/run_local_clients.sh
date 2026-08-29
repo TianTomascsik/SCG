@@ -35,7 +35,7 @@ CARGO_FLAGS=()
 TARGET="$ROOT/target/$PROFILE"
 
 echo "==> Building gateway + tls_echo example"
-cargo build "${CARGO_FLAGS[@]}" -p gateway --bin gateway --example tls_echo \
+cargo build "${CARGO_FLAGS[@]}" -p gateway --features dev --bin gateway --example tls_echo \
     || fail "gateway build failed"
 
 echo "==> Building scg-client library + Rust example"
@@ -87,12 +87,12 @@ cat >"$WORK/gw.json" <<JSON
   "rules": [
     { "name": "uds-test", "direction": "encrypt", "listen_addr": "unused",
       "listen_proto": "uds", "upstream_addr": "$UPSTREAM", "upstream_proto": "tcp",
-      "security_provider": "tls", "traffic_class": "safety", "app_id": "$APP",
-      "allowed_uids": [$UID_NUM] },
+      "security_provider": "tls", "verify": "none", "traffic_class": "safety",
+      "app_id": "$APP", "allowed_uids": [$UID_NUM] },
     { "name": "shm-test", "direction": "encrypt", "listen_addr": "unused",
       "listen_proto": "shm", "upstream_addr": "$UPSTREAM", "upstream_proto": "tcp",
-      "security_provider": "tls", "traffic_class": "safety", "app_id": "$APP",
-      "allowed_uids": [$UID_NUM] }
+      "security_provider": "tls", "verify": "none", "traffic_class": "safety",
+      "app_id": "$APP", "allowed_uids": [$UID_NUM] }
   ],
   "api": { "enabled": true, "uds_path": "$MGMT", "runtime_dir": "$WORK/run",
            "shm_ring_capacity": 65536 }

@@ -24,7 +24,9 @@ cargo build --release --bin gateway
 # which is what the bundled example configuration uses
 cargo build --release --bin gateway --features dev
 
-# Validate the example configuration without opening sockets (dev build)
+# Validate the example configuration without opening sockets (dev build).
+# Note: the example includes transparent (TPROXY) rules, so without
+# CAP_NET_ADMIN this reports one capability error and exits 1.
 ./target/release/gateway --config gateway/gateway.example.json --validate
 
 # Run (transparent-proxy rules need CAP_NET_ADMIN, e.g. via sudo or the systemd unit)

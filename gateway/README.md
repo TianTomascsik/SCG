@@ -419,11 +419,9 @@ gateway --config-dir /etc/scg/config --log-level debug
 { "log_level": "debug" }
 ```
 
-The `RUST_LOG` environment variable is also supported for fine-grained per-module control:
-
-```bash
-RUST_LOG=gateway::security=trace gateway --config-dir /etc/scg/config
-```
+The `RUST_LOG` environment variable is **not** currently honored (the logger is
+initialized from `--log-level` / the config's `log_level` only); use those to
+control verbosity.
 
 ### Data minimization & retention
 
@@ -585,10 +583,11 @@ sudo ./scripts/scg-host-qos.sh clear --dev eth0
 
 ### Override Settings
 
-Create `/etc/scg/environment`:
+Create `/etc/scg/environment` (the unit reads `CONFIG_DIR`, the signed config
+**directory** — production builds do not accept a single-file config):
 
 ```bash
-CONFIG=/etc/scg/my_custom.json
+CONFIG_DIR=/etc/scg/my-config-dir
 ```
 
 ## Hot-Reload
