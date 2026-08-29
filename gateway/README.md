@@ -65,6 +65,50 @@ sudo ./target/release/gateway --config-dir /etc/scg/config --validate
 > `scg.defaults.json` + `scg.user.json` with a pinned schema hash, verified
 > fail-closed), because unsigned configs are a config-tampering vector.
 
+### Production configuration (signed `--config-dir`)
+
+A production build loads a **directory** with this layout:
+
+```
+/etc/scg/config/
+├── scg.defaults.json        # base config; pins the schema hash (see below)
+├── scg.defaults.json.sig    # detached Ed25519 signature
+├── scg.user.json            # site-specific overrides
+├── scg.user.json.sig
+├── scg.lite.schema.json     # the JSON schema both files must satisfy
+└── trust/
+    └── config-signing.pub.pem   # trust anchor (public key only)
+```
+
+Signatures are detached Ed25519 over the **exact file bytes**, base64-encoded.
+Bootstrap with openssl alone:
+
+```bash
+# 1. Generate a signing keypair — keep the private key OUTSIDE the config dir
+#    and outside any repository
+openssl genpkey -algorithm ed25519 -out /secure/place/scg-config-signing.key.pem
+openssl pkey -in /secure/place/scg-config-signing.key.pem -pubout \
+  -out /etc/scg/config/trust/config-signing.pub.pem
+
+# 2. Pin the schema hash inside scg.defaults.json
+#    (runtime.config_signing.schema_sha256):
+openssl dgst -sha256 -r /etc/scg/config/scg.lite.schema.json
+
+# 3. Sign both config files (repeat after every edit)
+for f in scg.defaults.json scg.user.json; do
+  openssl pkeyutl -sign -inkey /secure/place/scg-config-signing.key.pem \
+    -rawin -in /etc/scg/config/$f | openssl base64 -A > /etc/scg/config/$f.sig
+done
+
+# 4. Verify without opening sockets
+gateway --config-dir /etc/scg/config --validate
+```
+
+A complete worked example (signed config set, schema, and an openssl-based
+`resign.sh` wrapper) ships in
+[SCG-deploy-methods](https://github.com/TianTomascsik/SCG-deploy-methods)
+under `container/tproxy-host/`.
+
 ### CLI Options
 
 | Flag | Description |

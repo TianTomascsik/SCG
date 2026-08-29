@@ -12,7 +12,7 @@ applications behind it. Part of the **SCG** project.
 | `crates/ktls_pipe/` | Kernel TLS (kTLS) pipe library |
 | `crates/scg-ipc/` | Local-interface IPC primitives (framed packets, SHM rings, capability tokens) |
 | `crates/scg-proto/` | gRPC/protobuf definitions for the management API |
-| `crates/scg-client/` | Client library (Rust core + C/C++ ABI) for the local interfaces |
+| [`crates/scg-client/`](crates/scg-client/README.md) | Client library (Rust core + C/C++ ABI) for the local interfaces |
 
 ## Build & run
 
