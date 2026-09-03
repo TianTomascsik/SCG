@@ -257,7 +257,7 @@ fn missing_config_flag_errors() {
 
 // In a production (non-`dev`) build the unsigned single-file `--config` loader is
 // compiled out: the binary must refuse it and point the operator at the signed
-// `--config-dir` path (SCG-TRA #87).
+// `--config-dir` path.
 #[cfg(not(feature = "dev"))]
 #[test]
 fn config_flag_rejected_without_dev_feature() {
@@ -318,7 +318,7 @@ fn write_sig(path: &Path, key: &PKey<openssl::pkey::Private>) {
 }
 
 /// A production gateway build accepts only the signed, layered `--config-dir`
-/// configuration (SCG-TRA #87). Build a minimal, self-consistent signed config
+/// configuration. Build a minimal, self-consistent signed config
 /// directory at test time (schema + hash-pinned defaults + user + detached
 /// Ed25519 signatures) and assert the real binary loads, verifies, maps, and
 /// validates it — the positive counterpart to the flat-config refusal test, and
